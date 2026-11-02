@@ -1,0 +1,114 @@
+name: Dong goi App iPhone (.ipa)
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  workflow_dispatch:
+
+jobs:
+  build_unsigned_ipa:
+    runs-on: macos-14
+    steps:
+      - name: 1. Tai 6 file code ve may chu Mac
+        uses: actions/checkout@v4
+
+      - name: 2. Sap xep thu muc va tao cau hinh iOS tu dong
+        run: |
+          mkdir -p Sources
+          cp *.swift Sources/
+          if [ -f "game_data.sqlite" ]; then
+            cp game_data.sqlite Sources/
+          fi
+
+          cat << 'EOF' > Info.plist
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+              <key>CFBundleDevelopmentRegion</key>
+              <string>en</string>
+              <key>CFBundleDisplayName</key>
+              <string>PS5 Translator</string>
+              <key>CFBundleExecutable</key>
+              <string>$(EXECUTABLE_NAME)</string>
+              <key>CFBundleIdentifier</key>
+              <string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
+              <key>CFBundleInfoDictionaryVersion</key>
+              <string>6.0</string>
+              <key>CFBundleName</key>
+              <string>$(PRODUCT_NAME)</string>
+              <key>CFBundlePackageType</key>
+              <string>APPL</string>
+              <key>CFBundleShortVersionString</key>
+              <string>1.0</string>
+              <key>CFBundleVersion</key>
+              <string>1</string>
+              <key>LSRequiresIPhoneOS</key>
+              <true/>
+              <key>UIApplicationSceneManifest</key>
+              <dict>
+                  <key>UIApplicationSupportsMultipleScenes</key>
+                  <false/>
+              </dict>
+              <key>UILaunchScreen</key>
+              <dict/>
+              <key>UISupportedInterfaceOrientations</key>
+              <array>
+                  <string>UIInterfaceOrientationPortrait</string>
+                  <string>UIInterfaceOrientationLandscapeLeft</string>
+                  <string>UIInterfaceOrientationLandscapeRight</string>
+              </array>
+              <key>NSLocalNetworkUsageDescription</key>
+              <string>Cho phep ket noi Wi-Fi noi bo voi PS5 va TV Samsung de truyen phu de.</string>
+          </dict>
+          </plist>
+          EOF
+
+          cat << 'EOF' > project.yml
+          name: PS5Translator
+          options:
+            bundleIdPrefix: com.ps5viet
+          targets:
+            PS5Translator:
+              type: application
+              platform: iOS
+              deploymentTarget: "16.0"
+              sources:
+                - path: Sources
+              info:
+                path: Info.plist
+              settings:
+                PRODUCT_BUNDLE_IDENTIFIER: com.ps5viet.translator
+                GENERATE_INFOPLIST_FILE: NO
+          EOF
+
+      - name: 3. Khoi tao Project Xcode bang XcodeGen
+        run: |
+          if ! command -v xcodegen &> /dev/null; then
+            brew install xcodegen
+          fi
+          xcodegen generate
+
+      - name: 4. Bien dich 6 file Swift thanh App iPhone
+        run: |
+          xcodebuild clean build \
+            -project PS5Translator.xcodeproj \
+            -scheme PS5Translator \
+            -configuration Release \
+            -sdk iphoneos \
+            -derivedDataPath build_output \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO
+
+      - name: 5. Dong goi thanh file PS5Translator.ipa
+        run: |
+          mkdir -p Payload
+          cp -r build_output/Build/Products/Release-iphoneos/PS5Translator.app Payload/
+          zip -r PS5Translator.ipa Payload
+
+      - name: 6. Xuat file PS5Translator.ipa de tai ve Windows
+        uses: actions/upload-artifact@v4
+        with:
+          name: File_Cai_Dat_PS5Translator_IPA
+          path: PS5Translator.ipa
