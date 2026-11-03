@@ -1,9 +1,9 @@
 // ============================================================================
 // FILE 3: 3_SmartThrottler.swift
-// NHIỆM VỤ: Bộ điều tiết chống nóng máy.
-// 1. Khoá tốc độ quét theo thanh trượt FPS người dùng chọn (1 - 15 FPS).
-// 2. Thu nhỏ vùng phụ đề về kích thước siêu nhỏ (32x8 pixel) để đo độ lệch điểm ảnh.
-//    Nếu nhân vật chưa nói sang câu mới (ảnh đứng yên) -> Bỏ qua không gọi OCR.
+// NHIỆM VỤ: Bộ điều tiết chống nóng máy thế hệ 2.
+// Khi quét TOÀN MÀN HÌNH, cảnh nền game (nhân vật chạy, lá bay) thay đổi liên tục.
+// Thuật toán này chỉ lọc lấy các điểm ảnh có độ tương phản cao (vùng chữ sáng)
+// trên lưới 48x27 để so sánh, giúp máy vẫn tự nghỉ khi chữ trên màn hình đứng yên!
 // ============================================================================
 
 import Foundation
@@ -11,51 +11,43 @@ import CoreGraphics
 import Combine
 
 class SmartThrottler: ObservableObject {
-    // Tốc độ FPS quét tối đa (người dùng kéo thanh trượt trên màn hình để chỉnh)
     @Published var targetScanFPS: Double = AppConfig.defaultScanFPS
-    
-    // Ngưỡng nhạy phát hiện đổi câu thoại
     @Published var pixelDiffThreshold: Double = AppConfig.defaultPixelDiffThreshold
     
-    // Thông số thống kê hiển thị lên màn hình để theo dõi độ mát của máy
     @Published var skippedStaticFramesCount: Int = 0
     @Published var actualOCRScansCount: Int = 0
     @Published var lastDiffValue: Double = 0.0
     
     private var lastScanTimestamp: TimeInterval = 0
-    private var previousThumbnailPixels: [UInt8] = []
+    private var previousHighContrastMask: [UInt8] = []
     
-    // Kích thước ảnh thu nhỏ để so sánh siêu tốc (chỉ mất 0.1 mili-giây CPU)
-    private let thumbWidth = 32
-    private let thumbHeight = 8
+    private let gridWidth = 48
+    private let gridHeight = 27
     
-    /// Hàm kiểm tra: Trả về true nếu CẦN chạy OCR, trả về false nếu NÊN NGHỈ để mát máy
-    func shouldPerformOCR(on croppedROIImage: CGImage, forceScan: Bool = false) -> Bool {
+    func shouldPerformOCR(on image: CGImage, forceScan: Bool = false) -> Bool {
         let now = Date().timeIntervalSince1970
         let minInterval = 1.0 / max(1.0, targetScanFPS)
         
-        // Tầng 1: Kiểm tra giới hạn thời gian giữa 2 lần quét (FPS Limiter)
         if !forceScan && (now - lastScanTimestamp) < minInterval {
             return false
         }
         lastScanTimestamp = now
         
-        // Tầng 2: Đo độ thay đổi điểm ảnh (Pixel Diff Gate)
-        let currentPixels = extractGrayscaleThumbnail(from: croppedROIImage)
+        let currentMask = extractBrightTextMask(from: image)
         
-        if previousThumbnailPixels.count == currentPixels.count && !forceScan {
-            var totalDiff: Int = 0
-            for i in 0..<currentPixels.count {
-                totalDiff += abs(Int(currentPixels[i]) - Int(previousThumbnailPixels[i]))
+        if previousHighContrastMask.count == currentMask.count && !forceScan {
+            var diffPixels = 0
+            for i in 0..<currentMask.count {
+                if abs(Int(currentMask[i]) - Int(previousHighContrastMask[i])) > 35 {
+                    diffPixels += 1
+                }
             }
-            let maxPossibleDiff = Double(currentPixels.count * 255)
-            let normalizedDiff = Double(totalDiff) / maxPossibleDiff
+            let normalizedDiff = Double(diffPixels) / Double(currentMask.count)
             
             DispatchQueue.main.async {
                 self.lastDiffValue = normalizedDiff
             }
             
-            // Nếu hình ảnh trong vùng phụ đề gần như đứng yên -> Nghỉ quét!
             if normalizedDiff < pixelDiffThreshold {
                 DispatchQueue.main.async {
                     self.skippedStaticFramesCount += 1
@@ -64,36 +56,36 @@ class SmartThrottler: ObservableObject {
             }
         }
         
-        // Cập nhật mẫu ảnh mới và cho phép chạy OCR
-        previousThumbnailPixels = currentPixels
+        previousHighContrastMask = currentMask
         DispatchQueue.main.async {
             self.actualOCRScansCount += 1
         }
         return true
     }
     
-    /// Đặt lại bộ nhớ ảnh khi người dùng di chuyển khung ROI
     func resetDiffMemory() {
-        previousThumbnailPixels.removeAll()
+        previousHighContrastMask.removeAll()
     }
     
-    /// Thu nhỏ ảnh vùng ROI về 32x8 điểm ảnh đen trắng
-    private func extractGrayscaleThumbnail(from image: CGImage) -> [UInt8] {
-        var pixels = [UInt8](repeating: 0, count: thumbWidth * thumbHeight)
+    /// Chỉ giữ lại các điểm ảnh sáng (nơi thường chứa chữ phụ đề, nhiệm vụ, menu)
+    private func extractBrightTextMask(from image: CGImage) -> [UInt8] {
+        var rawPixels = [UInt8](repeating: 0, count: gridWidth * gridHeight)
         let colorSpace = CGColorSpaceCreateDeviceGray()
         
         if let context = CGContext(
-            data: &pixels,
-            width: thumbWidth,
-            height: thumbHeight,
+            data: &rawPixels,
+            width: gridWidth,
+            height: gridHeight,
             bitsPerComponent: 8,
-            bytesPerRow: thumbWidth,
+            bytesPerRow: gridWidth,
             space: colorSpace,
             bitmapInfo: CGImageAlphaInfo.none.rawValue
         ) {
             context.interpolationQuality = .low
-            context.draw(image, in: CGRect(x: 0, y: 0, width: thumbWidth, height: thumbHeight))
+            context.draw(image, in: CGRect(x: 0, y: 0, width: gridWidth, height: gridHeight))
         }
-        return pixels
+        
+        // Lọc bỏ cảnh nền tối, chỉ giữ lại các điểm sáng của chữ (> 165)
+        return rawPixels.map { $0 > 165 ? $0 : 0 }
     }
 }
