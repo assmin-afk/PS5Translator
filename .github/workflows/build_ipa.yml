@@ -9,36 +9,44 @@ jobs:
   build_unsigned_ipa:
     runs-on: macos-latest
     steps:
-      - name: 1. Tai code ve may chu Mac
+      - name: 1. Tai code va icon.png ve may chu Mac
         uses: actions/checkout@v4
 
-      - name: 2. Tu dong gom file Swift va sua loi duoi .txt (neu co)
+      - name: 2. Gom 6 file Swift va tao Bo Icon App iPhone tu icon.png
         run: |
           mkdir -p Sources
-          
+
           # Tu dong doi ten neu Windows luu nham thanh .swift.txt
           for f in *.swift.txt; do
             [ -f "$f" ] && cp "$f" "Sources/${f%.txt}"
           done
-          
+
           # Copy tat ca file .swift vao thu muc Sources
           for f in *.swift; do
             [ -f "$f" ] && cp "$f" "Sources/$f"
           done
 
-          # Kiem tra xem da co file Swift nao trong Sources chua
-          echo "Danh sach file Swift tim thay:"
-          ls -la Sources/
-          if [ -z "$(ls -A Sources/*.swift 2>/dev/null)" ]; then
-            echo "LOI: Ban chua tai 6 file .swift len trang Code cua GitHub!"
-            exit 1
-          fi
-
-          # Tu dong nang cap ham doc SQLite an toan cho Swift moi trong File 5
-          if [ -f "Sources/5_PredictiveTranslator.swift" ]; then
-            sed -i '' 's/String(cString: sqlite3_column_text(statement, 0))/sqlite3_column_text(statement, 0).flatMap { String(cString: $0) } ?? "0"/g' Sources/5_PredictiveTranslator.swift
-            sed -i '' 's/String(cString: sqlite3_column_text(statement, 1))/sqlite3_column_text(statement, 1).flatMap { String(cString: $0) } ?? ""/g' Sources/5_PredictiveTranslator.swift
-            sed -i '' 's/String(cString: sqlite3_column_text(statement, 2))/sqlite3_column_text(statement, 2).flatMap { String(cString: $0) } ?? ""/g' Sources/5_PredictiveTranslator.swift
+          # Neu co file icon.png thi tao bo AppIcon chuan iOS va copy vao App
+          if [ -f "icon.png" ]; then
+            cp icon.png Sources/icon.png
+            mkdir -p Sources/Assets.xcassets/AppIcon.appiconset
+            sips -z 1024 1024 icon.png --out Sources/Assets.xcassets/AppIcon.appiconset/Icon-1024.png
+            cat << 'EOF' > Sources/Assets.xcassets/AppIcon.appiconset/Contents.json
+          {
+            "images" : [
+              {
+                "filename" : "Icon-1024.png",
+                "idiom" : "universal",
+                "platform" : "ios",
+                "size" : "1024x1024"
+              }
+            ],
+            "info" : {
+              "author" : "xcode",
+              "version" : 1
+            }
+          }
+          EOF
           fi
 
           if [ -f "game_data.sqlite" ]; then
@@ -61,6 +69,8 @@ jobs:
                 properties:
                   CFBundleDisplayName: PS5 Translator
                   UILaunchScreen: {}
+                  UIFileSharingEnabled: true
+                  LSSupportsOpeningDocumentsInPlace: true
                   UISupportedInterfaceOrientations:
                     - UIInterfaceOrientationPortrait
                     - UIInterfaceOrientationLandscapeLeft
@@ -69,6 +79,7 @@ jobs:
               settings:
                 base:
                   PRODUCT_BUNDLE_IDENTIFIER: com.ps5viet.translator
+                  ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
                   CODE_SIGN_IDENTITY: ""
                   CODE_SIGNING_REQUIRED: NO
                   CODE_SIGNING_ALLOWED: NO
