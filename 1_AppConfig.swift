@@ -1,42 +1,99 @@
 // ============================================================================
 // FILE 1: 1_AppConfig.swift
-// NHIỆM VỤ: Bảng điều khiển chứa toàn bộ thông số cài đặt mặc định và cấu trúc
-// gói tin chuẩn giao tiếp giữa các file và gửi sang TV Samsung.
+// NHIỆM VỤ: Lưu trữ cấu hình toàn cục, cấu trúc Hồ sơ Game, cấu hình Liên kết PS5,
+// phân loại vùng chữ (Thoại / Nhiệm vụ / Menu) và bộ lọc nút bấm / hiệu ứng.
 // ============================================================================
 
 import Foundation
 import CoreGraphics
+import SwiftUI
 
 struct AppConfig {
-    // 1. CẤU HÌNH QUÉT & CHỐNG NÓNG MÁY (Có thể chỉnh trực tiếp tại đây)
-    /// Tốc độ quét mặc định khi mới mở App (từ 1.0 đến 15.0 khung hình/giây)
+    // 1. CẤU HÌNH QUÉT & CHỐNG NÓNG MÁY
     static let defaultScanFPS: Double = 5.0
+    static let defaultPixelDiffThreshold: Double = 0.022
     
-    /// Ngưỡng thay đổi hình ảnh tối thiểu để kích hoạt OCR (0.025 = 2.5%)
-    /// Nếu hình ảnh thay đổi ít hơn mức này -> Máy hiểu là câu thoại đang đứng yên -> Ngừng quét để mát máy.
-    static let defaultPixelDiffThreshold: Double = 0.025
+    // 2. CHẾ ĐỘ QUÉT MẶC ĐỊNH (true = Quét toàn màn hình, false = Quét theo khung ROI)
+    static let defaultFullScreenScan: Bool = true
+    static let defaultROIRect = CGRect(x: 0.08, y: 0.68, width: 0.84, height: 0.25)
     
-    // 2. CẤU HÌNH VÙNG QUÉT PHỤ ĐỀ MẶC ĐỊNH (ROI - Tính theo tỷ lệ 0.0 -> 1.0)
-    /// Mặc định quét vùng phụ đề ở cạnh dưới màn hình (cách lề trái 10%, cách đỉnh 72%, rộng 80%, cao 20%)
-    static let defaultROIRect = CGRect(x: 0.10, y: 0.72, width: 0.80, height: 0.20)
-    
-    // 3. CẤU HÌNH ĐOÁN CÂU VIỆT HOÁ (Predictive Matcher)
-    /// Tỷ lệ khớp từ khoá tối thiểu (0.45 = chỉ cần OCR đọc đúng 45% từ khoá là đoán ra cả câu)
+    // 3. CẤU HÌNH ĐOÁN CÂU VIỆT HOÁ & DỊCH AI APPLE
     static let minimumMatchScore: Double = 0.45
-    
-    /// Số lượng câu thoại kế tiếp được ưu tiên cộng điểm theo mạch cốt truyện
     static let sequentialLookaheadWindow: Int = 15
+    static let enableAppleAIFallback: Bool = true
     
-    // 4. CẤU HÌNH KẾT NỐI VỚI TV SAMSUNG
-    /// Cổng WebSocket cố định để TV Samsung kết nối vào iPhone
+    // 4. CỔNG WEBSOCKET KẾT NỐI TV SAMSUNG
     static let webSocketPort: UInt16 = 8080
+    
+    // 5. DANH SÁCH NÚT BẤM TAY CẦM PS5 CẦN BẢO VỆ (KHÔNG DỊCH & KHÔNG ĐÈ LÊN)
+    static let controllerButtonTokens: Set<String> = [
+        "x", "o", "□", "△", "l1", "r1", "l2", "r2", "l3", "r3",
+        "[x]", "[o]", "[□]", "[△]", "(x)", "(o)", "(□)", "(△)",
+        "<x>", "<o>", "options", "share", "touchpad", "d-pad"
+    ]
+    
+    // 6. DANH SÁCH HIỆU ỨNG MÀN HÌNH / THÔNG SỐ HUD CẦN BỎ QUA
+    static let ignoredScreenEffects: Set<String> = [
+        "critical", "critical!", "miss", "dodge", "parry", "block",
+        "slash", "slash!!", "boom", "bam", "combo", "hit", "hits",
+        "fps", "hp", "mp", "sp", "exp", "xp", "lv", "lvl", "loading..."
+    ]
+}
+
+// MARK: - Phân loại vùng chữ trên màn hình Game
+enum TextRegionCategory: String, Codable, CaseIterable {
+    case dialogue = "dialogue" // Thoại nhân vật (Cạnh dưới màn hình)
+    case quest    = "quest"    // Thông tin nhiệm vụ (Góc trên trái/phải)
+    case menu     = "menu"     // Menu game / Vật phẩm / Tương tác
+    
+    var displayName: String {
+        switch self {
+        case .dialogue: return "Thoại nhân vật"
+        case .quest:    return "Nhiệm vụ (HUD)"
+        case .menu:     return "Menu / Tương tác"
+        }
+    }
+    
+    var textColor: Color {
+        switch self {
+        case .dialogue: return Color(red: 1.0, green: 0.92, blue: 0.15) // Vàng phụ đề
+        case .quest:    return Color(red: 0.35, green: 0.95, blue: 1.0) // Xanh ngọc nhiệm vụ
+        case .menu:     return Color.white                              // Trắng sáng cho Menu
+        }
+    }
+    
+    var borderColor: Color {
+        switch self {
+        case .dialogue: return Color.yellow.opacity(0.6)
+        case .quest:    return Color.cyan.opacity(0.7)
+        case .menu:     return Color.white.opacity(0.45)
+        }
+    }
+}
+
+// MARK: - Cấu trúc Hồ sơ Game (Game Profile)
+struct GameProfile: Codable, Identifiable, Equatable {
+    let id: String
+    var title: String
+    var sqliteFileName: String
+    var sentenceCount: Int
+    var updatedAt: String
+}
+
+// MARK: - Cấu hình Liên kết Tài khoản PS5 Remote Play
+struct PS5AccountConfig: Codable {
+    var psnAccountName: String = ""
+    var psnAccountIDBase64: String = ""
+    var pairingPIN: String = ""
+    var ps5LocalIP: String = "192.168.1.100"
+    var useSecondaryAccountMode: Bool = true
+    var isLinked: Bool = false
 }
 
 // ============================================================================
-// CẤU TRÚC GÓI TIN CHUẨN (TUYỆT ĐỐI KHÔNG ĐỔI TÊN BIẾN ĐỂ KHỚP VỚI TV SAMSUNG)
+// CẤU TRÚC GÓI TIN CHUẨN BẮN SANG TV SAMSUNG (GIỮ NGUYÊN TƯƠNG THÍCH 100%)
 // ============================================================================
 
-/// Một khung chữ đã dịch kèm toạ độ tỷ lệ phần trăm (0.0 -> 1.0) trên màn hình 16:9
 struct TranslatedBox: Codable, Identifiable, Equatable {
     var id: String { "\(text)_\(x)_\(y)" }
     let text: String
@@ -44,17 +101,18 @@ struct TranslatedBox: Codable, Identifiable, Equatable {
     let y: Double
     let w: Double
     let h: Double
+    var category: String = TextRegionCategory.dialogue.rawValue
+    var isAITranslated: Bool = false
 }
 
-/// Gói tin JSON tổng bắn từ iPhone sang TV Samsung qua cổng 8080
 struct TVPayload: Codable {
-    /// Nhận giá trị "show" (hiện chữ) hoặc "clear" (xoá chữ)
     let status: String
     let boxes: [TranslatedBox]
 }
 
-/// Kết quả thô do bộ OCR quét được trước khi đưa vào bộ đoán câu
 struct RawOCRResult {
-    let rawText: String
-    let normalizedRect: CGRect // Toạ độ (x, y, w, h) tính từ góc trên bên trái toàn màn hình (0.0 -> 1.0)
+    let cleanTextForTranslation: String
+    let normalizedRect: CGRect
+    let category: TextRegionCategory
+    let hadLeadingButtonPrompt: Bool
 }
