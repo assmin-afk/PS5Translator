@@ -1,9 +1,5 @@
 // ============================================================================
-// FILE 6: 6_OverlayAndBroadcaster.swift (GIAO DIỆN SONY PS REMOTE PLAY)
-// NHIỆM VỤ:
-// 1. Giao diện chính lấy cảm hứng từ ứng dụng PS Remote Play của Sony (#00439C).
-// 2. Hiển thị trực tiếp màn hình PS5 kèm khung vùng quét OCR (ROI) & phụ đề Tiếng Việt.
-// 3. Bảng Liên kết Tài khoản PS5 & Mã PIN 8 chữ số trực quan, dễ thao tác.
+// FILE 6: 6_OverlayAndBroadcaster.swift (BẢN CHUẨN TƯƠNG THÍCH 100% XCODE)
 // ============================================================================
 
 import SwiftUI
@@ -12,7 +8,6 @@ import Combine
 import WebKit
 import UniformTypeIdentifiers
 
-// MARK: - 1. Máy chủ WebSocket phát phụ đề sang TV Samsung
 class TVWebSocketServer: ObservableObject {
     @Published var connectedCount: Int = 0
     @Published var ipAddress: String = "Đang lấy IP..."
@@ -73,7 +68,6 @@ class TVWebSocketServer: ObservableObject {
     }
 }
 
-// MARK: - 2. Bộ điều phối luồng Quét chữ & Dịch thuật trên màn hình PS5
 class PipelineCoordinator: ObservableObject {
     @Published var videoMgr = VideoSourceManager()
     @Published var throttler = SmartThrottler()
@@ -132,7 +126,6 @@ class PipelineCoordinator: ObservableObject {
             let englishPreview = rawResults.map { $0.rawText }.joined(separator: " ")
             
             self.translator.translate(ocrResults: rawResults) { boxes in
-                // Quy đổi toạ độ từ vùng cắt ROI về đúng vị trí trên màn hình PS5 16:9
                 let mappedBoxes = boxes.map { b in
                     TranslatedBox(
                         text: b.text,
@@ -154,13 +147,11 @@ class PipelineCoordinator: ObservableObject {
     }
 }
 
-// MARK: - 3. Giao diện chính lấy cảm hứng từ Sony PS Remote Play
 struct MainTranslatorView: View {
     @StateObject private var coord = PipelineCoordinator()
     @State private var showPS5ConnectSheet = false
     @State private var showDatabaseSheet = false
     
-    // Bảng màu đặc trưng của Sony PlayStation
     private let psDarkBg = Color(red: 0.02, green: 0.04, blue: 0.09)
     private let psBluePrimary = Color(red: 0.0, green: 0.26, blue: 0.61)
     private let psNeonAccent = Color(red: 0.0, green: 0.44, blue: 0.82)
@@ -175,18 +166,10 @@ struct MainTranslatorView: View {
             .ignoresSafeArea()
             
             VStack(spacing: 12) {
-                // THANH TRẠNG THÁI PHONG CÁCH PS REMOTE PLAY
                 topPlayStationBar
-                
-                // MÀN HÌNH HIỂN THỊ TRỰC TIẾP PS5 (16:9) + KHUNG QUÉT OCR + PHỤ ĐỀ
                 ps5ScreenViewport
-                
-                // THANH TRẠNG THÁI QUÉT CHỮ REAL-TIME
                 liveOCRStatusStrip
-                
-                // BẢNG ĐIỀU KHIỂN NHANH KIỂU DUALSENSE OVERLAY
                 bottomDualSenseControlBar
-                
                 Spacer(minLength: 4)
             }
             .padding(.top, 6)
@@ -200,7 +183,6 @@ struct MainTranslatorView: View {
         }
     }
     
-    // MARK: - Thanh Header PlayStation
     private var topPlayStationBar: some View {
         HStack(spacing: 10) {
             HStack(spacing: 8) {
@@ -219,7 +201,7 @@ struct MainTranslatorView: View {
                         Circle()
                             .fill(coord.videoMgr.isConnectedToPS5 ? Color.green : Color.orange)
                             .frame(width: 7, height: 7)
-                        Text(coord.videoMgr.isConnectedToPS5 ? "Đã nối: \(coord.videoMgr.ps5HostIP)" : "Chưa liên kết PS5 (Đang chạy mẫu)")
+                        Text(coord.videoMgr.isConnectedToPS5 ? "Đã nối: \(coord.videoMgr.ps5HostIP)" : "Chưa liên kết PS5 (Chế độ mẫu)")
                             .font(.system(size: 11, weight: .medium))
                             .foregroundColor(.white.opacity(0.8))
                     }
@@ -228,7 +210,6 @@ struct MainTranslatorView: View {
             
             Spacer()
             
-            // Nút trạng thái TV Samsung
             HStack(spacing: 4) {
                 Image(systemName: "tv.fill")
                     .font(.caption2)
@@ -241,7 +222,6 @@ struct MainTranslatorView: View {
             .foregroundColor(coord.server.connectedCount > 0 ? .green : .white)
             .clipShape(Capsule())
             
-            // Nút mở nhanh Bảng Kết Nối PS5
             Button(action: { showPS5ConnectSheet = true }) {
                 HStack(spacing: 4) {
                     Image(systemName: "link.badge.plus")
@@ -258,7 +238,6 @@ struct MainTranslatorView: View {
         .padding(.horizontal, 14)
     }
     
-    // MARK: - Màn hình PS5 16:9 hiển thị trên App để quét chữ
     private var ps5ScreenViewport: some View {
         ZStack {
             if let img = coord.videoMgr.currentFullFrame {
@@ -268,7 +247,6 @@ struct MainTranslatorView: View {
                     .overlay(
                         GeometryReader { geo in
                             ZStack {
-                                // 1. Khung viền chỉ thị vùng quét OCR (Smart ROI) trên màn hình PS5
                                 if coord.showROIGuideBox {
                                     let roi = coord.videoMgr.getNormalizedROIRect(for: coord.roiMode)
                                     RoundedRectangle(cornerRadius: 8)
@@ -284,7 +262,6 @@ struct MainTranslatorView: View {
                                         )
                                 }
                                 
-                                // 2. Lớp phụ đề Tiếng Việt hiển thị đè trực tiếp trên màn hình PS5
                                 ForEach(coord.translatedBoxes) { box in
                                     Text(box.text)
                                         .font(.system(size: 15, weight: .bold))
@@ -309,7 +286,6 @@ struct MainTranslatorView: View {
             } else {
                 VStack(spacing: 10) {
                     ProgressView()
-                        .tint(.cyan)
                     Text("Đang khởi tạo khung hình PS5...")
                         .font(.caption)
                         .foregroundColor(.gray)
@@ -334,7 +310,6 @@ struct MainTranslatorView: View {
         .padding(.horizontal, 12)
     }
     
-    // MARK: - Thanh hiển thị câu gốc vừa quét được & câu dịch
     private var liveOCRStatusStrip: some View {
         HStack(spacing: 8) {
             Image(systemName: "viewfinder")
@@ -361,10 +336,8 @@ struct MainTranslatorView: View {
         .padding(.horizontal, 12)
     }
     
-    // MARK: - Bảng điều khiển bên dưới lấy cảm hứng từ PS Remote Play
     private var bottomDualSenseControlBar: some View {
         VStack(spacing: 10) {
-            // Chọn vùng quét chữ trên màn hình PS5
             HStack {
                 Text("Vùng quét chữ:")
                     .font(.caption.bold())
@@ -378,26 +351,28 @@ struct MainTranslatorView: View {
                 
                 Toggle("", isOn: $coord.showROIGuideBox)
                     .labelsHidden()
-                    .tint(psNeonAccent)
             }
             
-            // Chọn nguồn hình ảnh (PS5 Remote / Camera / Giả lập)
-            HStack {
+            HStack(spacing: 8) {
                 Text("Nguồn hình:")
                     .font(.caption.bold())
                     .foregroundColor(.white.opacity(0.8))
-                Picker("Nguồn hình", selection: $coord.videoMgr.feedSource) {
-                    ForEach(VideoFeedSource.allCases, id: \.self) { src in
-                        Text(src.rawValue).tag(src)
+                ForEach(VideoFeedSource.allCases, id: \.self) { src in
+                    Button(action: {
+                        coord.videoMgr.setVideoFeedSource(src)
+                    }) {
+                        Text(src.rawValue)
+                            .font(.system(size: 11, weight: .bold))
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 6)
+                            .background(coord.videoMgr.feedSource == src ? psNeonAccent : Color.white.opacity(0.1))
+                            .foregroundColor(.white)
+                            .cornerRadius(6)
                     }
                 }
-                .pickerStyle(SegmentedPickerStyle())
-                .onChange(of: coord.videoMgr.feedSource) { newSource in
-                    coord.videoMgr.setVideoFeedSource(newSource)
-                }
+                Spacer()
             }
             
-            // Hàng nút chức năng lớn kiểu PS5 Control Center
             HStack(spacing: 10) {
                 Button(action: { showPS5ConnectSheet = true }) {
                     HStack {
@@ -448,7 +423,6 @@ struct MainTranslatorView: View {
     }
 }
 
-// MARK: - 4. Giao diện Liên kết Tài khoản PS5 (Thiết kế mới dễ nhìn, dễ thao tác)
 struct PS5ConnectionWizardView: View {
     @ObservedObject var coord: PipelineCoordinator
     @Environment(\.presentationMode) var presentationMode
@@ -460,7 +434,6 @@ struct PS5ConnectionWizardView: View {
         NavigationView {
             ScrollView {
                 VStack(alignment: .leading, spacing: 16) {
-                    // Banner hướng dẫn trực quan kiểu PS Remote Play
                     HStack(spacing: 12) {
                         Image(systemName: "gamecontroller.fill")
                             .font(.system(size: 30))
@@ -483,13 +456,12 @@ struct PS5ConnectionWizardView: View {
                     .background(Color(red: 0.06, green: 0.13, blue: 0.28))
                     .cornerRadius(14)
                     
-                    // BƯỚC 1: TÌM MÁY PS5 TRONG MẠNG WI-FI
                     VStack(alignment: .leading, spacing: 10) {
                         Label("BƯỚC 1: Địa chỉ IP của máy PS5", systemImage: "1.circle.fill")
                             .font(.subheadline.bold())
                             .foregroundColor(.cyan)
                         
-                        Text("Vào PS5 -> Cài đặt -> Mạng -> Trạng thái kết nối -> Xem địa chỉ IPv4, hoặc bấm nút Quét tự động bên dưới:")
+                        Text("Vào PS5 -> Cài đặt -> Mạng -> Trạng thái kết nối -> Xem địa chỉ IPv4, hoặc bấm nút Quét tự động:")
                             .font(.caption)
                             .foregroundColor(.gray)
                         
@@ -519,15 +491,10 @@ struct PS5ConnectionWizardView: View {
                     .background(Color.white.opacity(0.06))
                     .cornerRadius(14)
                     
-                    // BƯỚC 2: TÀI KHOẢN PSN PHỤ & MÃ ACCOUNT ID
                     VStack(alignment: .leading, spacing: 10) {
                         Label("BƯỚC 2: Tài khoản PSN Phụ (Dùng để lấy hình ảnh)", systemImage: "2.circle.fill")
                             .font(.subheadline.bold())
                             .foregroundColor(.cyan)
-                        
-                        Text("Đăng nhập tài khoản phụ trên PS5 trước, sau đó điền tên hiển thị hoặc bấm lấy mã Account ID tự động:")
-                            .font(.caption)
-                            .foregroundColor(.gray)
                         
                         TextField("Tên tài khoản PSN phụ (VD: Player2_VN)", text: $coord.videoMgr.psnUsername)
                             .padding(10)
@@ -558,13 +525,12 @@ struct PS5ConnectionWizardView: View {
                     .background(Color.white.opacity(0.06))
                     .cornerRadius(14)
                     
-                    // BƯỚC 3: NHẬP MÃ PIN 8 CHỮ SỐ TRÊN MÀN HÌNH PS5
                     VStack(alignment: .leading, spacing: 10) {
                         Label("BƯỚC 3: Mã PIN 8 số liên kết thiết bị", systemImage: "3.circle.fill")
                             .font(.subheadline.bold())
                             .foregroundColor(.cyan)
                         
-                        Text("Trên PS5 (ở tài khoản phụ): Vào Cài đặt -> Hệ thống -> Chơi từ xa (Remote Play) -> Liên kết thiết bị (Link Device) để lấy 8 chữ số:")
+                        Text("Trên PS5 (ở tài khoản phụ): Cài đặt -> Hệ thống -> Chơi từ xa -> Liên kết thiết bị:")
                             .font(.caption)
                             .foregroundColor(.gray)
                         
@@ -585,7 +551,6 @@ struct PS5ConnectionWizardView: View {
                     .background(Color.white.opacity(0.06))
                     .cornerRadius(14)
                     
-                    // NÚT BẤM LIÊN KẾT LỚN PHONG CÁCH PLAYSTATION
                     Button(action: {
                         coord.videoMgr.pairAndConnectToPS5(
                             username: coord.videoMgr.psnUsername,
@@ -607,7 +572,6 @@ struct PS5ConnectionWizardView: View {
                         .background(psBlue)
                         .foregroundColor(.white)
                         .cornerRadius(12)
-                        .shadow(color: psBlue.opacity(0.5), radius: 8, x: 0, y: 3)
                     }
                     
                     if coord.videoMgr.isConnectedToPS5 {
@@ -647,7 +611,6 @@ struct PS5ConnectionWizardView: View {
     }
 }
 
-// MARK: - 5. Cửa sổ hỗ trợ đăng nhập Sony PSN chính thức để lấy Account ID
 struct PSNWebLoginHelperView: View {
     @Binding var accountIDBase64: String
     @Environment(\.presentationMode) var presentationMode
@@ -685,7 +648,6 @@ struct SonyWebView: UIViewRepresentable {
     func updateUIView(_ uiView: WKWebView, context: Context) {}
 }
 
-// MARK: - 6. Bảng Quản lý Database Việt hoá (.sqlite) & Tốc độ quét
 struct DatabaseAndTVSettingsView: View {
     @ObservedObject var coord: PipelineCoordinator
     @Environment(\.presentationMode) var presentationMode
@@ -710,13 +672,20 @@ struct DatabaseAndTVSettingsView: View {
                     }
                     
                     if !coord.savedProfiles.isEmpty {
-                        Picker("Chuyển đổi Hồ sơ Game đã lưu", selection: $coord.activeGameProfile) {
-                            ForEach(coord.savedProfiles, id: \.self) { name in
-                                Text(name).tag(name)
+                        ForEach(coord.savedProfiles, id: \.self) { name in
+                            Button(action: {
+                                coord.selectSavedProfile(name)
+                            }) {
+                                HStack {
+                                    Text(name)
+                                        .foregroundColor(.white)
+                                    Spacer()
+                                    if coord.activeGameProfile == name {
+                                        Image(systemName: "checkmark.circle.fill")
+                                            .foregroundColor(.green)
+                                    }
+                                }
                             }
-                        }
-                        .onChange(of: coord.activeGameProfile) { selected in
-                            coord.selectSavedProfile(selected)
                         }
                     }
                 }
@@ -737,9 +706,9 @@ struct DatabaseAndTVSettingsView: View {
                     }
                 }
                 
-                Section(header: Text("3. Tốc độ quét OCR & Chống nóng máy")) {
-                    Stepper("Tốc độ quét: \(Int(coord.throttler.targetScanFPS)) khung hình/giây", value: $coord.throttler.targetScanFPS, in: 1...15)
-                    Toggle("Hiện khung viền nét đứt vùng quét (ROI) trên màn hình PS5", isOn: $coord.showROIGuideBox)
+                Section(header: Text("3. Tốc độ quét OCR & Hiển thị")) {
+                    Stepper("Tốc độ quét: \(Int(coord.throttler.targetScanFPS)) FPS", value: $coord.throttler.targetScanFPS, in: 1...15)
+                    Toggle("Hiện khung viền nét đứt vùng quét (ROI)", isOn: $coord.showROIGuideBox)
                 }
             }
             .navigationTitle("Database & TV Samsung")
