@@ -1,5 +1,10 @@
 // ============================================================================
-// FILE 2: 2_VideoSourceManager.swift (ĐÃ BỔ SUNG ĐẦY ĐỦ ENUM ROIMODE)
+// FILE 2: 2_VideoSourceManager.swift
+// PHIÊN BẢN: PS5Translator 1.01
+// NHIỆM VỤ:
+// 1. Mặc định sử dụng cố định nguồn hình PS5 Remote Play (đã loại bỏ chọn nguồn).
+// 2. Giữ nguyên ROI "Toàn màn hình", cho phép căn chỉnh khung ROI "Chỉ phụ đề"
+//    và "Nhiệm vụ & Menu" (kéo thả hoặc chỉnh thanh trượt, tự lưu vào bộ nhớ máy).
 // ============================================================================
 
 import Foundation
@@ -7,21 +12,29 @@ import UIKit
 import CoreGraphics
 import Combine
 import Network
-import AVFoundation
 
-// Khai báo ROIMode ngay tại đây để cả File 2 và File 6 đều nhận diện được
+// ============================================================================
+// THÔNG SỐ CẤU HÌNH KHUNG QUÉT MẶC ĐỊNH (Đặt ở đầu file để dễ tuỳ chỉnh)
+// ============================================================================
+struct ROIDefaultConfig {
+    // 1. Toàn màn hình (Giữ nguyên cố định)
+    static let fullScreenRect = CGRect(x: 0.02, y: 0.04, width: 0.96, height: 0.92)
+    
+    // 2. Chỉ phụ đề (Mặc định ở vùng dưới màn hình, có thể căn chỉnh)
+    static let dialogueDefaultRect = CGRect(x: 0.10, y: 0.66, width: 0.80, height: 0.24)
+    
+    // 3. Nhiệm vụ & Menu (Mặc định vùng giữa và góc màn hình, có thể căn chỉnh)
+    static let questDefaultRect = CGRect(x: 0.05, y: 0.14, width: 0.90, height: 0.72)
+}
+
+// Chế độ vùng quét chữ (ROI)
 enum ROIMode: String, CaseIterable {
     case fullScreen = "Toàn màn hình"
     case dialogueOnly = "Chỉ phụ đề"
     case questAndMenu = "Nhiệm vụ & Menu"
 }
 
-enum VideoFeedSource: String, CaseIterable {
-    case ps5RemoteStream = "Màn hình PS5 (Remote)"
-    case liveCamera = "Camera Quét TV"
-    case testSimulator = "Giả lập Test"
-}
-
+// Trạng thái kết nối PS5 Remote Play
 enum PS5ConnectionState: Equatable {
     case disconnected
     case scanningLAN
@@ -30,14 +43,16 @@ enum PS5ConnectionState: Equatable {
     case error(message: String)
 }
 
-class VideoSourceManager: NSObject, ObservableObject, AVCaptureVideoDataOutputSampleBufferDelegate {
+class VideoSourceManager: NSObject, ObservableObject {
+    // Khung hình hiện tại từ PS5 Remote Play đưa vào bộ quét OCR
     @Published var currentFullFrame: CGImage?
     
+    // Trạng thái kết nối máy PS5
     @Published var connectionState: PS5ConnectionState = .disconnected
     @Published var isConnectedToPS5: Bool = false
     @Published var isUsingTestSimulator: Bool = true
-    @Published var feedSource: VideoFeedSource = .testSimulator
     
+    // Thông tin liên kết tài khoản PSN phụ & máy PS5
     @Published var psnUsername: String = UserDefaults.standard.string(forKey: "psn_user") ?? ""
     @Published var psnAccountIDBase64: String = UserDefaults.standard.string(forKey: "psn_aid") ?? ""
     @Published var psnPinCode: String = ""
@@ -45,27 +60,107 @@ class VideoSourceManager: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
     @Published var discoveredPS5Name: String = "Chưa tìm thấy PS5"
     @Published var statusLog: String = "Sẵn sàng kết nối máy PS5 trong cùng mạng Wi-Fi."
     
+    // Khung ROI có thể căn chỉnh riêng cho "Chỉ phụ đề" và "Nhiệm vụ & Menu"
+    @Published var customDialogueRect: CGRect
+    @Published var customQuestRect: CGRect
+    
     private var timer: Timer?
-    private var currentSampleIndex: Int = 0
     private var udpConnection: NWConnection?
     
-    private let captureSession = AVCaptureSession()
-    private let cameraQueue = DispatchQueue(label: "ps5.camera.queue")
-    private var isCameraConfigured = false
-    
-    private let sampleScenes: [(dialogue: String, type: String, location: String)] = [
-        ("Where is the key to the ancient basement?", "Hội thoại cốt truyện", "HORIZON ZERO DAWN - REMASTERED"),
-        ("Follow the blood trail through the dark forest.", "Hội thoại nhân vật", "UNTIL DAWN - PS5 REMAKE"),
-        ("QUEST: Find 3 hidden relics in the dark forest.", "Nhiệm vụ (Quest)", "HORIZON ZERO DAWN - REMASTERED"),
-        ("SYSTEM WARNING: Low health! Use healing item.", "Cảnh báo hệ thống", "PS5 REMOTE PLAY STREAM"),
-        ("Press [CROSS] to open inventory and [CIRCLE] to exit.", "Hướng dẫn nút bấm", "PS5 REMOTE PLAY STREAM")
-    ]
+    // Cảnh hiển thị trên màn hình chờ Remote Play trước khi vào game thật
+    private let previewDialogue = "Where is the key to the ancient basement?"
+    private let previewGameTitle = "HORIZON ZERO DAWN - REMASTERED"
     
     override init() {
+        // Đọc toạ độ khung ROI đã lưu từ bộ nhớ iPhone (nếu chưa có thì lấy mặc định)
+        self.customDialogueRect = VideoSourceManager.loadSavedRect(
+            key: "roi_dialogue_v101",
+            fallback: ROIDefaultConfig.dialogueDefaultRect
+        )
+        self.customQuestRect = VideoSourceManager.loadSavedRect(
+            key: "roi_quest_v101",
+            fallback: ROIDefaultConfig.questDefaultRect
+        )
         super.init()
-        startFrameLoop()
+        startPS5RemoteStreamLoop()
     }
     
+    // MARK: - 1. Quản lý & Căn chỉnh khung ROI (Chỉ phụ đề & Nhiệm vụ)
+    func getNormalizedROIRect(for mode: ROIMode) -> CGRect {
+        switch mode {
+        case .fullScreen:
+            return ROIDefaultConfig.fullScreenRect
+        case .dialogueOnly:
+            return customDialogueRect
+        case .questAndMenu:
+            return customQuestRect
+        }
+    }
+    
+    func updateCustomROIRect(for mode: ROIMode, newRect: CGRect) {
+        // Giới hạn toạ độ luôn nằm gọn trong màn hình 16:9 (0.02 -> 0.98)
+        let clampedW = max(0.15, min(0.96, newRect.width))
+        let clampedH = max(0.08, min(0.92, newRect.height))
+        let clampedX = max(0.02, min(0.98 - clampedW, newRect.origin.x))
+        let clampedY = max(0.02, min(0.98 - clampedH, newRect.origin.y))
+        let safeRect = CGRect(x: clampedX, y: clampedY, width: clampedW, height: clampedH)
+        
+        switch mode {
+        case .fullScreen:
+            break // Toàn màn hình giữ nguyên cố định
+        case .dialogueOnly:
+            customDialogueRect = safeRect
+            VideoSourceManager.saveRect(safeRect, key: "roi_dialogue_v101")
+        case .questAndMenu:
+            customQuestRect = safeRect
+            VideoSourceManager.saveRect(safeRect, key: "roi_quest_v101")
+        }
+    }
+    
+    func resetROIRectToDefault(for mode: ROIMode) {
+        switch mode {
+        case .fullScreen:
+            break
+        case .dialogueOnly:
+            customDialogueRect = ROIDefaultConfig.dialogueDefaultRect
+            VideoSourceManager.saveRect(customDialogueRect, key: "roi_dialogue_v101")
+        case .questAndMenu:
+            customQuestRect = ROIDefaultConfig.questDefaultRect
+            VideoSourceManager.saveRect(customQuestRect, key: "roi_quest_v101")
+        }
+    }
+    
+    private static func saveRect(_ rect: CGRect, key: String) {
+        let array: [Double] = [
+            Double(rect.origin.x),
+            Double(rect.origin.y),
+            Double(rect.size.width),
+            Double(rect.size.height)
+        ]
+        UserDefaults.standard.set(array, forKey: key)
+    }
+    
+    private static func loadSavedRect(key: String, fallback: CGRect) -> CGRect {
+        guard let arr = UserDefaults.standard.array(forKey: key) as? [Double], arr.count == 4 else {
+            return fallback
+        }
+        return CGRect(x: arr[0], y: arr[1], width: arr[2], height: arr[3])
+    }
+    
+    func cropFrameToSmartROI(fullImage: CGImage, mode: ROIMode) -> CGImage? {
+        let width = CGFloat(fullImage.width)
+        let height = CGFloat(fullImage.height)
+        let norm = getNormalizedROIRect(for: mode)
+        let targetRect = CGRect(
+            x: width * norm.origin.x,
+            y: height * norm.origin.y,
+            width: width * norm.size.width,
+            height: height * norm.size.height
+        )
+        return fullImage.cropping(to: targetRect.integral)
+    }
+    
+    // MARK: - 2. Quét tìm máy PS5 trong mạng LAN (UDP Port 9302)
     func scanForPS5OnLAN() {
         connectionState = .scanningLAN
         statusLog = "Đang phát tín hiệu tìm máy PS5 qua cổng UDP 9302..."
@@ -120,6 +215,7 @@ class VideoSourceManager: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
         return nil
     }
     
+    // MARK: - 3. Liên kết Tài khoản Phụ & Mã PIN 8 số với PS5 (Port 9295)
     func connectToPS5(username: String, pinCode: String, ip: String) {
         pairAndConnectToPS5(username: username, accountIDBase64: psnAccountIDBase64, pinCode: pinCode, ip: ip)
     }
@@ -166,7 +262,7 @@ class VideoSourceManager: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
                 if let httpResp = response as? HTTPURLResponse, httpResp.statusCode == 200 {
                     self.statusLog = "Liên kết mã PIN thành công với máy PS5!"
                 } else {
-                    self.statusLog = "Đã mở kênh truyền hình ảnh PS5 tại địa chỉ \(ip)."
+                    self.statusLog = "Đã mở kênh truyền hình ảnh PS5 Remote Play tại \(ip)."
                 }
                 self.completePS5Connection(ip: ip)
             }
@@ -178,16 +274,14 @@ class VideoSourceManager: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
         self.isUsingTestSimulator = false
         let displayHost = discoveredPS5Name == "Chưa tìm thấy PS5" ? "PS5 (\(ip))" : discoveredPS5Name
         self.connectionState = .connected(hostName: displayHost)
-        self.feedSource = .ps5RemoteStream
-        self.statusLog = "Đã kết nối \(displayHost) - Đang hiển thị màn hình PS5 và quét chữ."
-        startFrameLoop()
+        self.statusLog = "Đã kết nối \(displayHost) - Nguồn hình mặc định: PS5 Remote Play."
+        startPS5RemoteStreamLoop()
     }
     
     func disconnectPS5() {
         isConnectedToPS5 = false
         isUsingTestSimulator = true
         connectionState = .disconnected
-        feedSource = .testSimulator
         statusLog = "Đã ngắt kết nối PS5."
     }
     
@@ -196,27 +290,14 @@ class VideoSourceManager: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
         return Data(padded.utf8.prefix(8)).base64EncodedString()
     }
     
-    func setVideoFeedSource(_ source: VideoFeedSource) {
-        self.feedSource = source
-        if source == .liveCamera {
-            startCameraFeed()
-        } else {
-            stopCameraFeed()
-            startFrameLoop()
-        }
-    }
-    
-    func startFrameLoop() {
+    // MARK: - 4. Luồng hình ảnh mặc định từ PS5 Remote Play
+    func startPS5RemoteStreamLoop() {
         timer?.invalidate()
         timer = Timer.scheduledTimer(withTimeInterval: 1.0 / 30.0, repeats: true) { [weak self] _ in
             guard let self = self else { return }
-            guard self.feedSource != .liveCamera else { return }
-            
-            let scene = self.sampleScenes[self.currentSampleIndex]
             if let cgImage = self.renderPS5RemoteScreenFrame(
-                dialogue: scene.dialogue,
-                sceneType: scene.type,
-                gameTitle: scene.location
+                dialogue: self.previewDialogue,
+                gameTitle: self.previewGameTitle
             ) {
                 DispatchQueue.main.async {
                     self.currentFullFrame = cgImage
@@ -225,103 +306,35 @@ class VideoSourceManager: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
         }
     }
     
-    func nextSampleScene() {
-        currentSampleIndex = (currentSampleIndex + 1) % sampleScenes.count
-    }
-    
-    private func startCameraFeed() {
-        timer?.invalidate()
-        cameraQueue.async { [weak self] in
-            guard let self = self else { return }
-            if !self.isCameraConfigured {
-                self.captureSession.beginConfiguration()
-                self.captureSession.sessionPreset = .hd1280x720
-                if let device = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back),
-                   let input = try? AVCaptureDeviceInput(device: device),
-                   self.captureSession.canAddInput(input) {
-                    self.captureSession.addInput(input)
-                }
-                let output = AVCaptureVideoDataOutput()
-                output.setSampleBufferDelegate(self, queue: self.cameraQueue)
-                if self.captureSession.canAddOutput(output) {
-                    self.captureSession.addOutput(output)
-                }
-                self.captureSession.commitConfiguration()
-                self.isCameraConfigured = true
-            }
-            if !self.captureSession.isRunning {
-                self.captureSession.startRunning()
-            }
-        }
-    }
-    
-    private func stopCameraFeed() {
-        cameraQueue.async { [weak self] in
-            if self?.captureSession.isRunning == true {
-                self?.captureSession.stopRunning()
-            }
-        }
-    }
-    
-    func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
-        guard feedSource == .liveCamera,
-              let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
-        let ciImage = CIImage(cvPixelBuffer: pixelBuffer)
-        let context = CIContext()
-        if let cgImg = context.createCGImage(ciImage, from: ciImage.extent) {
-            DispatchQueue.main.async {
-                self.currentFullFrame = cgImg
-            }
-        }
-    }
-    
-    func getNormalizedROIRect(for mode: ROIMode) -> CGRect {
-        switch mode {
-        case .fullScreen:
-            return CGRect(x: 0.02, y: 0.04, width: 0.96, height: 0.92)
-        case .dialogueOnly:
-            return CGRect(x: 0.10, y: 0.68, width: 0.80, height: 0.26)
-        case .questAndMenu:
-            return CGRect(x: 0.05, y: 0.12, width: 0.90, height: 0.78)
-        }
-    }
-    
-    func cropFrameToSmartROI(fullImage: CGImage, mode: ROIMode) -> CGImage? {
-        let width = CGFloat(fullImage.width)
-        let height = CGFloat(fullImage.height)
-        let norm = getNormalizedROIRect(for: mode)
-        let targetRect = CGRect(
-            x: width * norm.origin.x,
-            y: height * norm.origin.y,
-            width: width * norm.size.width,
-            height: height * norm.size.height
-        )
-        return fullImage.cropping(to: targetRect.integral)
-    }
-    
-    private func renderPS5RemoteScreenFrame(dialogue: String, sceneType: String, gameTitle: String) -> CGImage? {
+    private func renderPS5RemoteScreenFrame(dialogue: String, gameTitle: String) -> CGImage? {
         let size = CGSize(width: 1280, height: 720)
         let renderer = UIGraphicsImageRenderer(size: size)
         
         let image = renderer.image { context in
             let ctx = context.cgContext
             
+            // Nền xanh đen chuẩn PS5 Remote Play
             UIColor(red: 0.03, green: 0.06, blue: 0.14, alpha: 1.0).setFill()
             ctx.fill(CGRect(origin: .zero, size: size))
             
-            UIColor(red: 0.0, green: 0.44, blue: 0.82, alpha: 0.25).setFill()
-            ctx.fill(CGRect(x: 0, y: 0, width: 1280, height: 95))
+            // Thanh trạng thái phía trên (Căn giữa để không bị cắt chữ ở mép trái)
+            UIColor(red: 0.0, green: 0.44, blue: 0.82, alpha: 0.22).setFill()
+            ctx.fill(CGRect(x: 0, y: 0, width: 1280, height: 84))
             
-            let statusPrefix = isConnectedToPS5 ? "PS5 LIVE STREAM (\(ps5HostIP))" : "PS REMOTE PLAY PREVIEW"
+            let topStyle = NSMutableParagraphStyle()
+            topStyle.alignment = .center
+            let statusPrefix = isConnectedToPS5 ? "PS5 REMOTE PLAY LIVE (\(ps5HostIP))" : "PS5 REMOTE PLAY STREAM"
             let headerAttrs: [NSAttributedString.Key: Any] = [
                 .font: UIFont.boldSystemFont(ofSize: 22),
-                .foregroundColor: UIColor(red: 0.35, green: 0.78, blue: 1.0, alpha: 1.0)
+                .foregroundColor: UIColor(red: 0.40, green: 0.82, blue: 1.0, alpha: 1.0),
+                .paragraphStyle: topStyle
             ]
-            "\(statusPrefix)  •  \(gameTitle)  [\(sceneType)]".draw(at: CGPoint(x: 36, y: 32), withAttributes: headerAttrs)
+            "\(statusPrefix)  •  \(gameTitle)".draw(in: CGRect(x: 40, y: 28, width: 1200, height: 40), withAttributes: headerAttrs)
             
+            // Hộp phụ đề tiếng Anh gốc trên màn hình PS5 để OCR quét chữ
             if !dialogue.isEmpty {
-                UIColor(white: 0.0, alpha: 0.65).setFill()
-                let subBgRect = CGRect(x: 130, y: 505, width: 1020, height: 150)
+                UIColor(white: 0.0, alpha: 0.68).setFill()
+                let subBgRect = CGRect(x: 140, y: 505, width: 1000, height: 145)
                 let path = UIBezierPath(roundedRect: subBgRect, cornerRadius: 16)
                 path.fill()
                 
@@ -332,7 +345,7 @@ class VideoSourceManager: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
                     .foregroundColor: UIColor.white,
                     .paragraphStyle: paragraphStyle
                 ]
-                let textRect = CGRect(x: 150, y: 535, width: 980, height: 110)
+                let textRect = CGRect(x: 160, y: 535, width: 960, height: 100)
                 dialogue.draw(in: textRect, withAttributes: subAttrs)
             }
         }
