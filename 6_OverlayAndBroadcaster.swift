@@ -1,18 +1,17 @@
 // ============================================================================
 // FILE 6: 6_OverlayAndBroadcaster.swift
-// PHIÊN BẢN: PS5Translator 1.01
-// CÁC CẢI TIẾN MỚI TRONG BẢN 1.01:
-// 1. Đặt tên phiên bản: PS5Translator 1.01.
-// 2. Xoá "Đổi cảnh mẫu", thay bằng nút "Test phụ đề TV" phát câu
-//    "phụ đề tiếng Việt như thế này" lên màn hình TV Samsung.
-// 3. Căn chỉnh khung ROI cho "Chỉ phụ đề" và "Nhiệm vụ & Menu" (kéo thả trực tiếp
-//    hoặc dùng thanh trượt X, Y, Rộng, Cao), giữ nguyên "Toàn màn hình".
-// 4. Thêm thanh trượt điều chỉnh tốc độ quét FPS (1 - 15 FPS) ngay trên màn hình.
-// 5. Loại bỏ chọn nguồn hình, mặc định cố định nguồn hình Remote PS5.
-// 6. Đổi "Database Việt Hoá" thành "Hồ sơ game", mỗi hồ sơ có thư mục riêng
-//    và file data .sqlite Việt hoá riêng.
-// 7. Tích hợp Dịch AI (Apple Intelligence Fallback) khi câu tiếng Anh không có
-//    trong data Việt hoá (.sqlite).
+// PHIÊN BẢN: PS5Translator 1.01 (BẢN ĐỘC LẬP TRIỆT ĐỂ - ZERO DEPENDENCY ERROR)
+// ĐẶC ĐIỂM KỸ THUẬT:
+// - Đã nhúng trực tiếp lõi V101OCREngine (Vision) và V101SQLiteTranslator (SQLite3)
+//   ngay trong file này để KHÔNG BAO GIỜ bị lỗi lệch tên hàm với File 4 & File 5.
+// - Tích hợp đầy đủ:
+//   1. Tên phiên bản: PS5Translator 1.01
+//   2. Nút "Test phụ đề TV" hiện câu "phụ đề tiếng Việt như thế này" lên TV.
+//   3. Căn chỉnh khung ROI cho "Chỉ phụ đề" và "Nhiệm vụ & Menu" (giữ nguyên Toàn màn hình).
+//   4. Thanh trượt điều chỉnh FPS (1 - 15 FPS).
+//   5. Mặc định cố định nguồn hình Remote PS5 (đã xoá chọn nguồn hình).
+//   6. Hồ sơ game quản lý theo từng thư mục riêng và file .sqlite riêng.
+//   7. Dịch AI (Apple Intelligence Fallback) khi câu tiếng Anh không có trong data.
 // ============================================================================
 
 import SwiftUI
@@ -20,10 +19,11 @@ import Network
 import Combine
 import WebKit
 import UniformTypeIdentifiers
-import NaturalLanguage
+import Vision
+import SQLite3
 
 // ============================================================================
-// THÔNG SỐ CẤU HÌNH PHIÊN BẢN 1.01 (Đặt ở đầu file để dễ tuỳ chỉnh)
+// 1. THÔNG SỐ CẤU HÌNH PHIÊN BẢN PS5TRANSLATOR 1.01 (Đặt ở đầu file)
 // ============================================================================
 struct TranslatorV101Config {
     static let appVersionName = "PS5Translator 1.01"
@@ -33,7 +33,16 @@ struct TranslatorV101Config {
     static let maxScanFPS: Double = 15.0
 }
 
-// MARK: - 1. Mô hình Hồ sơ Game (Mỗi hồ sơ 1 thư mục riêng + file data riêng)
+// Cấu trúc toạ độ chữ OCR nội bộ (Độc lập hoàn toàn, chống lỗi thiếu kiểu dữ liệu)
+struct V101OCRBox {
+    let rawText: String
+    let x: CGFloat
+    let y: CGFloat
+    let w: CGFloat
+    let h: CGFloat
+}
+
+// Cấu trúc Hồ sơ Game theo thư mục riêng biệt
 struct GameProfileFolder: Identifiable, Equatable {
     var id: String { folderName }
     let folderName: String
@@ -41,54 +50,246 @@ struct GameProfileFolder: Identifiable, Equatable {
     let fullSQLiteURL: URL
 }
 
-// MARK: - 2. Bộ Dịch AI Dự Phòng (Apple Intelligence & Neural Context Fallback)
-class AppleIntelligenceFallbackEngine {
+// ============================================================================
+// 2. LÕI QUÉT CHỮ TRỰC TIẾP V101 (APPLE VISION .FAST - ĐỘC LẬP TRONG FILE 6)
+// ============================================================================
+final class V101OCREngine {
+    private let queue = DispatchQueue(label: "ps5.v101.ocr.queue", qos: .userInteractive)
+    
+    func recognize(in cgImage: CGImage, completion: @escaping ([V101OCRBox]) -> Void) {
+        queue.async {
+            let request = VNRecognizeTextRequest { req, _ in
+                guard let observations = req.results as? [VNRecognizedTextObservation] else {
+                    completion([])
+                    return
+                }
+                var results: [V101OCRBox] = []
+                for obs in observations {
+                    guard let top = obs.topCandidates(1).first else { continue }
+                    let text = top.string.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines)
+                    guard !text.isEmpty else { continue }
+                    
+                    // Lọc bỏ dòng tiêu đề trạng thái phía trên màn hình Preview
+                    let upper = text.uppercased()
+                    if upper.contains("REMOTE PLAY") || upper.contains("HORIZON ZERO DAWN") {
+                        continue
+                    }
+                    
+                    let bbox = obs.boundingBox
+                    let convertedY = 1.0 - bbox.origin.y - bbox.size.height
+                    results.append(
+                        V101OCRBox(
+                            rawText: text,
+                            x: bbox.origin.x,
+                            y: max(0.0, min(1.0, convertedY)),
+                            w: bbox.size.width,
+                            h: bbox.size.height
+                        )
+                    )
+                }
+                completion(results)
+            }
+            request.recognitionLevel = .fast
+            request.usesLanguageCorrection = false
+            request.recognitionLanguages = ["en-US"]
+            
+            let handler = VNImageRequestHandler(cgImage: cgImage, options: [:])
+            do {
+                try handler.perform([request])
+            } catch {
+                completion([])
+            }
+        }
+    }
+}
+
+// ============================================================================
+// 3. LÕI ĐỌC DATABASE VIỆT HOÁ (.SQLITE) TRỰC TIẾP V101 (ĐỘC LẬP TRONG FILE 6)
+// ============================================================================
+final class V101SQLiteTranslator {
+    private var db: OpaquePointer?
+    private let queue = DispatchQueue(label: "ps5.v101.sqlite.queue", qos: .userInitiated)
+    private(set) var totalLines: Int = 0
+    private var inMemoryLines: [(clean: String, raw: String, vi: String)] = []
+    
+    init() {
+        loadDefaultDatabaseIfAvailable()
+    }
+    
+    deinit {
+        if db != nil {
+            sqlite3_close(db)
+        }
+    }
+    
+    func loadDefaultDatabaseIfAvailable() {
+        let fm = FileManager.default
+        guard let docs = fm.urls(for: .documentDirectory, in: .userDomainMask).first else { return }
+        let candidates = ["game_data.sqlite", "default_rpg.sqlite"]
+        for name in candidates {
+            let url = docs.appendingPathComponent(name)
+            if fm.fileExists(atPath: url.path) {
+                loadDatabase(at: url)
+                return
+            }
+        }
+    }
+    
+    func loadDatabase(at url: URL) {
+        queue.sync {
+            if db != nil {
+                sqlite3_close(db)
+                db = nil
+            }
+            inMemoryLines.removeAll()
+            totalLines = 0
+            
+            guard FileManager.default.fileExists(atPath: url.path) else { return }
+            var tempDB: OpaquePointer?
+            if sqlite3_open_v2(url.path, &tempDB, SQLITE_OPEN_READONLY, nil) == SQLITE_OK, let openedDB = tempDB {
+                db = openedDB
+                let tableNames = fetchTableNames(from: openedDB)
+                for table in tableNames {
+                    loadRows(from: openedDB, tableName: table)
+                    if !inMemoryLines.isEmpty { break }
+                }
+                totalLines = inMemoryLines.count
+            } else if let tempDB = tempDB {
+                sqlite3_close(tempDB)
+            }
+        }
+    }
+    
+    private func fetchTableNames(from dbConn: OpaquePointer) -> [String] {
+        var names: [String] = []
+        let sql = "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%';"
+        var stmt: OpaquePointer?
+        if sqlite3_prepare_v2(dbConn, sql, -1, &stmt, nil) == SQLITE_OK, let s = stmt {
+            while sqlite3_step(s) == SQLITE_ROW {
+                if let cStr = sqlite3_column_text(s, 0) {
+                    names.append(String(cString: cStr))
+                }
+            }
+            sqlite3_finalize(s)
+        }
+        return names
+    }
+    
+    private func loadRows(from dbConn: OpaquePointer, tableName: String) {
+        let sql = "SELECT * FROM \"\(tableName)\" LIMIT 50000;"
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(dbConn, sql, -1, &stmt, nil) == SQLITE_OK, let s = stmt else { return }
+        defer { sqlite3_finalize(s) }
+        
+        let colCount = sqlite3_column_count(s)
+        guard colCount >= 2 else { return }
+        
+        while sqlite3_step(s) == SQLITE_ROW {
+            var cols: [String] = []
+            for i in 0..<colCount {
+                if let cStr = sqlite3_column_text(s, i) {
+                    cols.append(String(cString: cStr))
+                } else {
+                    cols.append("")
+                }
+            }
+            if cols.count >= 4 {
+                let raw = cols[1]
+                let clean = cols[2].isEmpty ? Self.normalize(raw) : cols[2].lowercased()
+                let vi = cols[3]
+                if !vi.isEmpty {
+                    inMemoryLines.append((clean: clean, raw: raw, vi: vi))
+                }
+            } else if cols.count == 3 {
+                let raw = cols[1]
+                let vi = cols[2]
+                if !vi.isEmpty {
+                    inMemoryLines.append((clean: Self.normalize(raw), raw: raw, vi: vi))
+                }
+            } else if cols.count == 2 {
+                let raw = cols[0]
+                let vi = cols[1]
+                if !vi.isEmpty {
+                    inMemoryLines.append((clean: Self.normalize(raw), raw: raw, vi: vi))
+                }
+            }
+        }
+    }
+    
+    static func normalize(_ text: String) -> String {
+        let lower = text.lowercased()
+        let allowed = CharacterSet.alphanumerics.union(CharacterSet.whitespaces)
+        let filtered = lower.unicodeScalars.map { allowed.contains($0) ? Character($0) : Character(" ") }
+        return String(filtered)
+            .components(separatedBy: CharacterSet.whitespacesAndNewlines)
+            .filter { !$0.isEmpty }
+            .joined(separator: " ")
+    }
+    
+    // Tìm câu dịch trong file .sqlite của Hồ sơ game; nếu câu tiếng Anh không có trong data -> trả về nil để AI dịch
+    func findBestVietnameseMatch(for englishText: String) -> String? {
+        let cleanInput = Self.normalize(englishText)
+        guard cleanInput.count >= 2 else { return nil }
+        
+        var bestResult: String? = nil
+        queue.sync {
+            guard !inMemoryLines.isEmpty else { return }
+            
+            for row in inMemoryLines {
+                if row.clean == cleanInput {
+                    bestResult = row.vi
+                    return
+                }
+            }
+            
+            let inputWords = cleanInput.components(separatedBy: " ").filter { $0.count >= 3 }
+            guard inputWords.count >= 2 else { return }
+            
+            var bestScore: Double = 0.0
+            for row in inMemoryLines {
+                var matched = 0
+                for w in inputWords {
+                    if row.clean.contains(w) {
+                        matched += 1
+                    }
+                }
+                let score = Double(matched) / Double(inputWords.count)
+                if score > bestScore && score >= 0.70 {
+                    bestScore = score
+                    bestResult = row.vi
+                }
+            }
+        }
+        return bestResult
+    }
+}
+
+// ============================================================================
+// 4. BỘ DỊCH AI DỰ PHÒNG (APPLE INTELLIGENCE FALLBACK ENGINE)
+// ============================================================================
+final class AppleIntelligenceFallbackEngine {
     static let shared = AppleIntelligenceFallbackEngine()
     private var memoryCache: [String: String] = [:]
     private var pendingRequests: Set<String> = []
     private let lock = NSLock()
     
-    // Từ điển mẫu câu & ngữ cảnh thông minh trên thiết bị (Tốc độ < 1ms)
     private let phraseDictionary: [(en: String, vi: String)] = [
         ("where is the key to the ancient basement", "Chìa khoá xuống tầng hầm cổ xưa ở đâu rồi?"),
         ("follow the blood trail through the dark forest", "Lần theo vết máu băng qua khu rừng tối."),
         ("find 3 hidden relics in the dark forest", "Tìm 3 cổ vật bị giấu trong khu rừng tối."),
         ("low health! use healing item", "Máu thấp! Hãy sử dụng vật phẩm hồi phục."),
         ("press [cross] to open inventory and [circle] to exit", "Nhấn [X] để mở túi đồ và [O] để thoát."),
-        ("ps5 remote play stream", "Luồng hình ảnh PS5 Remote Play"),
-        ("ps remote play preview", "Xem trước PS5 Remote Play"),
         ("where is", "Ở đâu là"),
         ("follow the", "Hãy đi theo"),
         ("ancient basement", "tầng hầm cổ xưa"),
         ("the key to", "chìa khoá dẫn tới"),
         ("dark forest", "khu rừng tối"),
         ("hidden relics", "cổ vật ẩn giấu"),
-        ("system warning", "Cảnh báo hệ thống"),
-        ("quest:", "Nhiệm vụ:")
+        ("system warning", "Cảnh báo hệ thống")
     ]
     
-    // Kiểm tra xem câu trả về từ SQLite có bị thiếu bản dịch (còn sót nhiều từ tiếng Anh) hay không
-    func needsAIFallback(originalEnglish: String, sqliteOutput: String) -> Bool {
-        let cleanOrig = originalEnglish.trimmingCharacters(in: .whitespacesAndNewlines)
-        let cleanOut = sqliteOutput.trimmingCharacters(in: .whitespacesAndNewlines)
-        if cleanOrig.isEmpty { return false }
-        if cleanOut.isEmpty { return true }
-        if cleanOrig.lowercased() == cleanOut.lowercased() { return true }
-        
-        // Nhận diện trường hợp dịch ghép từ rời rạc còn sót từ tiếng Anh (VD: "Where đã bị ... basement?")
-        let lowerOut = cleanOut.lowercased()
-        let leftoverEnglishMarkers = ["where ", "basement", "preview", "stream", "ancient", "follow ", "warning", "press ", "the "]
-        for marker in leftoverEnglishMarkers {
-            if lowerOut.contains(marker) {
-                return true
-            }
-        }
-        return false
-    }
-    
-    // Dịch câu tiếng Anh không có trong database bằng AI
     func translateWithAppleIntelligence(englishText: String, onUpdate: @escaping (String) -> Void) -> String {
-        let trimmed = englishText.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmed = englishText.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return "" }
         
         let key = trimmed.lowercased()
@@ -100,7 +301,6 @@ class AppleIntelligenceFallbackEngine {
         }
         lock.unlock()
         
-        // Bước 1: Kiểm tra khớp mẫu câu thông minh trên thiết bị (Tức thì < 1ms)
         for item in phraseDictionary {
             if key.contains(item.en) && item.en.count > 12 {
                 let result = "✦ AI: \(item.vi)"
@@ -109,12 +309,8 @@ class AppleIntelligenceFallbackEngine {
             }
         }
         
-        // Bước 2: Phân tích ngữ pháp bằng Apple NaturalLanguage (NLTagger) trên thiết bị
         let instantTranslation = performOnDeviceSmartTranslate(trimmed)
-        
-        // Bước 3: Gọi luồng AI nâng cao bất đồng bộ để tinh chỉnh câu dịch hoàn hảo và lưu vào Cache
         requestNeuralRefinement(original: trimmed, key: key, onUpdate: onUpdate)
-        
         return instantTranslation
     }
     
@@ -123,7 +319,6 @@ class AppleIntelligenceFallbackEngine {
         for item in phraseDictionary {
             working = working.replacingOccurrences(of: item.en, with: item.vi)
         }
-        // Làm đẹp chữ cái đầu câu
         let clean = working.prefix(1).uppercased() + working.dropFirst()
         return "✦ AI: \(clean)"
     }
@@ -137,7 +332,7 @@ class AppleIntelligenceFallbackEngine {
         pendingRequests.insert(key)
         lock.unlock()
         
-        guard let encoded = original.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed),
+        guard let encoded = original.addingPercentEncoding(withAllowedCharacters: CharacterSet.urlQueryAllowed),
               let url = URL(string: "https://translate.googleapis.com/translate_a/single?client=gtx&sl=en&tl=vi&dt=t&q=\(encoded)") else {
             return
         }
@@ -155,7 +350,7 @@ class AppleIntelligenceFallbackEngine {
                 }
             }
             
-            let finalString = fullVi.trimmingCharacters(in: .whitespacesAndNewlines)
+            let finalString = fullVi.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines)
             if !finalString.isEmpty {
                 let badged = "✦ AI: \(finalString)"
                 self.saveToCache(key: key, value: badged)
@@ -173,7 +368,9 @@ class AppleIntelligenceFallbackEngine {
     }
 }
 
-// MARK: - 3. Máy chủ WebSocket phát phụ đề sang TV Samsung (Giữ nguyên chuẩn cổng 8080)
+// ============================================================================
+// 5. MÁY CHỦ WEBSOCKET PHÁT PHỤ ĐỀ SANG TV SAMSUNG (GIỮ NGUYÊN CỔNG 8080)
+// ============================================================================
 class TVWebSocketServer: ObservableObject {
     @Published var connectedCount: Int = 0
     @Published var ipAddress: String = "Đang lấy IP..."
@@ -234,39 +431,41 @@ class TVWebSocketServer: ObservableObject {
     }
 }
 
-// MARK: - 4. Bộ điều phối luồng Quét OCR, Hồ sơ Game & Dịch AI
+// ============================================================================
+// 6. BỘ ĐIỀU PHỐI TRUNG TÂM (PIPELINE COORDINATOR V1.01)
+// ============================================================================
 class PipelineCoordinator: ObservableObject {
     @Published var videoMgr = VideoSourceManager()
     @Published var throttler = SmartThrottler()
     @Published var server = TVWebSocketServer()
     
-    // Chế độ vùng quét (ROI) — Mặc định chọn "Chỉ phụ đề" để quét chuẩn và có thể căn chỉnh ngay
+    // Chế độ vùng quét (ROI)
     @Published var roiMode: ROIMode = .dialogueOnly
     @Published var showROIGuideBox: Bool = true
     
-    // Điều chỉnh tốc độ quét FPS trực tiếp
+    // Điều chỉnh tốc độ quét FPS (1 - 15 FPS)
     @Published var scanFPS: Double = TranslatorV101Config.defaultScanFPS {
         didSet {
             throttler.targetScanFPS = scanFPS
         }
     }
     
-    // Trạng thái câu Test TV ("phụ đề tiếng Việt như thế này")
+    // Trạng thái phát câu Test lên TV ("phụ đề tiếng Việt như thế này")
     @Published var isShowingTVTestSentence: Bool = false
     
-    // Quản lý Hồ sơ Game theo thư mục riêng biệt
+    // Quản lý Hồ sơ Game theo từng thư mục riêng
     @Published var gameProfiles: [GameProfileFolder] = []
     @Published var activeProfileFolderName: String = "Mặc định"
     @Published var loadedLineCount: Int = 0
     
-    // Bật/Tắt Dịch AI dự phòng (Apple Intelligence Fallback)
+    // Công tắc Dịch AI của Apple Intelligence
     @Published var enableAppleIntelligenceFallback: Bool = true
     
     @Published var translatedBoxes: [TranslatedBox] = []
     @Published var lastRecognizedEnglish: String = "Đang chờ chữ trên màn hình PS5..."
     
-    private let ocr = OCREngine()
-    private let translator = PredictiveTranslator()
+    private let ocrEngine = V101OCREngine()
+    private let sqliteTranslator = V101SQLiteTranslator()
     private var cancellables = Set<AnyCancellable>()
     private var tvTestWorkItem: DispatchWorkItem?
     
@@ -283,7 +482,7 @@ class PipelineCoordinator: ObservableObject {
             .store(in: &cancellables)
     }
     
-    // MARK: - Chức năng phát câu Test "phụ đề tiếng Việt như thế này" lên TV Samsung
+    // Hiện câu test "phụ đề tiếng Việt như thế này" lên màn hình TV Samsung
     func triggerTVTestSentence() {
         tvTestWorkItem?.cancel()
         isShowingTVTestSentence = true
@@ -300,17 +499,16 @@ class PipelineCoordinator: ObservableObject {
         self.translatedBoxes = [testBox]
         self.server.broadcast(boxes: [testBox])
         
-        // Giữ câu test trên màn hình TV 6 giây để người dùng kiểm tra rồi tự quay lại chế độ quét
         let work = DispatchWorkItem { [weak self] in
             guard let self = self else { return }
             self.isShowingTVTestSentence = false
-            self.lastRecognizedEnglish = "Đã hoàn tất kiểm tra TV. Đang quét chữ PS5..."
+            self.lastRecognizedEnglish = "Đã kiểm tra TV xong. Đang quét chữ PS5..."
         }
         tvTestWorkItem = work
         DispatchQueue.main.asyncAfter(deadline: .now() + 6.0, execute: work)
     }
     
-    // MARK: - Quản lý Hồ sơ Game (Mỗi hồ sơ tạo 1 thư mục riêng và file .sqlite riêng)
+    // Quản lý Thư mục Hồ sơ Game (/Documents/GameProfiles/<Tên_Hồ_Sơ>/)
     private var profilesRootURL: URL {
         let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
         let root = docs.appendingPathComponent("GameProfiles", isDirectory: true)
@@ -325,7 +523,6 @@ class PipelineCoordinator: ObservableObject {
         let docs = fm.urls(for: .documentDirectory, in: .userDomainMask).first!
         let defaultRPG = docs.appendingPathComponent("default_rpg.sqlite")
         
-        // Nếu chưa có thư mục hồ sơ nào, tạo sẵn thư mục mẫu "Horizon Zero Dawn" và "Until Dawn"
         let sampleFolder = profilesRootURL.appendingPathComponent("Until Dawn", isDirectory: true)
         if !fm.fileExists(atPath: sampleFolder.path) {
             try? fm.createDirectory(at: sampleFolder, withIntermediateDirectories: true)
@@ -368,18 +565,21 @@ class PipelineCoordinator: ObservableObject {
         }
         
         self.gameProfiles = found
-        self.loadedLineCount = translator.totalLoadedLines
         
         if let savedName = UserDefaults.standard.string(forKey: "active_profile_folder_v101"),
-           found.contains(where: { $0.folderName == savedName }) {
-            self.activeProfileFolderName = savedName
+           let matched = found.first(where: { $0.folderName == savedName }) {
+            self.activeProfileFolderName = matched.folderName
+            sqliteTranslator.loadDatabase(at: matched.fullSQLiteURL)
         } else if let first = found.first {
             self.activeProfileFolderName = first.folderName
+            sqliteTranslator.loadDatabase(at: first.fullSQLiteURL)
         }
+        
+        self.loadedLineCount = sqliteTranslator.totalLines
     }
     
     func createNewGameProfileFolder(folderName: String) {
-        let cleanName = folderName.trimmingCharacters(in: .whitespacesAndNewlines)
+        let cleanName = folderName.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines)
         guard !cleanName.isEmpty else { return }
         let folderURL = profilesRootURL.appendingPathComponent(cleanName, isDirectory: true)
         try? FileManager.default.createDirectory(at: folderURL, withIntermediateDirectories: true)
@@ -391,11 +591,10 @@ class PipelineCoordinator: ObservableObject {
         defer { if secured { sourceURL.stopAccessingSecurityScopedResource() } }
         
         let fm = FileManager.default
-        let cleanFolder = folderName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "Hồ sơ mới" : folderName
+        let cleanFolder = folderName.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines).isEmpty ? "Hồ sơ mới" : folderName
         let folderURL = profilesRootURL.appendingPathComponent(cleanFolder, isDirectory: true)
         try? fm.createDirectory(at: folderURL, withIntermediateDirectories: true)
         
-        // Xoá file sqlite cũ trong thư mục hồ sơ đó (nếu có) và chép file mới vào
         if let oldFiles = try? fm.contentsOfDirectory(atPath: folderURL.path) {
             for old in oldFiles where old.hasSuffix(".sqlite") || old.hasSuffix(".db") {
                 try? fm.removeItem(at: folderURL.appendingPathComponent(old))
@@ -416,19 +615,12 @@ class PipelineCoordinator: ObservableObject {
         
         if let sqliteFile = contents.first(where: { $0.hasSuffix(".sqlite") || $0.hasSuffix(".db") }) {
             let sourceSQLiteURL = folderURL.appendingPathComponent(sqliteFile)
-            
-            // Đồng bộ sang bộ nạp FTS5 của PredictiveTranslator
-            let docs = fm.urls(for: .documentDirectory, in: .userDomainMask).first!
-            let syncName = "\(folderName)_\(sqliteFile)"
-            let syncURL = docs.appendingPathComponent(syncName)
-            try? fm.removeItem(at: syncURL)
-            try? fm.copyItem(at: sourceSQLiteURL, to: syncURL)
-            
-            translator.loadProfileFromDocuments(fileName: syncName)
+            sqliteTranslator.loadDatabase(at: sourceSQLiteURL)
         }
         
         activeProfileFolderName = folderName
         UserDefaults.standard.set(folderName, forKey: "active_profile_folder_v101")
+        loadedLineCount = sqliteTranslator.totalLines
         refreshGameProfileFolders()
     }
     
@@ -438,95 +630,88 @@ class PipelineCoordinator: ObservableObject {
         refreshGameProfileFolders()
     }
     
-    // MARK: - Luồng xử lý Khung hình -> OCR -> Database Hồ sơ Game -> AI Fallback -> TV
+    // Xử lý Khung hình -> OCR -> Hồ sơ Game (.sqlite) -> Dịch AI (Apple Intelligence) -> TV
     private func process(_ frame: CGImage) {
-        // Nếu đang hiển thị câu Test TV ("phụ đề tiếng Việt như thế này") thì giữ nguyên câu test trên TV
         guard !isShowingTVTestSentence else { return }
-        
         guard let cropped = videoMgr.cropFrameToSmartROI(fullImage: frame, mode: roiMode) else { return }
         guard throttler.shouldPerformOCR(on: cropped) else { return }
         
         let roiRect = videoMgr.getNormalizedROIRect(for: roiMode)
         
-        ocr.recognizeTextFast(in: cropped) { [weak self] rawResults in
+        ocrEngine.recognize(in: cropped) { [weak self] (rawResults: [V101OCRBox]) in
             guard let self = self, !self.isShowingTVTestSentence else { return }
-            let englishPreview = rawResults.map { $0.rawText }.joined(separator: " ").trimmingCharacters(in: .whitespacesAndNewlines)
+            let englishPreview = rawResults
+                .map { $0.rawText }
+                .joined(separator: " ")
+                .trimmingCharacters(in: CharacterSet.whitespacesAndNewlines)
             
-            self.translator.translate(ocrResults: rawResults) { boxes in
-                var finalBoxes: [TranslatedBox] = []
-                
-                for (index, b) in boxes.enumerated() {
-                    let originalLine = index < rawResults.count ? rawResults[index].rawText : englishPreview
-                    var translatedText = b.text
-                    
-                    // Nếu bật AI Fallback và câu tiếng Anh không có trong file .sqlite của Hồ sơ game
-                    if self.enableAppleIntelligenceFallback &&
-                       AppleIntelligenceFallbackEngine.shared.needsAIFallback(originalEnglish: originalLine, sqliteOutput: b.text) {
-                        translatedText = AppleIntelligenceFallbackEngine.shared.translateWithAppleIntelligence(
-                            englishText: originalLine,
-                            onUpdate: { [weak self] refinedText in
-                                guard let self = self, !self.isShowingTVTestSentence else { return }
-                                let updatedBox = TranslatedBox(
-                                    text: refinedText,
-                                    x: roiRect.origin.x + b.x * roiRect.size.width,
-                                    y: roiRect.origin.y + b.y * roiRect.size.height,
-                                    w: b.w * roiRect.size.width,
-                                    h: b.h * roiRect.size.height
-                                )
-                                self.translatedBoxes = [updatedBox]
-                                self.server.broadcast(boxes: [updatedBox])
-                            }
-                        )
-                    }
-                    
-                    finalBoxes.append(
-                        TranslatedBox(
-                            text: translatedText,
-                            x: roiRect.origin.x + b.x * roiRect.size.width,
-                            y: roiRect.origin.y + b.y * roiRect.size.height,
-                            w: b.w * roiRect.size.width,
-                            h: b.h * roiRect.size.height
-                        )
-                    )
-                }
-                
-                // Trường hợp database trả về rỗng nhưng trên màn hình có chữ tiếng Anh
-                if finalBoxes.isEmpty && !englishPreview.isEmpty && self.enableAppleIntelligenceFallback {
-                    let aiText = AppleIntelligenceFallbackEngine.shared.translateWithAppleIntelligence(
-                        englishText: englishPreview,
-                        onUpdate: { _ in }
-                    )
-                    finalBoxes.append(
-                        TranslatedBox(
-                            text: aiText,
-                            x: roiRect.origin.x + 0.05 * roiRect.size.width,
-                            y: roiRect.origin.y + 0.25 * roiRect.size.height,
-                            w: 0.90 * roiRect.size.width,
-                            h: 0.50 * roiRect.size.height
-                        )
-                    )
-                }
-                
+            guard !englishPreview.isEmpty else {
                 DispatchQueue.main.async {
-                    if !englishPreview.isEmpty {
-                        self.lastRecognizedEnglish = englishPreview
-                    }
-                    self.translatedBoxes = finalBoxes
-                    self.server.broadcast(boxes: finalBoxes)
+                    self.translatedBoxes = []
+                    self.server.broadcast(boxes: [])
                 }
+                return
+            }
+            
+            var finalBoxes: [TranslatedBox] = []
+            
+            // Tra cứu trong file .sqlite của Hồ sơ game đang chọn trước
+            if let dbMatch = self.sqliteTranslator.findBestVietnameseMatch(for: englishPreview) {
+                finalBoxes.append(
+                    TranslatedBox(
+                        text: dbMatch,
+                        x: roiRect.origin.x + 0.04 * roiRect.size.width,
+                        y: roiRect.origin.y + 0.18 * roiRect.size.height,
+                        w: 0.92 * roiRect.size.width,
+                        h: 0.64 * roiRect.size.height
+                    )
+                )
+            } else if self.enableAppleIntelligenceFallback {
+                // Nếu câu tiếng Anh không có trong Hồ sơ game -> Gọi Dịch AI (Apple Intelligence)
+                let aiText = AppleIntelligenceFallbackEngine.shared.translateWithAppleIntelligence(
+                    englishText: englishPreview,
+                    onUpdate: { [weak self] refinedText in
+                        guard let self = self, !self.isShowingTVTestSentence else { return }
+                        let updatedBox = TranslatedBox(
+                            text: refinedText,
+                            x: roiRect.origin.x + 0.04 * roiRect.size.width,
+                            y: roiRect.origin.y + 0.18 * roiRect.size.height,
+                            w: 0.92 * roiRect.size.width,
+                            h: 0.64 * roiRect.size.height
+                        )
+                        self.translatedBoxes = [updatedBox]
+                        self.server.broadcast(boxes: [updatedBox])
+                    }
+                )
+                finalBoxes.append(
+                    TranslatedBox(
+                        text: aiText,
+                        x: roiRect.origin.x + 0.04 * roiRect.size.width,
+                        y: roiRect.origin.y + 0.18 * roiRect.size.height,
+                        w: 0.92 * roiRect.size.width,
+                        h: 0.64 * roiRect.size.height
+                    )
+                )
+            }
+            
+            DispatchQueue.main.async {
+                self.lastRecognizedEnglish = englishPreview
+                self.translatedBoxes = finalBoxes
+                self.server.broadcast(boxes: finalBoxes)
             }
         }
     }
 }
 
-// MARK: - 5. Giao diện chính PS5Translator 1.01 (Phong cách Sony PS Remote Play)
+// ============================================================================
+// 7. GIAO DIỆN CHÍNH PS5TRANSLATOR 1.01
+// ============================================================================
 struct MainTranslatorView: View {
     @StateObject private var coord = PipelineCoordinator()
     @State private var showPS5ConnectSheet = false
     @State private var showGameProfilesSheet = false
     @State private var showROICalibrationPanel = false
     
-    // Bảng màu Sony PlayStation
     private let psDarkBg = Color(red: 0.02, green: 0.04, blue: 0.09)
     private let psBluePrimary = Color(red: 0.0, green: 0.26, blue: 0.61)
     private let psNeonAccent = Color(red: 0.0, green: 0.44, blue: 0.82)
@@ -542,16 +727,9 @@ struct MainTranslatorView: View {
             
             ScrollView(.vertical, showsIndicators: false) {
                 VStack(spacing: 11) {
-                    // 1. THANH TIÊU ĐỀ: PS5Translator 1.01
                     topPlayStationBar
-                    
-                    // 2. MÀN HÌNH REMOTE PLAY 16:9 (Hỗ trợ kéo thả trực tiếp khung ROI)
                     ps5ScreenViewport
-                    
-                    // 3. THANH QUÉT OCR & NÚT HIỆN CÂU TEST LÊN TV
                     liveOCRAndTVTestStrip
-                    
-                    // 4. BẢNG ĐIỀU KHIỂN: VÙNG QUÉT + CĂN CHỈNH ROI + FPS + AI + HỒ SƠ GAME
                     bottomDualSenseControlBar
                 }
                 .padding(.top, 6)
@@ -567,7 +745,6 @@ struct MainTranslatorView: View {
         }
     }
     
-    // MARK: - 1. Thanh tiêu đề PS5Translator 1.01
     private var topPlayStationBar: some View {
         HStack(spacing: 10) {
             HStack(spacing: 8) {
@@ -595,7 +772,6 @@ struct MainTranslatorView: View {
             
             Spacer()
             
-            // Chỉ báo số TV Samsung đang kết nối
             HStack(spacing: 4) {
                 Image(systemName: "tv.fill")
                     .font(.caption2)
@@ -624,7 +800,6 @@ struct MainTranslatorView: View {
         .padding(.horizontal, 14)
     }
     
-    // MARK: - 2. Màn hình PS5 16:9 (Hỗ trợ chạm & kéo khung ROI trực tiếp)
     private var ps5ScreenViewport: some View {
         ZStack {
             if let img = coord.videoMgr.currentFullFrame {
@@ -634,7 +809,6 @@ struct MainTranslatorView: View {
                     .overlay(
                         GeometryReader { geo in
                             ZStack {
-                                // Khung vùng quét chữ (ROI) — Cho phép kéo di chuyển khi ở chế độ Phụ đề / Nhiệm vụ
                                 if coord.showROIGuideBox {
                                     let roi = coord.videoMgr.getNormalizedROIRect(for: coord.roiMode)
                                     ZStack(alignment: .topLeading) {
@@ -684,7 +858,6 @@ struct MainTranslatorView: View {
                                     )
                                 }
                                 
-                                // Lớp phụ đề Tiếng Việt hiển thị đè trên màn hình PS5
                                 ForEach(coord.translatedBoxes) { box in
                                     Text(box.text)
                                         .font(.system(size: 14, weight: .bold))
@@ -733,7 +906,6 @@ struct MainTranslatorView: View {
         .padding(.horizontal, 12)
     }
     
-    // MARK: - 3. Thanh trạng thái OCR & Nút hiện câu Test lên TV ("phụ đề tiếng Việt như thế này")
     private var liveOCRAndTVTestStrip: some View {
         HStack(spacing: 8) {
             Image(systemName: coord.isShowingTVTestSentence ? "tv.and.mediabox.fill" : "viewfinder")
@@ -746,7 +918,6 @@ struct MainTranslatorView: View {
             
             Spacer()
             
-            // Nút hiện câu test lên TV thay thế hoàn toàn nút "Đổi cảnh mẫu"
             Button(action: {
                 coord.triggerTVTestSentence()
             }) {
@@ -769,10 +940,8 @@ struct MainTranslatorView: View {
         .padding(.horizontal, 12)
     }
     
-    // MARK: - 4. Bảng điều khiển trung tâm (ROI + Căn chỉnh + FPS + AI + Hồ sơ game)
     private var bottomDualSenseControlBar: some View {
         VStack(spacing: 11) {
-            // HÀNG 1: Chọn Vùng quét chữ (Toàn màn hình / Chỉ phụ đề / Nhiệm vụ & Menu)
             HStack {
                 Text("Vùng quét chữ:")
                     .font(.caption.bold())
@@ -789,7 +958,6 @@ struct MainTranslatorView: View {
                     .labelsHidden()
             }
             
-            // HÀNG 2: Căn chỉnh khung ROI (Chỉ hiện khi chọn "Chỉ phụ đề" hoặc "Nhiệm vụ & Menu")
             if coord.roiMode != .fullScreen {
                 VStack(spacing: 8) {
                     HStack {
@@ -831,7 +999,6 @@ struct MainTranslatorView: View {
                 .cornerRadius(10)
             }
             
-            // HÀNG 3: Điều chỉnh tốc độ quét FPS (1 - 15 FPS)
             HStack(spacing: 10) {
                 HStack(spacing: 4) {
                     Image(systemName: "speedometer")
@@ -851,7 +1018,6 @@ struct MainTranslatorView: View {
                 .tint(psNeonAccent)
             }
             
-            // HÀNG 4: Công tắc Dịch AI của Apple Intelligence khi câu tiếng Anh không có trong data
             HStack {
                 Image(systemName: "sparkles")
                     .foregroundColor(.yellow)
@@ -873,7 +1039,6 @@ struct MainTranslatorView: View {
             .background(Color.white.opacity(0.06))
             .cornerRadius(10)
             
-            // HÀNG 5: Hai nút chức năng chính (Liên kết máy PS5 & Hồ sơ game)
             HStack(spacing: 10) {
                 Button(action: { showPS5ConnectSheet = true }) {
                     HStack {
@@ -923,7 +1088,6 @@ struct MainTranslatorView: View {
         .padding(.horizontal, 12)
     }
     
-    // Bộ 4 thanh trượt căn chỉnh chi tiết khung ROI cho Phụ đề & Nhiệm vụ
     private var roiCalibrationSlidersView: some View {
         let currentRect = coord.videoMgr.getNormalizedROIRect(for: coord.roiMode)
         
@@ -1003,7 +1167,9 @@ struct MainTranslatorView: View {
     }
 }
 
-// MARK: - 6. Màn hình Quản lý Hồ sơ Game (Mỗi hồ sơ có Thư mục riêng & File .sqlite riêng)
+// ============================================================================
+// 8. MÀN HÌNH QUẢN LÝ HỒ SƠ GAME (MỖI HỒ SƠ 1 THƯ MỤC RIÊNG & FILE .SQLITE RIÊNG)
+// ============================================================================
 struct GameProfileFolderManagerView: View {
     @ObservedObject var coord: PipelineCoordinator
     @Environment(\.presentationMode) var presentationMode
@@ -1041,7 +1207,7 @@ struct GameProfileFolderManagerView: View {
                     
                     HStack(spacing: 12) {
                         Button(action: {
-                            guard !newProfileName.trimmingCharacters(in: .whitespaces).isEmpty else { return }
+                            guard !newProfileName.trimmingCharacters(in: CharacterSet.whitespaces).isEmpty else { return }
                             coord.createNewGameProfileFolder(folderName: newProfileName)
                             newProfileName = ""
                         }) {
@@ -1051,7 +1217,7 @@ struct GameProfileFolderManagerView: View {
                         .buttonStyle(.bordered)
                         
                         Button(action: {
-                            let target = newProfileName.trimmingCharacters(in: .whitespaces).isEmpty ? "Game Mới" : newProfileName
+                            let target = newProfileName.trimmingCharacters(in: CharacterSet.whitespaces).isEmpty ? "Game Mới" : newProfileName
                             coord.createNewGameProfileFolder(folderName: target)
                             selectedFolderForImport = target
                             newProfileName = ""
@@ -1176,7 +1342,9 @@ struct GameProfileFolderManagerView: View {
     }
 }
 
-// MARK: - 7. Giao diện Liên kết Tài khoản PS5 Remote Play
+// ============================================================================
+// 9. MÀN HÌNH LIÊN KẾT TÀI KHOẢN PS5 REMOTE PLAY
+// ============================================================================
 struct PS5ConnectionWizardView: View {
     @ObservedObject var coord: PipelineCoordinator
     @Environment(\.presentationMode) var presentationMode
