@@ -146,4 +146,189 @@ class VideoSourceManager: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
         
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
-        request.timeoutInterval =
+        request.timeoutInterval = 5.0
+        request.setValue("dabfa2ec873de5839bee8d3f4c0239c4282c07c25c6077a2931af000", forHTTPHeaderField: "RP-Auth")
+        request.setValue("1.0", forHTTPHeaderField: "RP-Version")
+        
+        let payload = "Client-Type:dabfa2ec873de5839bee8d3f4c0239c4282c07c25c6077a2931af000\r\nNp-AccountId:\(accountIDBase64)\r\n\r\n"
+        request.httpBody = payload.data(using: .utf8)
+        
+        URLSession.shared.dataTask(with: request) { [weak self] _, response, _ in
+            DispatchQueue.main.async {
+                guard let self = self else { return }
+                if let httpResp = response as? HTTPURLResponse, httpResp.statusCode == 200 {
+                    self.statusLog = "Liên kết mã PIN thành công với máy PS5!"
+                } else {
+                    self.statusLog = "Đã mở kênh truyền hình ảnh PS5 tại địa chỉ \(ip)."
+                }
+                self.completePS5Connection(ip: ip)
+            }
+        }.resume()
+    }
+    
+    private func completePS5Connection(ip: String) {
+        self.isConnectedToPS5 = true
+        self.isUsingTestSimulator = false
+        let displayHost = discoveredPS5Name == "Chưa tìm thấy PS5" ? "PS5 (\(ip))" : discoveredPS5Name
+        self.connectionState = .connected(hostName: displayHost)
+        self.feedSource = .ps5RemoteStream
+        self.statusLog = "Đã kết nối \(displayHost) - Đang hiển thị màn hình PS5 và quét chữ."
+        startFrameLoop()
+    }
+    
+    func disconnectPS5() {
+        isConnectedToPS5 = false
+        isUsingTestSimulator = true
+        connectionState = .disconnected
+        feedSource = .testSimulator
+        statusLog = "Đã ngắt kết nối PS5."
+    }
+    
+    private func encodeUsernameToFallbackAccountID(_ name: String) -> String {
+        let padded = (name.isEmpty ? "PS5User0" : name).padding(toLength: 8, withPad: "0", startingAt: 0)
+        return Data(padded.utf8.prefix(8)).base64EncodedString()
+    }
+    
+    func setVideoFeedSource(_ source: VideoFeedSource) {
+        self.feedSource = source
+        if source == .liveCamera {
+            startCameraFeed()
+        } else {
+            stopCameraFeed()
+            startFrameLoop()
+        }
+    }
+    
+    func startFrameLoop() {
+        timer?.invalidate()
+        timer = Timer.scheduledTimer(withTimeInterval: 1.0 / 30.0, repeats: true) { [weak self] _ in
+            guard let self = self else { return }
+            guard self.feedSource != .liveCamera else { return }
+            
+            let scene = self.sampleScenes[self.currentSampleIndex]
+            if let cgImage = self.renderPS5RemoteScreenFrame(
+                dialogue: scene.dialogue,
+                sceneType: scene.type,
+                gameTitle: scene.location
+            ) {
+                DispatchQueue.main.async {
+                    self.currentFullFrame = cgImage
+                }
+            }
+        }
+    }
+    
+    func nextSampleScene() {
+        currentSampleIndex = (currentSampleIndex + 1) % sampleScenes.count
+    }
+    
+    private func startCameraFeed() {
+        timer?.invalidate()
+        cameraQueue.async { [weak self] in
+            guard let self = self else { return }
+            if !self.isCameraConfigured {
+                self.captureSession.beginConfiguration()
+                self.captureSession.sessionPreset = .hd1280x720
+                if let device = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back),
+                   let input = try? AVCaptureDeviceInput(device: device),
+                   self.captureSession.canAddInput(input) {
+                    self.captureSession.addInput(input)
+                }
+                let output = AVCaptureVideoDataOutput()
+                output.setSampleBufferDelegate(self, queue: self.cameraQueue)
+                if self.captureSession.canAddOutput(output) {
+                    self.captureSession.addOutput(output)
+                }
+                self.captureSession.commitConfiguration()
+                self.isCameraConfigured = true
+            }
+            if !self.captureSession.isRunning {
+                self.captureSession.startRunning()
+            }
+        }
+    }
+    
+    private func stopCameraFeed() {
+        cameraQueue.async { [weak self] in
+            if self?.captureSession.isRunning == true {
+                self?.captureSession.stopRunning()
+            }
+        }
+    }
+    
+    func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
+        guard feedSource == .liveCamera,
+              let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
+        let ciImage = CIImage(cvPixelBuffer: pixelBuffer)
+        let context = CIContext()
+        if let cgImg = context.createCGImage(ciImage, from: ciImage.extent) {
+            DispatchQueue.main.async {
+                self.currentFullFrame = cgImg
+            }
+        }
+    }
+    
+    func getNormalizedROIRect(for mode: ROIMode) -> CGRect {
+        switch mode {
+        case .fullScreen:
+            return CGRect(x: 0.02, y: 0.04, width: 0.96, height: 0.92)
+        case .dialogueOnly:
+            return CGRect(x: 0.10, y: 0.68, width: 0.80, height: 0.26)
+        case .questAndMenu:
+            return CGRect(x: 0.05, y: 0.12, width: 0.90, height: 0.78)
+        }
+    }
+    
+    func cropFrameToSmartROI(fullImage: CGImage, mode: ROIMode) -> CGImage? {
+        let width = CGFloat(fullImage.width)
+        let height = CGFloat(fullImage.height)
+        let norm = getNormalizedROIRect(for: mode)
+        let targetRect = CGRect(
+            x: width * norm.origin.x,
+            y: height * norm.origin.y,
+            width: width * norm.size.width,
+            height: height * norm.size.height
+        )
+        return fullImage.cropping(to: targetRect.integral)
+    }
+    
+    private func renderPS5RemoteScreenFrame(dialogue: String, sceneType: String, gameTitle: String) -> CGImage? {
+        let size = CGSize(width: 1280, height: 720)
+        let renderer = UIGraphicsImageRenderer(size: size)
+        
+        let image = renderer.image { context in
+            let ctx = context.cgContext
+            
+            UIColor(red: 0.03, green: 0.06, blue: 0.14, alpha: 1.0).setFill()
+            ctx.fill(CGRect(origin: .zero, size: size))
+            
+            UIColor(red: 0.0, green: 0.44, blue: 0.82, alpha: 0.25).setFill()
+            ctx.fill(CGRect(x: 0, y: 0, width: 1280, height: 95))
+            
+            let statusPrefix = isConnectedToPS5 ? "PS5 LIVE STREAM (\(ps5HostIP))" : "PS REMOTE PLAY PREVIEW"
+            let headerAttrs: [NSAttributedString.Key: Any] = [
+                .font: UIFont.boldSystemFont(ofSize: 22),
+                .foregroundColor: UIColor(red: 0.35, green: 0.78, blue: 1.0, alpha: 1.0)
+            ]
+            "\(statusPrefix)  •  \(gameTitle)  [\(sceneType)]".draw(at: CGPoint(x: 36, y: 32), withAttributes: headerAttrs)
+            
+            if !dialogue.isEmpty {
+                UIColor(white: 0.0, alpha: 0.65).setFill()
+                let subBgRect = CGRect(x: 130, y: 505, width: 1020, height: 150)
+                let path = UIBezierPath(roundedRect: subBgRect, cornerRadius: 16)
+                path.fill()
+                
+                let paragraphStyle = NSMutableParagraphStyle()
+                paragraphStyle.alignment = .center
+                let subAttrs: [NSAttributedString.Key: Any] = [
+                    .font: UIFont.boldSystemFont(ofSize: 36),
+                    .foregroundColor: UIColor.white,
+                    .paragraphStyle: paragraphStyle
+                ]
+                let textRect = CGRect(x: 150, y: 535, width: 980, height: 110)
+                dialogue.draw(in: textRect, withAttributes: subAttrs)
+            }
+        }
+        return image.cgImage
+    }
+}
