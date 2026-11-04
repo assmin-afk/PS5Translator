@@ -1,5 +1,5 @@
 // ============================================================================
-// FILE 6: 6_OverlayAndBroadcaster.swift (BẢN CHUẨN TƯƠNG THÍCH 100% XCODE)
+// FILE 6: 6_OverlayAndBroadcaster.swift (ĐÃ XOÁ SẠCH LỖI GỌI HÀM TRANSLATOR)
 // ============================================================================
 
 import SwiftUI
@@ -73,15 +73,14 @@ class PipelineCoordinator: ObservableObject {
     @Published var throttler = SmartThrottler()
     @Published var server = TVWebSocketServer()
     @Published var roiMode: ROIMode = .dialogueOnly
-    @Published var activeGameProfile: String = "Dữ liệu mẫu (Mặc định)"
+    @Published var activeGameProfile: String = "game_data.sqlite (Mặc định)"
     @Published var savedProfiles: [String] = []
-    @Published var loadedLineCount: Int = 0
     @Published var translatedBoxes: [TranslatedBox] = []
     @Published var lastRecognizedEnglish: String = "Đang chờ chữ trên màn hình PS5..."
     @Published var showROIGuideBox: Bool = true
     
     private let ocr = OCREngine()
-    private let translator = PredictiveTranslator()
+    private var translator = PredictiveTranslator()
     private var cancellables = Set<AnyCancellable>()
     
     init() {
@@ -95,24 +94,44 @@ class PipelineCoordinator: ObservableObject {
     }
     
     func refreshProfileList() {
-        savedProfiles = translator.getAvailableProfilesInDocuments()
-        loadedLineCount = translator.totalLoadedLines
-        if let first = savedProfiles.first, activeGameProfile == "Dữ liệu mẫu (Mặc định)" {
-            activeGameProfile = first
+        let fm = FileManager.default
+        guard let docsURL = fm.urls(for: .documentDirectory, in: .userDomainMask).first else { return }
+        if let files = try? fm.contentsOfDirectory(atPath: docsURL.path) {
+            savedProfiles = files.filter { $0.hasSuffix(".sqlite") || $0.hasSuffix(".db") }.sorted()
         }
     }
     
     func importSQLiteFromFilesApp(url: URL) {
-        if let importedName = translator.importExternalSQLiteFile(from: url) {
-            activeGameProfile = importedName
-            refreshProfileList()
-        }
+        let secured = url.startAccessingSecurityScopedResource()
+        defer { if secured { url.stopAccessingSecurityScopedResource() } }
+        
+        let fm = FileManager.default
+        guard let docsURL = fm.urls(for: .documentDirectory, in: .userDomainMask).first else { return }
+        let fileName = url.lastPathComponent
+        let destURL = docsURL.appendingPathComponent(fileName)
+        let activeDBURL = docsURL.appendingPathComponent("game_data.sqlite")
+        
+        try? fm.removeItem(at: destURL)
+        try? fm.copyItem(at: url, to: destURL)
+        try? fm.removeItem(at: activeDBURL)
+        try? fm.copyItem(at: url, to: activeDBURL)
+        
+        activeGameProfile = fileName
+        translator = PredictiveTranslator()
+        refreshProfileList()
     }
     
     func selectSavedProfile(_ name: String) {
+        let fm = FileManager.default
+        guard let docsURL = fm.urls(for: .documentDirectory, in: .userDomainMask).first else { return }
+        let srcURL = docsURL.appendingPathComponent(name)
+        let activeDBURL = docsURL.appendingPathComponent("game_data.sqlite")
+        if srcURL.path != activeDBURL.path {
+            try? fm.removeItem(at: activeDBURL)
+            try? fm.copyItem(at: srcURL, to: activeDBURL)
+        }
         activeGameProfile = name
-        translator.loadProfileFromDocuments(fileName: name)
-        loadedLineCount = translator.totalLoadedLines
+        translator = PredictiveTranslator()
     }
     
     private func process(_ frame: CGImage) {
@@ -398,7 +417,7 @@ struct MainTranslatorView: View {
                         VStack(alignment: .leading, spacing: 2) {
                             Text("Database Việt Hoá")
                                 .font(.system(size: 13, weight: .bold))
-                            Text("\(coord.activeGameProfile) (\(coord.loadedLineCount) câu)")
+                            Text(coord.activeGameProfile)
                                 .font(.system(size: 10))
                                 .foregroundColor(.cyan)
                                 .lineLimit(1)
@@ -660,7 +679,7 @@ struct DatabaseAndTVSettingsView: View {
                     HStack {
                         Text("Đang kích hoạt:")
                         Spacer()
-                        Text("\(coord.activeGameProfile) (\(coord.loadedLineCount) câu)")
+                        Text(coord.activeGameProfile)
                             .bold()
                             .foregroundColor(.cyan)
                     }
@@ -706,8 +725,7 @@ struct DatabaseAndTVSettingsView: View {
                     }
                 }
                 
-                Section(header: Text("3. Tốc độ quét OCR & Hiển thị")) {
-                    Stepper("Tốc độ quét: \(Int(coord.throttler.targetScanFPS)) FPS", value: $coord.throttler.targetScanFPS, in: 1...15)
+                Section(header: Text("3. Hiển thị vùng quét OCR")) {
                     Toggle("Hiện khung viền nét đứt vùng quét (ROI)", isOn: $coord.showROIGuideBox)
                 }
             }
