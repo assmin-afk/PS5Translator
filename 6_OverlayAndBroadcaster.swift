@@ -1,5 +1,5 @@
 // ============================================================================
-// FILE 6: 6_OverlayAndBroadcaster.swift (BẢN TƯƠNG THÍCH TỔNG QUÁT 100%)
+// FILE 6: 6_OverlayAndBroadcaster.swift (ĐÃ ĐỒNG BỘ 100% VỚI FILE 1 -> 5)
 // ============================================================================
 
 import SwiftUI
@@ -73,7 +73,7 @@ class PipelineCoordinator: ObservableObject {
     @Published var throttler = SmartThrottler()
     @Published var server = TVWebSocketServer()
     @Published var roiMode: ROIMode = .dialogueOnly
-    @Published var activeGameProfile: String = "game_data.sqlite (Mặc định)"
+    @Published var activeGameProfile: String = "default_rpg.sqlite (Mặc định)"
     @Published var savedProfiles: [String] = []
     @Published var translatedBoxes: [TranslatedBox] = []
     @Published var lastRecognizedEnglish: String = "Đang chờ chữ trên màn hình PS5..."
@@ -102,22 +102,9 @@ class PipelineCoordinator: ObservableObject {
     }
     
     func importSQLiteFromFilesApp(url: URL) {
-        let secured = url.startAccessingSecurityScopedResource()
-        defer { if secured { url.stopAccessingSecurityScopedResource() } }
-        
-        let fm = FileManager.default
-        guard let docsURL = fm.urls(for: .documentDirectory, in: .userDomainMask).first else { return }
         let fileName = url.lastPathComponent
-        let destURL = docsURL.appendingPathComponent(fileName)
-        let activeDBURL = docsURL.appendingPathComponent("game_data.sqlite")
-        
-        try? fm.removeItem(at: destURL)
-        try? fm.copyItem(at: url, to: destURL)
-        try? fm.removeItem(at: activeDBURL)
-        try? fm.copyItem(at: url, to: activeDBURL)
-        
+        translator.importVietnameseDataFile(from: url, forGameTitle: fileName)
         activeGameProfile = fileName
-        translator = PredictiveTranslator()
         refreshProfileList()
     }
     
@@ -125,13 +112,15 @@ class PipelineCoordinator: ObservableObject {
         let fm = FileManager.default
         guard let docsURL = fm.urls(for: .documentDirectory, in: .userDomainMask).first else { return }
         let srcURL = docsURL.appendingPathComponent(name)
-        let activeDBURL = docsURL.appendingPathComponent("game_data.sqlite")
-        if srcURL.path != activeDBURL.path {
-            try? fm.removeItem(at: activeDBURL)
-            try? fm.copyItem(at: srcURL, to: activeDBURL)
+        let defaultDBURL = docsURL.appendingPathComponent("default_rpg.sqlite")
+        if srcURL.path != defaultDBURL.path {
+            try? fm.removeItem(at: defaultDBURL)
+            try? fm.copyItem(at: srcURL, to: defaultDBURL)
         }
         activeGameProfile = name
-        translator = PredictiveTranslator()
+        if let firstProfile = translator.profiles.first {
+            translator.selectProfile(firstProfile)
+        }
     }
     
     private func process(_ frame: CGImage) {
@@ -139,29 +128,22 @@ class PipelineCoordinator: ObservableObject {
         guard throttler.shouldPerformOCR(on: cropped) else { return }
         let roiRect = videoMgr.getNormalizedROIRect(for: roiMode)
         
-        // Sử dụng phản hồi dạng Any linh hoạt để tương thích với mọi phương thức OCR có sẵn
-        let mirror = Mirror(reflecting: ocr)
-        var handledViaReflection = false
-        
-        for child in mirror.children {
-            if let methodName = child.label, methodName.contains("detect") || methodName.contains("recognize") || methodName.contains("text") {
-                // Tự động gọi hàm OCR tìm thấy qua reflection nếu cần
-            }
-        }
-        
-        // Gọi trực tiếp qua PredictiveTranslator để xử lý khung hình giả lập và hiển thị mượt mà ngay lập tức
-        let dummyToken = OCRToken(rawText: "Preview Mode active", x: 0.1, y: 0.7, w: 0.8, h: 0.2)
-        translator.translate(ocrResults: [dummyToken]) { boxes in
-            let mappedBoxes = boxes.map { b in
-                TranslatedBox(
-                    text: b.text,
-                    x: roiRect.origin.x + b.x * roiRect.size.width,
-                    y: roiRect.origin.y + b.y * roiRect.size.height,
-                    w: b.w * roiRect.size.width,
-                    h: b.h * roiRect.size.height
-                )
-            }
+        // Gọi trực tiếp hàm recognizeAndClassifyText từ 4_OCREngine.swift
+        ocr.recognizeAndClassifyText(in: cropped, effectiveROIRect: roiRect) { [weak self] ocrResults in
+            guard let self = self else { return }
+            
+            // Dịch danh sách RawOCRResult sang [TranslatedBox] thông qua 5_PredictiveTranslator.swift
+            let mappedBoxes: [TranslatedBox] = self.translator.translateRegions(
+                ocrResults: ocrResults,
+                useAppleAIFallback: AppConfig.enableAppleAIFallback
+            )
+            
+            let recognizedText = ocrResults.map { $0.cleanTextForTranslation }.joined(separator: " | ")
+            
             DispatchQueue.main.async {
+                if !recognizedText.isEmpty {
+                    self.lastRecognizedEnglish = recognizedText
+                }
                 self.translatedBoxes = mappedBoxes
                 self.server.broadcast(boxes: mappedBoxes)
             }
@@ -688,7 +670,7 @@ struct DatabaseAndTVSettingsView: View {
                     }
                     
                     Button(action: { showFileImporter = true }) {
-                        Label("Nhập file .sqlite từ ứng dụng Tệp (iPhone)", systemImage: "folder.badge.plus")
+                        Label("Nhập file .sqlite hoặc .txt từ Tệp (iPhone)", systemImage: "folder.badge.plus")
                             .font(.body.bold())
                             .foregroundColor(.blue)
                     }
