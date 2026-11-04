@@ -1,5 +1,5 @@
 // ============================================================================
-// FILE 6: 6_OverlayAndBroadcaster.swift (ĐÃ SỬA CHUẨN TÊN HÀM OCR)
+// FILE 6: 6_OverlayAndBroadcaster.swift (BẢN TƯƠNG THÍCH OCR TUYỆT ĐỐI)
 // ============================================================================
 
 import SwiftUI
@@ -140,8 +140,8 @@ class PipelineCoordinator: ObservableObject {
         
         let roiRect = videoMgr.getNormalizedROIRect(for: roiMode)
         
-        // Sử dụng đúng hàm recognizeText chuẩn của OCREngine
-        ocr.recognizeText(in: cropped) { [weak self] rawResults in
+        // Gọi phương thức detectText tương thích chuẩn với OCREngine sẵn có
+        ocr.detectText(in: cropped) { [weak self] (rawResults: [OCRToken]) in
             guard let self = self else { return }
             let englishPreview = rawResults.map { $0.rawText }.joined(separator: " ")
             
