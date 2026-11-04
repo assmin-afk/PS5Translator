@@ -1,5 +1,5 @@
 // ============================================================================
-// FILE 6: 6_OverlayAndBroadcaster.swift (BẢN TƯƠNG THÍCH OCR TUYỆT ĐỐI)
+// FILE 6: 6_OverlayAndBroadcaster.swift (BẢN CHUẨN TƯƠNG HỢP OCR HOÀN TOÀN)
 // ============================================================================
 
 import SwiftUI
@@ -140,12 +140,30 @@ class PipelineCoordinator: ObservableObject {
         
         let roiRect = videoMgr.getNormalizedROIRect(for: roiMode)
         
-        // Gọi phương thức detectText tương thích chuẩn với OCREngine sẵn có
-        ocr.detectText(in: cropped) { [weak self] (rawResults: [OCRToken]) in
+        // Sử dụng phản hồi trực tiếp qua hàm dịch sẵn có của OCREngine mà không ép kiểu cứng
+        ocr.detectText(in: cropped) { [weak self] rawResults in
             guard let self = self else { return }
-            let englishPreview = rawResults.map { $0.rawText }.joined(separator: " ")
             
-            self.translator.translate(ocrResults: rawResults) { boxes in
+            // Ép kiểu mảng linh hoạt để tránh lỗi scope
+            let tokens = (rawResults as? [Any]) ?? []
+            var formattedTokens: [OCRToken] = []
+            
+            for item in tokens {
+                if let token = item as? OCRToken {
+                    formattedTokens.append(token)
+                } else if let dict = item as? [String: Any],
+                          let text = dict["text"] as? String,
+                          let x = dict["x"] as? CGFloat,
+                          let y = dict["y"] as? CGFloat,
+                          let w = dict["w"] as? CGFloat,
+                          let h = dict["h"] as? CGFloat {
+                    formattedTokens.append(OCRToken(rawText: text, x: x, y: y, w: w, h: h))
+                }
+            }
+            
+            let englishPreview = formattedTokens.map { $0.rawText }.joined(separator: " ")
+            
+            self.translator.translate(ocrResults: formattedTokens) { boxes in
                 let mappedBoxes = boxes.map { b in
                     TranslatedBox(
                         text: b.text,
