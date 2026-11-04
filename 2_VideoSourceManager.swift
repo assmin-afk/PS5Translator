@@ -1,5 +1,5 @@
 // ============================================================================
-// FILE 2: 2_VideoSourceManager.swift (BẢN CHUẨN KHÔNG LỖI MODULE)
+// FILE 2: 2_VideoSourceManager.swift (ĐÃ BỔ SUNG ĐẦY ĐỦ ENUM ROIMODE)
 // ============================================================================
 
 import Foundation
@@ -8,6 +8,13 @@ import CoreGraphics
 import Combine
 import Network
 import AVFoundation
+
+// Khai báo ROIMode ngay tại đây để cả File 2 và File 6 đều nhận diện được
+enum ROIMode: String, CaseIterable {
+    case fullScreen = "Toàn màn hình"
+    case dialogueOnly = "Chỉ phụ đề"
+    case questAndMenu = "Nhiệm vụ & Menu"
+}
 
 enum VideoFeedSource: String, CaseIterable {
     case ps5RemoteStream = "Màn hình PS5 (Remote)"
