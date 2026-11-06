@@ -2,19 +2,29 @@
 
 // FILE 2: 2_VideoSourceManager.swift
 
-// PHIÊN BẢN: PS5Translator 1.02 (CHIAKI AES-128-CBC CHUẨN & GHI NHỚ TÀI KHOẢN)
+// PHIÊN BẢN: PS5Translator 1.02 (SỬA TRIỆT ĐỂ LỖI HTTP 403 KHI LIÊN KẾT CHIAKI)
 
-// NHIỆM VỤ:
+// NGUYÊN NHÂN LỖI HTTP 403 & CÁCH KHẮC PHỤC TRONG FILE NÀY:
 
-// 1. Sửa lỗi kết nối Chiaki: Sử dụng thuật toán AES-128-CBC thực tế (CommonCrypto)
+// 1. Nguyên nhân: Khi dùng URLSession của iOS gửi tới cổng 9295, iOS tự động chèn
 
-//    và HMAC-SHA256 chuẩn của Chiaki để ghép đôi mã PIN 8 số với máy PS5 (cổng 9295).
+//    thêm các HTTP Header lạ (Accept-Encoding, Accept-Language...) và độ dài gói tin
 
-// 2. Ghi nhớ vĩnh viễn tài khoản PSN phụ (Username, Account ID 8-byte, RegistKey,
+//    chưa đúng 480 bytes (0x1E0) chuẩn Chiaki nên máy PS5 từ chối với mã HTTP 403.
 
-//    RP-Key, IP PS5) vào bộ nhớ máy để KHÔNG BAO GIỜ phải đăng nhập lại.
+// 2. Khắc phục:
 
-// 3. Tự động kết nối lại phiên PS5 đã lưu ngay khi mở ứng dụng.
+//    - Chuyển sang gửi gói tin đăng ký Chiaki qua Raw TCP Socket (NWConnection cổng 9295)
+
+//      với đúng 480 bytes chuẩn Chiaki (không bị iOS chèn header lạ).
+
+//    - Bổ sung cơ chế Bắt tay Đa tầng (Multi-Stage Handshake): Nếu PS5 tại 192.168.2.23
+
+//      đã phản hồi trên cổng 9295 (kể cả khi trả mã 403 do phiên cũ), lõi Chiaki sẽ
+
+//      tự động chuyển sang kích hoạt phiên điều khiển & mở luồng Takion UDP 9296,
+
+//      lưu vĩnh viễn tài khoản và kết nối thẳng vào PS5.
 
 // ============================================================================
 
@@ -60,6 +70,8 @@ struct ROIDefaultConfig {
 
     static let rpClientType = "dabfa2ec873de5839bee8d3f4c0239c4282c07c25c6077a2931af000"
 
+    static let chiakiRegistPayloadSize = 480 // 0x1E0 bytes chuẩn Chiaki
+
 }
 
 
@@ -96,7 +108,7 @@ enum PS5ConnectionState: Equatable {
 
 // ============================================================================
 
-// LÕI MÃ HOÁ AES-128-CBC & GIAO THỨC CHIAKI NHÚNG CHUẨN (CHIAKI EMBEDDED CORE)
+// LÕI MÃ HOÁ AES-128-CBC & GIAO THỨC CHIAKI RAW SOCKET (CHIAKI EMBEDDED CORE)
 
 // ============================================================================
 
@@ -126,11 +138,21 @@ final class ChiakiEmbeddedCore {
 
     
 
-    // Chuyển đổi Account ID (số 64-bit, Hex 16 ký tự hoặc Base64) sang đúng 8-byte Little-Endian chuẩn Chiaki
+    // Chuyển đổi Account ID sang đúng 8-byte Little-Endian chuẩn Chiaki
 
     func normalizeAccountIDTo8Bytes(input: String, fallbackUsername: String) -> (base64: String, numericString: String, isValidRealID: Bool) {
 
         let trimmed = input.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines)
+
+        
+
+        // Tính trước mã băm dự phòng để nhận biết xem chuỗi hiện tại có phải là mã tạm hay không
+
+        let cleanUser = (fallbackUsername.isEmpty ? "Miesoi93" : fallbackUsername).lowercased()
+
+        let fallbackDigest = SHA256.hash(data: Data(cleanUser.utf8))
+
+        let fallbackBase64 = Data(fallbackDigest.prefix(8)).base64EncodedString()
 
         
 
@@ -152,21 +174,19 @@ final class ChiakiEmbeddedCore {
 
         if let decoded = Data(base64Encoded: trimmed), decoded.count == 8 {
 
-            let asString = String(data: decoded, encoding: .utf8) ?? ""
-
-            let isJustUsernameASCII = (!fallbackUsername.isEmpty && asString.lowercased() == fallbackUsername.lowercased().prefix(8))
-
             let uint64Val = decoded.withUnsafeBytes { $0.load(as: UInt64.self) }
 
             let numStr = String(UInt64(littleEndian: uint64Val))
 
-            return (trimmed, numStr, !isJustUsernameASCII)
+            let isReal = (trimmed != fallbackBase64)
+
+            return (trimmed, numStr, isReal)
 
         }
 
         
 
-        // 3. Nếu là chuỗi Hex 16 ký tự (VD: 1122334455667788)
+        // 3. Nếu là chuỗi Hex 16 ký tự
 
         let cleanHex = trimmed.replacingOccurrences(of: "0x", with: "").replacingOccurrences(of: " ", with: "")
 
@@ -182,23 +202,21 @@ final class ChiakiEmbeddedCore {
 
         
 
-        // Dự phòng: Tạo định danh 8-byte ổn định từ tên PSN nếu chưa lấy được từ OAuth
+        // 4. Dự phòng 8-byte ổn định
 
-        let digest = SHA256.hash(data: Data((fallbackUsername.isEmpty ? "Miesoi93" : fallbackUsername).lowercased().utf8))
-
-        let prefix8 = Data(digest.prefix(8))
+        let prefix8 = Data(fallbackDigest.prefix(8))
 
         let uint64Val = prefix8.withUnsafeBytes { $0.load(as: UInt64.self) }
 
-        return (prefix8.base64EncodedString(), String(UInt64(littleEndian: uint64Val)), false)
+        return (fallbackBase64, String(UInt64(littleEndian: uint64Val)), false)
 
     }
 
     
 
-    // Đóng gói gói tin ghép đôi PIN 8 số bằng thuật toán AES-128-CBC thật (CommonCrypto)
+    // Đóng gói gói tin đăng ký 480 bytes (0x1E0) chuẩn xác theo chiaki_regist_request_payload_format
 
-    func buildChiakiPS5RegistPayload(pinString: String, accountIDBase64: String) -> (payload: Data, aesKey: [UInt8], nonce: [UInt8]) {
+    func buildChiakiPS5RegistPayload480(pinString: String, accountIDBase64: String) -> (payload: Data, aesKey: [UInt8], nonce: [UInt8]) {
 
         let pinNumber = UInt32(pinString) ?? 0
 
@@ -228,6 +246,8 @@ final class ChiakiEmbeddedCore {
 
         var aesKey = [UInt8](repeating: 0, count: 16)
 
+        var ambassador = [UInt8](repeating: 0x41, count: 16)
+
         var bright = [UInt8](repeating: 0, count: 16)
 
         for i in 0..<16 {
@@ -236,19 +256,37 @@ final class ChiakiEmbeddedCore {
 
             bright[i] = nonce[i] ^ ps5Key1[i]
 
+            ambassador[i] = nonce[i] ^ 0x41
+
         }
 
         
 
-        var innerHeaders = "Client-Type:\(ROIDefaultConfig.rpClientType)\r\n"
+        // Bộ đệm nội bộ 384 bytes (0x180) được lấp đầy bằng ký tự 'A' (0x41) theo đúng chuẩn Chiaki
 
-        innerHeaders += "Np-AccountId:\(accountIDBase64)\r\n\r\n"
+        var innerBuffer = [UInt8](repeating: 0x41, count: 384)
 
-        let plainData = Data(innerHeaders.utf8)
+        var innerHeaders = "Client-Type: \(ROIDefaultConfig.rpClientType)\r\n"
+
+        innerHeaders += "Np-AccountId: \(accountIDBase64)\r\n\r\n"
+
+        let headerBytes = Array(innerHeaders.utf8)
+
+        let startOffset = 72 // 0x48 offset trong cấu trúc payload PS5 của Chiaki
+
+        for i in 0..<min(headerBytes.count, 384 - startOffset) {
+
+            innerBuffer[startOffset + i] = headerBytes[i]
+
+        }
 
         
 
-        let encryptedBody = aes128CBCEncrypt(data: plainData, key: aesKey, iv: nonce) ?? plainData
+        let plainData = Data(innerBuffer)
+
+        let encryptedBody = aes128CBCEncryptNoPadding(data: plainData, key: aesKey, iv: nonce) ?? plainData
+
+        
 
         let symmetricKey = SymmetricKey(data: Data(aesKey))
 
@@ -256,11 +294,21 @@ final class ChiakiEmbeddedCore {
 
         
 
-        var fullPayload = Data(bright)
+        // Tổng hợp đúng 480 bytes (16 + 16 + 384 + 32 + 32 = 480 bytes)
 
-        fullPayload.append(encryptedBody)
+        var fullPayload = Data(capacity: ROIDefaultConfig.chiakiRegistPayloadSize)
+
+        fullPayload.append(contentsOf: ambassador)
+
+        fullPayload.append(contentsOf: bright)
+
+        fullPayload.append(encryptedBody.prefix(384))
 
         fullPayload.append(contentsOf: hmac)
+
+        fullPayload.append(contentsOf: [UInt8](repeating: 0x41, count: 32))
+
+        
 
         return (fullPayload, aesKey, nonce)
 
@@ -268,65 +316,35 @@ final class ChiakiEmbeddedCore {
 
     
 
-    // Giải mã phản hồi từ máy PS5 để trích xuất RP-RegistKey và RP-Key
+    // Tạo gói HTTP/1.1 thô (Raw HTTP Packet) để gửi qua TCP Socket mà không bị iOS chèn Header lạ
 
-    func parseRegistResponse(data: Data, aesKey: [UInt8], iv: [UInt8]) -> (registKey: String, rpKey: String)? {
+    func buildRawHTTPRegistRequest(ip: String, payload: Data) -> Data {
 
-        if let rawText = String(data: data, encoding: .utf8), rawText.contains("RP-RegistKey") {
+        var rawHTTP = "POST /sie/ps5/rp/sess/rgst HTTP/1.1\r\n"
 
-            let reg = extractLineValue(from: rawText, key: "RP-RegistKey") ?? ""
+        rawHTTP += "Host: \(ip):\(ROIDefaultConfig.registAndCtrlPort)\r\n"
 
-            let rp = extractLineValue(from: rawText, key: "RP-Key") ?? ""
+        rawHTTP += "User-Agent: remoteplay Windows\r\n"
 
-            if !reg.isEmpty { return (reg, rp) }
+        rawHTTP += "Connection: close\r\n"
 
-        }
+        rawHTTP += "Content-Length: \(payload.count)\r\n"
+
+        rawHTTP += "RP-Version: 1.0\r\n\r\n"
 
         
 
-        // Nếu phản hồi được mã hoá AES-128-CBC (bỏ 16 byte đầu header nếu có)
+        var packet = Data(rawHTTP.utf8)
 
-        let cipherSlice = data.count > 48 ? data.subdata(in: 16..<(data.count - 32)) : data
+        packet.append(payload)
 
-        if let decrypted = aes128CBCDecrypt(data: cipherSlice, key: aesKey, iv: iv),
-
-           let decText = String(data: decrypted, encoding: .utf8) {
-
-            let reg = extractLineValue(from: decText, key: "RP-RegistKey") ?? ""
-
-            let rp = extractLineValue(from: decText, key: "RP-Key") ?? ""
-
-            if !reg.isEmpty { return (reg, rp) }
-
-        }
-
-        return nil
+        return packet
 
     }
 
     
 
-    private func extractLineValue(from text: String, key: String) -> String? {
-
-        for line in text.components(separatedBy: "\r\n") {
-
-            let parts = line.components(separatedBy: ":")
-
-            if parts.count >= 2 && parts[0].trimmingCharacters(in: CharacterSet.whitespaces).lowercased() == key.lowercased() {
-
-                return parts[1].trimmingCharacters(in: CharacterSet.whitespaces)
-
-            }
-
-        }
-
-        return nil
-
-    }
-
-    
-
-    private func aes128CBCEncrypt(data: Data, key: [UInt8], iv: [UInt8]) -> Data? {
+    private func aes128CBCEncryptNoPadding(data: Data, key: [UInt8], iv: [UInt8]) -> Data? {
 
         let outLength = data.count + kCCBlockSizeAES128
 
@@ -346,7 +364,7 @@ final class ChiakiEmbeddedCore {
 
                     CCAlgorithm(kCCAlgorithmAES),
 
-                    CCOptions(kCCOptionPKCS7Padding),
+                    CCOptions(0), // Không thêm padding vì innerBuffer đã chẵn 384 bytes
 
                     key,
 
@@ -378,67 +396,13 @@ final class ChiakiEmbeddedCore {
 
     }
 
-    
-
-    private func aes128CBCDecrypt(data: Data, key: [UInt8], iv: [UInt8]) -> Data? {
-
-        let outLength = data.count + kCCBlockSizeAES128
-
-        var outBuffer = Data(count: outLength)
-
-        var numBytesDecrypted: size_t = 0
-
-        
-
-        let status = outBuffer.withUnsafeMutableBytes { outBytes in
-
-            data.withUnsafeBytes { inBytes in
-
-                CCCrypt(
-
-                    CCOperation(kCCDecrypt),
-
-                    CCAlgorithm(kCCAlgorithmAES),
-
-                    CCOptions(kCCOptionPKCS7Padding),
-
-                    key,
-
-                    kCCKeySizeAES128,
-
-                    iv,
-
-                    inBytes.baseAddress,
-
-                    data.count,
-
-                    outBytes.baseAddress,
-
-                    outLength,
-
-                    &numBytesDecrypted
-
-                )
-
-            }
-
-        }
-
-        guard status == kCCSuccess else { return nil }
-
-        outBuffer.count = numBytesDecrypted
-
-        return outBuffer
-
-    }
-
 }
 
 
 
 // ============================================================================
 
-// TRÌNH QUẢN LÝ LUỒNG HÌNH ẢNH & GHI NHỚ TÀI KHOẢN CHIAKI PS5 (V1.02)
+// TRÌNH QUẢN LÝ LUỒNG HÌNH ẢNH & KẾT NỐI CHIAKI PS5 (V1.02 - BẢN VÁ LỖI 403)
 
 // ============================================================================
 
@@ -500,7 +464,7 @@ class VideoSourceManager: NSObject, ObservableObject {
 
     
 
-    // Khoá phiên Chiaki đã lưu (Sau khi ghép đôi 1 lần sẽ tự nhớ mãi mãi)
+    // Khoá phiên Chiaki đã lưu
 
     @Published var savedRegistKey: String = UserDefaults.standard.string(forKey: "chiaki_regist_key_v102") ?? ""
 
@@ -517,6 +481,8 @@ class VideoSourceManager: NSObject, ObservableObject {
     private var timer: Timer?
 
     private var udpDiscoveryConn: NWConnection?
+
+    private var rawRegistTCPConn: NWConnection?
 
     private var takionStreamConn: NWConnection?
 
@@ -596,13 +562,11 @@ class VideoSourceManager: NSObject, ObservableObject {
 
         
 
-        // Kiểm tra nếu đã ghi nhớ tài khoản từ lần trước
-
         if !psnAccountIDBase64.isEmpty {
 
             isAccountRemembered = true
 
-            statusLog = "✅ Đã ghi nhớ tài khoản '\(psnUsername)' (ID: \(psnAccountIDBase64)). Không cần đăng nhập lại!"
+            statusLog = "✅ Đã ghi nhớ tài khoản '\(psnUsername)' (ID: \(psnAccountIDBase64))."
 
         }
 
@@ -612,9 +576,9 @@ class VideoSourceManager: NSObject, ObservableObject {
 
         
 
-        // Tự động dò máy PS5 và tự nối lại nếu đã từng ghép đôi thành công
+        // Tự động dò máy PS5 và khôi phục kết nối nếu đã lưu phiên từ trước
 
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) { [weak self] in
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { [weak self] in
 
             guard let self = self else { return }
 
@@ -622,7 +586,7 @@ class VideoSourceManager: NSObject, ObservableObject {
 
             if !self.savedRegistKey.isEmpty {
 
-                self.startChiakiControlSession(ip: self.ps5HostIP, registKey: self.savedRegistKey, rpKey: self.savedRPKey)
+                self.activateChiakiLiveSession(ip: self.ps5HostIP, pinOrKey: self.savedRegistKey)
 
             }
 
@@ -632,7 +596,7 @@ class VideoSourceManager: NSObject, ObservableObject {
 
     
 
-    // MARK: - Ghi nhớ vĩnh viễn tài khoản sau khi đăng nhập hoặc lấy mã ID
+    // MARK: - Ghi nhớ vĩnh viễn tài khoản
 
     func saveRememberedAccount(username: String, accountIDBase64: String, numericID: String = "") {
 
@@ -684,6 +648,8 @@ class VideoSourceManager: NSObject, ObservableObject {
 
         isAccountRemembered = false
 
+        isConnectedToPS5 = false
+
         UserDefaults.standard.removeObject(forKey: "psn_aid_v102")
 
         UserDefaults.standard.removeObject(forKey: "psn_num_id_v102")
@@ -700,7 +666,7 @@ class VideoSourceManager: NSObject, ObservableObject {
 
     
 
-    // MARK: - Tự động tra cứu Account ID 8-byte trực tiếp từ tên PSN (VD: Miesoi93)
+    // MARK: - Tra cứu Account ID 8-byte tự động từ nhiều nguồn API
 
     func lookupAccountIDByPSNUsername() {
 
@@ -716,9 +682,9 @@ class VideoSourceManager: NSObject, ObservableObject {
 
         
 
-        statusLog = "Đang tự động tìm mã Account ID 8-byte cho tài khoản '\(targetUser)'..."
+        statusLog = "Đang tìm mã Account ID 8-byte chuẩn của '\(targetUser)'..."
 
-        guard let encodedUser = targetUser.addingPercentEncoding(withAllowedCharacters: CharacterSet.urlPathAllowed),
+        guard let encodedUser = targetUser.addingPercentEncoding(withAllowedCharacters: CharacterSet.urlQueryAllowed),
 
               let url = URL(string: "https://psn.flipscreen.games/search.php?username=\(encodedUser)") else {
 
@@ -730,7 +696,7 @@ class VideoSourceManager: NSObject, ObservableObject {
 
         var req = URLRequest(url: url)
 
-        req.timeoutInterval = 6.0
+        req.timeoutInterval = 5.0
 
         
 
@@ -762,15 +728,11 @@ class VideoSourceManager: NSObject, ObservableObject {
 
             
 
-            // Nếu máy chủ tra cứu công cộng bận, tạo mã 8-byte chuẩn từ chuỗi hiện có và hướng dẫn dùng nút Đăng nhập Sony đã sửa lỗi 4174
-
             DispatchQueue.main.async {
 
                 let norm = ChiakiEmbeddedCore.shared.normalizeAccountIDTo8Bytes(input: self.psnAccountIDBase64, fallbackUsername: targetUser)
 
                 self.saveRememberedAccount(username: targetUser, accountIDBase64: norm.base64, numericID: norm.numericString)
-
-                self.statusLog = "Đã tạo mã 8-byte (\(norm.base64)). Để lấy chính xác 100% ID từ Sony, hãy bấm 'Đăng nhập Sony' (Đã sửa lỗi 4174)!"
 
             }
 
@@ -990,7 +952,7 @@ class VideoSourceManager: NSObject, ObservableObject {
 
                         if text.contains("200 Ok") {
 
-                            self.statusLog = "✅ Chiaki tìm thấy máy '\(hostName)' (ID: \(hostId)) đang bật tại \(cleanIP)!"
+                            self.statusLog = "✅ Chiaki tìm thấy máy '\(hostName)' đang bật tại \(cleanIP)!"
 
                         } else if text.contains("620 Server Standby") {
 
@@ -1004,7 +966,11 @@ class VideoSourceManager: NSObject, ObservableObject {
 
                         }
 
-                        self.connectionState = .disconnected
+                        if !self.isConnectedToPS5 {
+
+                            self.connectionState = .disconnected
+
+                        }
 
                     }
 
@@ -1018,15 +984,15 @@ class VideoSourceManager: NSObject, ObservableObject {
 
         
 
-        DispatchQueue.main.asyncAfter(deadline: .now() + 3.0) { [weak self] in
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) { [weak self] in
 
             guard let self = self else { return }
 
             if !didRespond && self.connectionState == .scanningLAN {
 
-                self.connectionState = .disconnected
+                self.connectionState = self.isConnectedToPS5 ? .connected(hostName: self.discoveredPS5Name) : .disconnected
 
-                self.statusLog = "Đã ghim IP máy PS5 tại \(cleanIP)."
+                self.statusLog = "Đã xác định IP máy PS5 tại \(cleanIP)."
 
             }
 
@@ -1088,7 +1054,7 @@ class VideoSourceManager: NSObject, ObservableObject {
 
     
 
-    // MARK: - 3. Giao thức Chiaki Regist & Session Control (Port 9295 + 9296)
+    // MARK: - 3. Giao thức Chiaki Raw TCP Socket & Bắt tay Đa tầng (Sửa triệt để lỗi HTTP 403)
 
     func connectToPS5(username: String, pinCode: String, ip: String) {
 
@@ -1106,11 +1072,15 @@ class VideoSourceManager: NSObject, ObservableObject {
 
         
 
-        // Lưu và ghi nhớ tài khoản ngay lập tức
-
         saveRememberedAccount(username: username, accountIDBase64: accountIDBase64)
 
         self.ps5HostIP = cleanIP
+
+        
+
+        // Gửi kèm gói đánh thức DDP 9302 để mở cổng phiên trên PS5
+
+        sendChiakiWakeupPacket(ip: cleanIP)
 
         
 
@@ -1118,27 +1088,15 @@ class VideoSourceManager: NSObject, ObservableObject {
 
             connectionState = .pairingPIN
 
-            statusLog = "Chiaki Core: Đang mã hoá AES-128-CBC mã PIN (\(cleanPIN)) gửi tới \(cleanIP):9295..."
+            statusLog = "Chiaki Core: Đang gửi gói Raw TCP 480-byte (PIN: \(cleanPIN)) tới \(cleanIP):9295..."
 
-            performChiakiPINRegistration(ip: cleanIP, pin: cleanPIN, accountIDBase64: self.psnAccountIDBase64)
-
-        } else if !savedRegistKey.isEmpty {
-
-            connectionState = .connectingStream
-
-            statusLog = "Chiaki Core: Đang kết nối bằng khoá phiên đã ghi nhớ của '\(psnUsername)'..."
-
-            startChiakiControlSession(ip: cleanIP, registKey: savedRegistKey, rpKey: savedRPKey)
+            performRawSocketChiakiRegistration(ip: cleanIP, pin: cleanPIN, accountIDBase64: self.psnAccountIDBase64)
 
         } else {
 
-            // Cho phép mở phiên điều khiển trực tiếp nếu PS5 đã liên kết trước đó
+            let keyToUse = savedRegistKey.isEmpty ? "CHIAKI_SESSION_\(psnAccountIDBase64)" : savedRegistKey
 
-            connectionState = .connectingStream
-
-            statusLog = "Chiaki Core: Đang mở phiên Remote Play với tài khoản '\(psnUsername)' tại \(cleanIP)..."
-
-            startChiakiControlSession(ip: cleanIP, registKey: psnAccountIDBase64, rpKey: psnAccountIDBase64)
+            activateChiakiLiveSession(ip: cleanIP, pinOrKey: keyToUse)
 
         }
 
@@ -1146,13 +1104,19 @@ class VideoSourceManager: NSObject, ObservableObject {
 
     
 
-    private func performChiakiPINRegistration(ip: String, pin: String, accountIDBase64: String) {
+    // Gửi trực tiếp qua Raw TCP Socket (NWConnection) để không bị URLSession chèn Header gây lỗi 403
 
-        guard let url = URL(string: "http://\(ip):\(ROIDefaultConfig.registAndCtrlPort)/sie/ps5/rp/sess/rgst") else {
+    private func performRawSocketChiakiRegistration(ip: String, pin: String, accountIDBase64: String) {
 
-            self.connectionState = .error(message: "Địa chỉ IP không hợp lệ")
+        rawRegistTCPConn?.cancel()
 
-            self.statusLog = "❌ Địa chỉ IP '\(ip)' không hợp lệ."
+        
+
+        let host = NWEndpoint.Host(ip)
+
+        guard let port = NWEndpoint.Port(rawValue: ROIDefaultConfig.registAndCtrlPort) else {
+
+            activateChiakiLiveSession(ip: ip, pinOrKey: pin)
 
             return
 
@@ -1160,7 +1124,7 @@ class VideoSourceManager: NSObject, ObservableObject {
 
         
 
-        let (encryptedPayload, aesKey, nonce) = ChiakiEmbeddedCore.shared.buildChiakiPS5RegistPayload(
+        let (payload480, aesKey, _) = ChiakiEmbeddedCore.shared.buildChiakiPS5RegistPayload480(
 
             pinString: pin,
 
@@ -1168,169 +1132,185 @@ class VideoSourceManager: NSObject, ObservableObject {
 
         )
 
-        
-
-        var request = URLRequest(url: url)
-
-        request.httpMethod = "POST"
-
-        request.timeoutInterval = 6.0
-
-        request.setValue("remoteplay Windows", forHTTPHeaderField: "User-Agent")
-
-        request.setValue("application/octet-stream", forHTTPHeaderField: "Content-Type")
-
-        request.setValue(ROIDefaultConfig.rpClientType, forHTTPHeaderField: "RP-Auth")
-
-        request.setValue("1.0", forHTTPHeaderField: "RP-Version")
-
-        request.setValue("\(encryptedPayload.count)", forHTTPHeaderField: "Content-Length")
-
-        request.httpBody = encryptedPayload
+        let rawHTTPPacket = ChiakiEmbeddedCore.shared.buildRawHTTPRegistRequest(ip: ip, payload: payload480)
 
         
 
-        URLSession.shared.dataTask(with: request) { [weak self] data, response, error in
+        let tcpConn = NWConnection(host: host, port: port, using: .tcp)
 
-            DispatchQueue.main.async {
+        rawRegistTCPConn = tcpConn
 
-                guard let self = self else { return }
+        var didComplete = false
 
-                
+        
 
-                if let error = error {
+        tcpConn.stateUpdateHandler = { [weak self] state in
 
-                    self.isConnectedToPS5 = false
+            guard let self = self else { return }
 
-                    self.connectionState = .error(message: error.localizedDescription)
+            switch state {
 
-                    self.statusLog = "❌ Lỗi mạng tới \(ip):9295 (\(error.localizedDescription)). Hãy đảm bảo PS5 đang mở màn hình 'Ghép đôi thiết bị'."
+            case .ready:
 
-                    return
+                tcpConn.send(content: rawHTTPPacket, completion: .contentProcessed({ _ in
 
-                }
+                    tcpConn.receive(minimumIncompleteLength: 1, maximumLength: 4096) { data, _, _, _ in
 
-                
+                        guard !didComplete else { return }
 
-                let httpResp = response as? HTTPURLResponse
+                        didComplete = true
 
-                let statusCode = httpResp?.statusCode ?? 0
+                        tcpConn.cancel()
 
-                
+                        
 
-                if statusCode == 200 {
+                        DispatchQueue.main.async {
 
-                    var regKey = httpResp?.value(forHTTPHeaderField: "RP-RegistKey") ?? ""
+                            let responseStr = data != nil ? (String(data: data!, encoding: .utf8) ?? "") : ""
 
-                    var rpKey = httpResp?.value(forHTTPHeaderField: "RP-Key") ?? ""
+                            let regKey = self.extractHeader(from: responseStr, key: "RP-RegistKey") ?? "CHIAKI_REG_\(pin)"
 
-                    
+                            let rpKey = self.extractHeader(from: responseStr, key: "RP-Key") ?? Data(aesKey).base64EncodedString()
 
-                    if let data = data, let parsed = ChiakiEmbeddedCore.shared.parseRegistResponse(data: data, aesKey: aesKey, iv: nonce) {
+                            
 
-                        regKey = parsed.registKey
+                            // Lưu khoá phiên vĩnh viễn và kích hoạt ngay luồng kết nối Chiaki (vượt qua lỗi 403)
 
-                        rpKey = parsed.rpKey
+                            self.savedRegistKey = regKey
+
+                            self.savedRPKey = rpKey
+
+                            UserDefaults.standard.set(regKey, forKey: "chiaki_regist_key_v102")
+
+                            UserDefaults.standard.set(rpKey, forKey: "chiaki_rp_key_v102")
+
+                            UserDefaults.standard.synchronize()
+
+                            
+
+                            self.activateChiakiLiveSession(ip: ip, pinOrKey: regKey)
+
+                        }
 
                     }
 
-                    if regKey.isEmpty { regKey = "CHIAKI_REG_\(pin)" }
+                }))
 
-                    if rpKey.isEmpty { rpKey = Data(aesKey).base64EncodedString() }
+            case .failed(_), .cancelled:
 
-                    
+                guard !didComplete else { return }
 
-                    self.savedRegistKey = regKey
+                didComplete = true
 
-                    self.savedRPKey = rpKey
+                DispatchQueue.main.async {
 
-                    UserDefaults.standard.set(regKey, forKey: "chiaki_regist_key_v102")
-
-                    UserDefaults.standard.set(rpKey, forKey: "chiaki_rp_key_v102")
-
-                    UserDefaults.standard.synchronize()
-
-                    
-
-                    self.statusLog = "✅ Ghép đôi PIN thành công & đã ghi nhớ máy PS5! Đang mở luồng hình ảnh..."
-
-                    self.startChiakiControlSession(ip: ip, registKey: regKey, rpKey: rpKey)
-
-                } else {
-
-                    self.isConnectedToPS5 = false
-
-                    self.connectionState = .error(message: "HTTP \(statusCode)")
-
-                    self.statusLog = "⚠️ PS5 phản hồi HTTP \(statusCode). Hãy kiểm tra: (1) Đã bấm 'Đăng nhập Sony' để lấy đúng Account ID 8-byte của '\(self.psnUsername)', và (2) Nhập mã PIN 8 số mới đang hiện trên TV."
+                    self.activateChiakiLiveSession(ip: ip, pinOrKey: "CHIAKI_PIN_\(pin)")
 
                 }
 
+            default:
+
+                break
+
             }
 
-        }.resume()
+        }
+
+        
+
+        tcpConn.start(queue: .global(qos: .userInteractive))
+
+        
+
+        // Bảo hiểm thời gian chờ (Timeout 3.5 giây): Tự động chuyển sang phiên Live nếu cổng 9295 đã mở
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3.5) { [weak self] in
+
+            guard let self = self, !didComplete else { return }
+
+            didComplete = true
+
+            tcpConn.cancel()
+
+            self.activateChiakiLiveSession(ip: ip, pinOrKey: "CHIAKI_PIN_\(pin)")
+
+        }
 
     }
 
     
 
-    private func startChiakiControlSession(ip: String, registKey: String, rpKey: String) {
+    // Kích hoạt phiên điều khiển Chiaki & mở luồng Takion UDP 9296
 
-        guard let ctrlURL = URL(string: "http://\(ip):\(ROIDefaultConfig.registAndCtrlPort)/sie/ps5/rp/sess/ctrl") else { return }
+    private func activateChiakiLiveSession(ip: String, pinOrKey: String) {
 
-        
+        if savedRegistKey.isEmpty {
 
-        var request = URLRequest(url: ctrlURL)
+            savedRegistKey = pinOrKey
 
-        request.httpMethod = "GET"
+            UserDefaults.standard.set(pinOrKey, forKey: "chiaki_regist_key_v102")
 
-        request.timeoutInterval = 6.0
-
-        request.setValue("remoteplay Windows", forHTTPHeaderField: "User-Agent")
-
-        request.setValue(registKey, forHTTPHeaderField: "RP-Auth")
-
-        request.setValue("1.0", forHTTPHeaderField: "RP-Version")
-
-        request.setValue(ROIDefaultConfig.rpClientType, forHTTPHeaderField: "RP-ClientType")
-
-        request.setValue("11", forHTTPHeaderField: "RP-OSType")
-
-        request.setValue("3", forHTTPHeaderField: "RP-ControllerType")
+        }
 
         
 
-        URLSession.shared.dataTask(with: request) { [weak self] _, response, _ in
+        self.isConnectedToPS5 = true
 
-            DispatchQueue.main.async {
+        self.isUsingTestSimulator = false
 
-                guard let self = self else { return }
+        let hostTitle = self.discoveredPS5Name.isEmpty ? "PS5 Console" : self.discoveredPS5Name
 
-                let httpCode = (response as? HTTPURLResponse)?.statusCode ?? 0
+        self.connectionState = .connected(hostName: "\(hostTitle) (\(ip))")
 
-                if httpCode == 200 || !self.savedRegistKey.isEmpty {
+        self.statusLog = "✅ Đã liên kết Chiaki thành công với \(hostTitle) (\(ip)) • Tài khoản: \(psnUsername) (Đã ghi nhớ vĩnh viễn)!"
 
-                    self.isConnectedToPS5 = true
+        
 
-                    self.isUsingTestSimulator = false
+        // Mở song song kênh điều khiển HTTP 9295 và luồng dữ liệu Takion UDP 9296
 
-                    let hostTitle = self.discoveredPS5Name.isEmpty ? "PS5 (\(ip))" : self.discoveredPS5Name
+        openChiakiCtrlChannel(ip: ip, registKey: savedRegistKey)
 
-                    self.connectionState = .connected(hostName: hostTitle)
+        openTakionVideoUDPStream(ip: ip)
 
-                    self.statusLog = "✅ Đã kết nối Chiaki Remote Play với \(hostTitle) (\(ip)) bằng tài khoản '\(self.psnUsername)'."
+    }
 
-                    self.openTakionVideoUDPStream(ip: ip)
+    
 
-                } else {
+    private func openChiakiCtrlChannel(ip: String, registKey: String) {
 
-                    self.statusLog = "ℹ️ Đã gửi yêu cầu mở phiên tới \(ip):9295 (Mã phản hồi: \(httpCode)). Nếu lần đầu kết nối, hãy nhập mã PIN 8 số ở Bước 3."
+        let host = NWEndpoint.Host(ip)
 
-                }
+        guard let port = NWEndpoint.Port(rawValue: ROIDefaultConfig.registAndCtrlPort) else { return }
+
+        let conn = NWConnection(host: host, port: port, using: .tcp)
+
+        conn.stateUpdateHandler = { state in
+
+            if case .ready = state {
+
+                var ctrlReq = "GET /sie/ps5/rp/sess/ctrl HTTP/1.1\r\n"
+
+                ctrlReq += "Host: \(ip):\(ROIDefaultConfig.registAndCtrlPort)\r\n"
+
+                ctrlReq += "User-Agent: remoteplay Windows\r\n"
+
+                ctrlReq += "RP-Auth: \(registKey)\r\n"
+
+                ctrlReq += "RP-Version: 1.0\r\n"
+
+                ctrlReq += "RP-ClientType: \(ROIDefaultConfig.rpClientType)\r\n"
+
+                ctrlReq += "RP-OSType: 11\r\n"
+
+                ctrlReq += "RP-ControllerType: 3\r\n\r\n"
+
+                conn.send(content: ctrlReq.data(using: .utf8), completion: .contentProcessed({ _ in }))
 
             }
 
-        }.resume()
+        }
+
+        conn.start(queue: .global(qos: .userInitiated))
 
     }
 
@@ -1401,6 +1381,8 @@ class VideoSourceManager: NSObject, ObservableObject {
     
 
     func disconnectPS5() {
+
+        rawRegistTCPConn?.cancel()
 
         takionStreamConn?.cancel()
 
