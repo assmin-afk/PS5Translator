@@ -1,10 +1,10 @@
 // ============================================================================
 // FILE 2B: 2_VideoSourceManager.swift (TÁCH TỪ FILE 2 - PHẦN 2/2)
-// PHIÊN BẢN: PS5Translator 1.02
+// PHIÊN BẢN: PS5Translator 1.02 (CHUỖI 6 TẦNG LẤY MÃ 8-BYTE SONY & CHIAKI LIVE)
 // NHIỆM VỤ:
 // 1. Quản lý luồng hình ảnh PS5 Remote Play & trạng thái kết nối thực tế.
-// 2. Tự động trích xuất Account ID 8-byte thật từ Cookie Sony (WKWebsiteDataStore)
-//    và ghi nhớ vĩnh viễn tài khoản đã đăng nhập.
+// 2. Tự động trích xuất Account ID 8-byte thật từ Cookie Sony (npsso / OAuth Code),
+//    giải mã JWT trực tiếp và truy vấn chuỗi 5 cổng Profile chính thức của Sony.
 // 3. Căn chỉnh khung ROI, quét tìm máy PS5 qua UDP 9302, ghép đôi mã PIN cổng 9295
 //    và mở phiên truyền hình ảnh thời gian thực cổng UDP 9296.
 // ============================================================================
@@ -105,7 +105,6 @@ class VideoSourceManager: NSObject, ObservableObject {
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
             guard let self = self else { return }
             self.scanForPS5OnLAN()
-            // Nếu chưa có Account ID thật thì tự động trích xuất từ Cookie Sony đã đăng nhập
             if self.psnAccountIDBase64.isEmpty {
                 self.extractAccountIDFromSonyWebCookies()
             }
@@ -116,7 +115,10 @@ class VideoSourceManager: NSObject, ObservableObject {
     func extractAccountIDFromSonyWebCookies(completion: ((Bool) -> Void)? = nil) {
         DispatchQueue.main.async {
             WKWebsiteDataStore.default().httpCookieStore.getAllCookies { [weak self] cookies in
-                guard let self = self else { return }
+                guard let self = self else {
+                    completion?(false)
+                    return
+                }
                 let sonyCookies = cookies.filter {
                     $0.domain.contains("sony.com") || $0.domain.contains("playstation.net") || $0.domain.contains("playstation.com")
                 }
@@ -125,41 +127,77 @@ class VideoSourceManager: NSObject, ObservableObject {
                     return
                 }
 
-                // Nạp toàn bộ Cookie đăng nhập Sony vào HTTPCookieStorage để gọi OAuth Silent Authorize
                 for cookie in sonyCookies {
                     HTTPCookieStorage.shared.setCookie(cookie)
                 }
 
-                let silentAuthURLStr = "https://ca.account.sony.com/api/authz/v3/oauth/authorize?access_type=offline&client_id=09515159-7237-4370-9b40-3806e67c0891&redirect_uri=com.scee.psxandroid.scecompcall%3A%2F%2Fredirect&response_type=code&scope=psn:mobile.v2.core%20psn:clientapp&prompt=none"
-                guard let url = URL(string: silentAuthURLStr) else {
-                    completion?(false)
-                    return
-                }
+                // Bước 1: Thử gọi thẳng cổng BasicProfile của PlayStation bằng Cookie hiện có
+                self.fetchBasicProfileWithCookies(sonyCookies) { foundDirect in
+                    if foundDirect {
+                        completion?(true)
+                        return
+                    }
 
-                let config = URLSessionConfiguration.default
-                config.httpShouldSetCookies = true
-                config.httpCookieAcceptPolicy = .always
-
-                let delegate = SilentOAuthRedirectCatcher { [weak self] code in
-                    guard let self = self, let code = code else {
+                    // Bước 2: Dùng Cookie (bao gồm npsso) để lấy OAuth Code ngầm
+                    let silentAuthURLStr = "https://ca.account.sony.com/api/authz/v3/oauth/authorize?access_type=offline&client_id=09515159-7237-4370-9b40-3806e67c0891&redirect_uri=com.scee.psxandroid.scecompcall%3A%2F%2Fredirect&response_type=code&scope=psn:mobile.v2.core%20psn:clientapp&prompt=none"
+                    guard let url = URL(string: silentAuthURLStr) else {
                         completion?(false)
                         return
                     }
-                    self.exchangeSonyCodeForRealAccountID(code: code, completion: completion)
-                }
 
-                let session = URLSession(configuration: config, delegate: delegate, delegateQueue: nil)
-                var req = URLRequest(url: url)
-                let cookieHeader = HTTPCookie.requestHeaderFields(with: sonyCookies)
-                for (k, v) in cookieHeader {
-                    req.setValue(v, forHTTPHeaderField: k)
+                    let config = URLSessionConfiguration.default
+                    config.httpShouldSetCookies = true
+                    config.httpCookieAcceptPolicy = .always
+
+                    let delegate = SilentOAuthRedirectCatcher { [weak self] code in
+                        guard let self = self, let code = code else {
+                            completion?(false)
+                            return
+                        }
+                        self.exchangeSonyCodeForRealAccountID(code: code, completion: completion)
+                    }
+
+                    let session = URLSession(configuration: config, delegate: delegate, delegateQueue: nil)
+                    var req = URLRequest(url: url)
+                    let cookieHeader = HTTPCookie.requestHeaderFields(with: sonyCookies)
+                    for (k, v) in cookieHeader {
+                        req.setValue(v, forHTTPHeaderField: k)
+                    }
+                    session.dataTask(with: req).resume()
                 }
-                session.dataTask(with: req).resume()
             }
         }
     }
 
-    private func exchangeSonyCodeForRealAccountID(code: String, completion: ((Bool) -> Void)? = nil) {
+    private func fetchBasicProfileWithCookies(_ cookies: [HTTPCookie], completion: @escaping (Bool) -> Void) {
+        guard let url = URL(string: "https://web.np.playstation.com/api/basicProfile/v1/profile/users/me") else {
+            completion(false)
+            return
+        }
+        var req = URLRequest(url: url)
+        req.timeoutInterval = 5.0
+        let cookieHeader = HTTPCookie.requestHeaderFields(with: cookies)
+        for (k, v) in cookieHeader {
+            req.setValue(v, forHTTPHeaderField: k)
+        }
+        req.setValue("https://www.playstation.com/", forHTTPHeaderField: "Referer")
+
+        URLSession.shared.dataTask(with: req) { [weak self] data, _, _ in
+            guard let self = self, let data = data,
+                  let extracted = ChiakiEmbeddedCore.shared.extractAccountIDFromJSONData(data) else {
+                completion(false)
+                return
+            }
+            DispatchQueue.main.async {
+                let user = extracted.onlineID.isEmpty ? self.psnUsername : extracted.onlineID
+                self.saveRememberedAccount(username: user, accountIDBase64: extracted.base64ID, numericID: extracted.numericID)
+                completion(true)
+            }
+        }.resume()
+    }
+
+    // Đổi OAuth Code sang Token (có token_format=jwt) và quét chuỗi 5 cổng của Sony
+    func exchangeSonyCodeForRealAccountID(code: String, completion: ((Bool) -> Void)? = nil) {
         guard let tokenURL = URL(string: "https://ca.account.sony.com/api/authz/v3/oauth/token") else {
             completion?(false)
             return
@@ -168,47 +206,111 @@ class VideoSourceManager: NSObject, ObservableObject {
         req.httpMethod = "POST"
         req.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
         req.setValue("Basic MDk1MTUxNTktNzIzNy00MzcwLTliNDAtMzgwNmU2N2MwODkxOnVjUGprYTV0bnRCMktxc1A=", forHTTPHeaderField: "Authorization")
-        let body = "grant_type=authorization_code&code=\(code)&redirect_uri=com.scee.psxandroid.scecompcall%3A%2F%2Fredirect"
+
+        let encodedCode = code.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? code
+        let body = "grant_type=authorization_code&code=\(encodedCode)&redirect_uri=com.scee.psxandroid.scecompcall%3A%2F%2Fredirect&token_format=jwt"
         req.httpBody = body.data(using: .utf8)
 
         URLSession.shared.dataTask(with: req) { [weak self] data, _, _ in
-            guard let self = self,
-                  let data = data,
-                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+            guard let self = self, let data = data else {
+                completion?(false)
+                return
+            }
+
+            // Tầng 1: Quét trực tiếp JSON trả về từ cổng Token
+            if let directFound = ChiakiEmbeddedCore.shared.extractAccountIDFromJSONData(data) {
+                DispatchQueue.main.async {
+                    let user = directFound.onlineID.isEmpty ? self.psnUsername : directFound.onlineID
+                    self.saveRememberedAccount(username: user, accountIDBase64: directFound.base64ID, numericID: directFound.numericID)
+                    completion?(true)
+                }
+                return
+            }
+
+            guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
                   let accessToken = json["access_token"] as? String else {
                 completion?(false)
                 return
             }
 
-            // Gọi cổng kiểm tra Token chính thức của Sony (Trả về chính xác user_id / account_id 64-bit)
-            guard let checkURL = URL(string: "https://ca.account.sony.com/api/v1/oauth/token/\(accessToken)") else {
-                completion?(false)
+            // Tầng 2: Giải mã trực tiếp chuỗi JWT access_token / id_token
+            if let jwtFound = ChiakiEmbeddedCore.shared.extractAccountIDFromJWT(accessToken) {
+                DispatchQueue.main.async {
+                    let user = jwtFound.onlineID.isEmpty ? self.psnUsername : jwtFound.onlineID
+                    self.saveRememberedAccount(username: user, accountIDBase64: jwtFound.base64ID, numericID: jwtFound.numericID)
+                    completion?(true)
+                }
                 return
             }
-            var checkReq = URLRequest(url: checkURL)
-            checkReq.setValue("Basic MDk1MTUxNTktNzIzNy00MzcwLTliNDAtMzgwNmU2N2MwODkxOnVjUGprYTV0bnRCMktxc1A=", forHTTPHeaderField: "Authorization")
-
-            URLSession.shared.dataTask(with: checkReq) { [weak self] checkData, _, _ in
-                guard let self = self else { return }
-                if let checkData = checkData,
-                   let tokenInfo = try? JSONSerialization.jsonObject(with: checkData) as? [String: Any] {
-                    let accStr = (tokenInfo["account_id"] as? String)
-                        ?? (tokenInfo["user_id"] as? String)
-                        ?? (tokenInfo["accountId"] as? String)
-                        ?? ""
-                    if let numericID = UInt64(accStr), numericID > 1000000 {
-                        var le = numericID.littleEndian
-                        let base64ID = Data(bytes: &le, count: 8).base64EncodedString()
-                        DispatchQueue.main.async {
-                            self.saveRememberedAccount(username: self.psnUsername, accountIDBase64: base64ID, numericID: String(numericID))
-                            completion?(true)
-                        }
-                        return
-                    }
+            if let idToken = json["id_token"] as? String,
+               let idJwtFound = ChiakiEmbeddedCore.shared.extractAccountIDFromJWT(idToken) {
+                DispatchQueue.main.async {
+                    let user = idJwtFound.onlineID.isEmpty ? self.psnUsername : idJwtFound.onlineID
+                    self.saveRememberedAccount(username: user, accountIDBase64: idJwtFound.base64ID, numericID: idJwtFound.numericID)
+                    completion?(true)
                 }
+                return
+            }
+
+            // Tầng 3 -> 6: Truy vấn chuỗi 4 cổng Profile & Introspection chính thức của Sony
+            self.fetchPSNAccountIDMultiEndpoint(accessToken: accessToken) { onlineID, base64ID, numericID in
+                DispatchQueue.main.async {
+                    let user = onlineID.isEmpty ? self.psnUsername : onlineID
+                    self.saveRememberedAccount(username: user, accountIDBase64: base64ID, numericID: numericID)
+                    completion?(true)
+                }
+            } onFailure: {
                 completion?(false)
-            }.resume()
+            }
         }.resume()
+    }
+
+    func fetchPSNAccountIDMultiEndpoint(
+        accessToken: String,
+        onSuccess: @escaping (String, String, String) -> Void,
+        onFailure: @escaping () -> Void
+    ) {
+        let endpoints: [(url: String, authHeader: String)] = [
+            // 1. Cổng UserProfile v1 chuẩn cho scope psn:mobile.v2.core (Hoạt động ổn định nhất 2026)
+            ("https://us-prof.np.community.playstation.net/userProfile/v1/users/me/profile2?fields=accountId,onlineId", "Bearer \(accessToken)"),
+            // 2. Cổng Mobile Internal UserProfile v1
+            ("https://m.np.playstation.com/api/userProfile/v1/internal/users/me/profiles", "Bearer \(accessToken)"),
+            // 3. Cổng OAuth Token Introspection của Sony
+            ("https://ca.account.sony.com/api/v1/oauth/token/\(accessToken)", "Basic MDk1MTUxNTktNzIzNy00MzcwLTliNDAtMzgwNmU2N2MwODkxOnVjUGprYTV0bnRCMktxc1A="),
+            // 4. Cổng Web BasicProfile v1
+            ("https://web.np.playstation.com/api/basicProfile/v1/profile/users/me", "Bearer \(accessToken)"),
+            // 5. Cổng DMS Devices Accounts
+            ("https://dms.api.playstation.com/api/v1/devices/accounts/me", "Bearer \(accessToken)")
+        ]
+
+        func tryEndpoint(at index: Int) {
+            guard index < endpoints.count else {
+                onFailure()
+                return
+            }
+            let current = endpoints[index]
+            guard let url = URL(string: current.url) else {
+                tryEndpoint(at: index + 1)
+                return
+            }
+
+            var req = URLRequest(url: url)
+            req.httpMethod = "GET"
+            req.timeoutInterval = 6.0
+            req.setValue(current.authHeader, forHTTPHeaderField: "Authorization")
+            req.setValue("application/json", forHTTPHeaderField: "Accept")
+
+            URLSession.shared.dataTask(with: req) { data, _, _ in
+                if let data = data,
+                   let found = ChiakiEmbeddedCore.shared.extractAccountIDFromJSONData(data) {
+                    onSuccess(found.onlineID, found.base64ID, found.numericID)
+                    return
+                }
+                tryEndpoint(at: index + 1)
+            }.resume()
+        }
+
+        tryEndpoint(at: 0)
     }
 
     // MARK: - Ghi nhớ vĩnh viễn tài khoản thật
@@ -254,11 +356,18 @@ class VideoSourceManager: NSObject, ObservableObject {
         statusLog = "Đã xoá tài khoản cũ. Hãy bấm 'Đăng nhập Sony' hoặc 'Tự lấy ID' để lấy mã 8-byte thật."
     }
 
-    // MARK: - Tra cứu Account ID 8-byte thật từ Cookie Sony + API PSN
+    // MARK: - Tra cứu Account ID 8-byte thật từ Cookie Sony + Đa nguồn Public Lookup
     func lookupAccountIDByPSNUsername() {
         let targetUser = psnUsername.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines)
         guard !targetUser.isEmpty else {
             statusLog = "⚠️ Vui lòng nhập tên tài khoản PSN phụ (VD: Miesoi93) trước."
+            return
+        }
+
+        // Nếu người dùng nhập thẳng số ID 19 chữ số hoặc Hex 16 ký tự vào ô Account ID -> chuyển đổi ngay lập tức!
+        let manualCheck = ChiakiEmbeddedCore.shared.normalizeAccountIDTo8Bytes(input: psnAccountIDBase64, fallbackUsername: targetUser)
+        if manualCheck.isValidRealID {
+            saveRememberedAccount(username: targetUser, accountIDBase64: manualCheck.base64, numericID: manualCheck.numericString)
             return
         }
 
@@ -269,30 +378,26 @@ class VideoSourceManager: NSObject, ObservableObject {
             guard let self = self else { return }
             if success { return }
 
-            // Ưu tiên 2: Tra cứu qua API công khai
+            // Ưu tiên 2: Tra cứu qua API công khai FlipScreen
             guard let encodedUser = targetUser.addingPercentEncoding(withAllowedCharacters: CharacterSet.urlQueryAllowed),
                   let url = URL(string: "https://psn.flipscreen.games/search.php?username=\(encodedUser)") else {
                 return
             }
 
             var req = URLRequest(url: url)
-            req.timeoutInterval = 6.0
+            req.timeoutInterval = 7.0
             URLSession.shared.dataTask(with: req) { [weak self] data, _, _ in
                 guard let self = self else { return }
                 if let data = data,
-                   let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                   let userIdStr = (json["user_id"] as? String) ?? (json["account_id"] as? String) ?? (json["id"] as? String),
-                   let numericID = UInt64(userIdStr), numericID > 1000000 {
-                    var le = numericID.littleEndian
-                    let base64ID = Data(bytes: &le, count: 8).base64EncodedString()
+                   let found = ChiakiEmbeddedCore.shared.extractAccountIDFromJSONData(data) {
                     DispatchQueue.main.async {
-                        self.saveRememberedAccount(username: targetUser, accountIDBase64: base64ID, numericID: String(numericID))
+                        self.saveRememberedAccount(username: targetUser, accountIDBase64: found.base64ID, numericID: found.numericID)
                     }
                     return
                 }
 
                 DispatchQueue.main.async {
-                    self.statusLog = "⚠️ Hãy bấm nút 'Đăng nhập Sony' màu xanh (chỉ cần đăng nhập 1 lần) để App trích xuất đúng mã Account ID 8-byte thật của '\(targetUser)'!"
+                    self.statusLog = "⚠️ Hãy bấm nút 'Đăng nhập Sony' màu xanh bên dưới để App trích xuất trực tiếp mã Account ID 8-byte thật của '\(targetUser)'!"
                 }
             }.resume()
         }
@@ -451,7 +556,7 @@ class VideoSourceManager: NSObject, ObservableObject {
         return nil
     }
 
-    // MARK: - 3. Giao thức Chiaki Ghép đôi & Mở phiên điều khiển thực tế (Không báo kết nối ảo)
+    // MARK: - 3. Giao thức Chiaki Ghép đôi & Mở phiên điều khiển thực tế
     func connectToPS5(username: String, pinCode: String, ip: String) {
         pairAndConnectToPS5(username: username, accountIDBase64: psnAccountIDBase64, pinCode: pinCode, ip: ip)
     }
@@ -465,11 +570,15 @@ class VideoSourceManager: NSObject, ObservableObject {
         guard parsed.isValidRealID else {
             self.isConnectedToPS5 = false
             self.connectionState = .error(message: "Chưa có Account ID 8-byte thật")
-            self.statusLog = "⚠️ Đang trích xuất mã Account ID 8-byte thật từ phiên đăng nhập Sony... Nếu chưa đăng nhập, hãy bấm nút 'Đăng nhập Sony' ở Bước 2!"
+            self.statusLog = "⚠️ Đang trích xuất mã Account ID 8-byte thật từ phiên đăng nhập Sony..."
             self.extractAccountIDFromSonyWebCookies { [weak self] ok in
                 guard let self = self else { return }
                 if ok && cleanPIN.count == 8 {
                     self.performRawSocketChiakiRegistration(ip: cleanIP, pin: cleanPIN, accountIDBase64: self.psnAccountIDBase64)
+                } else if !ok {
+                    DispatchQueue.main.async {
+                        self.statusLog = "⚠️ Vui lòng bấm nút 'Đăng nhập Sony' ở Bước 2 (hoặc dán số Account ID 19 chữ số) để lấy mã 8-byte thật!"
+                    }
                 }
             }
             return
@@ -703,16 +812,14 @@ class VideoSourceManager: NSObject, ObservableObject {
         statusLog = "Đã ngắt kết nối PS5."
     }
 
-    // MARK: - 4. Luồng kết xuất màn hình (Đã xoá bỏ hoàn toàn 3 câu tiếng Anh giả lập)
+    // MARK: - 4. Luồng kết xuất màn hình
     func startPS5RemoteStreamLoop() {
         timer?.invalidate()
         timer = Timer.scheduledTimer(withTimeInterval: 1.0 / 5.0, repeats: true) { [weak self] _ in
             guard let self = self else { return }
-            // Khi đang nhận khung hình thật từ PS5 (qua VideoToolbox), giữ nguyên currentFullFrame thật
             if self.isReceivingRealPS5Video {
                 return
             }
-            // Khi chưa có luồng hình thật từ PS5, chỉ hiển thị khung nền chờ trống (không vẽ chữ tiếng Anh giả)
             if let standbyImg = self.renderCleanStandbyCanvas() {
                 DispatchQueue.main.async {
                     self.currentFullFrame = standbyImg
@@ -736,4 +843,3 @@ class VideoSourceManager: NSObject, ObservableObject {
         }.cgImage
     }
 }
-
