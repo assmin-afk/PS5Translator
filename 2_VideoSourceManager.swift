@@ -1,845 +1,1401 @@
 // ============================================================================
-// FILE 2B: 2_VideoSourceManager.swift (TÁCH TỪ FILE 2 - PHẦN 2/2)
-// PHIÊN BẢN: PS5Translator 1.02 (CHUỖI 6 TẦNG LẤY MÃ 8-BYTE SONY & CHIAKI LIVE)
+// FILE 6B: 6B_TranslatorViewsAndModals.swift (TÁCH TỪ FILE 6 - PHẦN 2/2)
+// PHIÊN BẢN: PS5Translator 1.02
 // NHIỆM VỤ:
-// 1. Quản lý luồng hình ảnh PS5 Remote Play & trạng thái kết nối thực tế.
-// 2. Tự động trích xuất Account ID 8-byte thật từ Cookie Sony (npsso / OAuth Code),
-//    giải mã JWT trực tiếp và truy vấn chuỗi 5 cổng Profile chính thức của Sony.
-// 3. Căn chỉnh khung ROI, quét tìm máy PS5 qua UDP 9302, ghép đôi mã PIN cổng 9295
-//    và mở phiên truyền hình ảnh thời gian thực cổng UDP 9296.
+// 1. Giao diện chính (MainTranslatorView): Khung hình 16:9, kéo thả & căn chỉnh ROI,
+//    hiển thị hộp chữ dịch đè đúng vị trí chữ gốc với nền đen mờ và bằng cỡ chữ gốc.
+// 2. Màn hình quản lý Hồ sơ game theo thư mục (GameProfileFolderManagerView).
+// 3. Màn hình liên kết Chiaki PS5 & ghi nhớ tài khoản (PS5ConnectionWizardView).
+// 4. Trình đăng nhập Sony OAuth tự lấy Account ID 8-byte (PSNWebLoginHelperView).
+// 5. Điểm khởi chạy ứng dụng (@main PS5TranslatorApp).
 // ============================================================================
 
-import Foundation
-import UIKit
-import CoreGraphics
-import Combine
-import Network
-import CryptoKit
+import SwiftUI
 import WebKit
+import UniformTypeIdentifiers
 
 // ============================================================================
-// 3. TRÌNH QUẢN LÝ LUỒNG HÌNH ẢNH & KẾT NỐI CHIAKI PS5 THỰC TẾ
+// 7. GIAO DIỆN CHÍNH PS5TRANSLATOR 1.02 (HIỂN THỊ ĐÈ ĐÚNG CHỖ & BẰNG CỠ CHỮ GỐC)
 // ============================================================================
-class VideoSourceManager: NSObject, ObservableObject {
-    @Published var currentFullFrame: CGImage?
+struct MainTranslatorView: View {
+    @StateObject private var coord = PipelineCoordinator()
+    @State private var showPS5ConnectSheet = false
+    @State private var showGameProfilesSheet = false
+    @State private var showROICalibrationPanel = false
 
-    @Published var connectionState: PS5ConnectionState = .disconnected
-    @Published var isConnectedToPS5: Bool = false
-    @Published var isUsingTestSimulator: Bool = false
-    @Published var isReceivingRealPS5Video: Bool = false
+    private let psDarkBg = Color(red: 0.02, green: 0.04, blue: 0.09)
+    private let psBluePrimary = Color(red: 0.0, green: 0.26, blue: 0.61)
+    private let psNeonAccent = Color(red: 0.0, green: 0.44, blue: 0.82)
 
-    // Ghi nhớ vĩnh viễn thông tin tài khoản thật trong UserDefaults
-    @Published var psnUsername: String = UserDefaults.standard.string(forKey: "psn_user_v102") ?? "Miesoi93" {
-        didSet { UserDefaults.standard.set(psnUsername, forKey: "psn_user_v102") }
-    }
-    @Published var psnAccountIDBase64: String = UserDefaults.standard.string(forKey: "psn_aid_v102") ?? "" {
-        didSet { UserDefaults.standard.set(psnAccountIDBase64, forKey: "psn_aid_v102") }
-    }
-    @Published var psnNumericAccountID: String = UserDefaults.standard.string(forKey: "psn_num_id_v102") ?? "" {
-        didSet { UserDefaults.standard.set(psnNumericAccountID, forKey: "psn_num_id_v102") }
-    }
-    @Published var isAccountRemembered: Bool = UserDefaults.standard.bool(forKey: "psn_remembered_v102") {
-        didSet { UserDefaults.standard.set(isAccountRemembered, forKey: "psn_remembered_v102") }
-    }
+    var body: some View {
+        ZStack {
+            LinearGradient(
+                gradient: Gradient(colors: [psDarkBg, Color(red: 0.04, green: 0.09, blue: 0.20), psDarkBg]),
+                startPoint: .topLeading,
+                endPoint: .bottomTrailing
+            )
+            .ignoresSafeArea()
 
-    @Published var psnPinCode: String = ""
-    @Published var ps5HostIP: String = UserDefaults.standard.string(forKey: "ps5_ip_v102") ?? "192.168.2.23" {
-        didSet { UserDefaults.standard.set(ps5HostIP, forKey: "ps5_ip_v102") }
-    }
-    @Published var discoveredPS5Name: String = UserDefaults.standard.string(forKey: "ps5_name_v102") ?? "PS5 Console"
-    @Published var discoveredPS5HostID: String = UserDefaults.standard.string(forKey: "ps5_hostid_v102") ?? ""
-    @Published var statusLog: String = "Sẵn sàng kết nối máy PS5 qua lõi Chiaki."
-
-    // Khoá phiên Chiaki thật (Chỉ lưu khi PS5 trả về HTTP 200 OK)
-    @Published var savedRegistKey: String = UserDefaults.standard.string(forKey: "chiaki_real_regist_key_v102") ?? ""
-    @Published var savedRPKey: String = UserDefaults.standard.string(forKey: "chiaki_real_rp_key_v102") ?? ""
-
-    @Published var customDialogueRect: CGRect
-    @Published var customQuestRect: CGRect
-
-    private var timer: Timer?
-    private var udpDiscoveryConn: NWConnection?
-    private var rawRegistTCPConn: NWConnection?
-    private var ctrlSessionTCPConn: NWConnection?
-    private var takionStreamConn: NWConnection?
-    private let videoDecoder = ChiakiHardwareVideoDecoder()
-    private var receivedPacketsCount: Int = 0
-
-    override init() {
-        self.customDialogueRect = VideoSourceManager.loadSavedRect(
-            key: "roi_dialogue_v102",
-            fallback: ROIDefaultConfig.dialogueDefaultRect
-        )
-        self.customQuestRect = VideoSourceManager.loadSavedRect(
-            key: "roi_quest_v102",
-            fallback: ROIDefaultConfig.questDefaultRect
-        )
-        super.init()
-
-        // 1. Tự động xoá bỏ mã băm giả "nZKnNYIoZ0w=" và khoá giả từ bản trước
-        UserDefaults.standard.removeObject(forKey: "chiaki_regist_key_v102")
-        UserDefaults.standard.removeObject(forKey: "chiaki_rp_key_v102")
-
-        if ChiakiEmbeddedCore.shared.isFakeGeneratedAccountID(psnAccountIDBase64, username: psnUsername) {
-            psnAccountIDBase64 = ""
-            psnNumericAccountID = ""
-            isAccountRemembered = false
-            UserDefaults.standard.removeObject(forKey: "psn_aid_v102")
-            UserDefaults.standard.removeObject(forKey: "psn_num_id_v102")
-            UserDefaults.standard.set(false, forKey: "psn_remembered_v102")
-            statusLog = "Đang tự động trích xuất Account ID 8-byte thật từ phiên đăng nhập Sony..."
-        } else if !psnAccountIDBase64.isEmpty {
-            isAccountRemembered = true
-            statusLog = "✅ Đã ghi nhớ tài khoản thật '\(psnUsername)' (ID: \(psnAccountIDBase64))."
+            ScrollView(.vertical, showsIndicators: false) {
+                VStack(spacing: 11) {
+                    topPlayStationBar
+                    ps5ScreenViewport
+                    liveOCRAndTVTestStrip
+                    bottomDualSenseControlBar
+                }
+                .padding(.top, 6)
+                .padding(.bottom, 16)
+            }
         }
-
-        // 2. Khi giải mã được khung hình video H.264/HEVC thật từ PS5 -> đưa thẳng vào bộ quét OCR
-        videoDecoder.onFrameDecoded = { [weak self] decodedCGImage in
-            guard let self = self else { return }
-            self.isReceivingRealPS5Video = true
-            self.currentFullFrame = decodedCGImage
+        .preferredColorScheme(.dark)
+        .sheet(isPresented: $showPS5ConnectSheet) {
+            PS5ConnectionWizardView(coord: coord)
         }
+        .sheet(isPresented: $showGameProfilesSheet) {
+            GameProfileFolderManagerView(coord: coord)
+        }
+    }
 
-        startPS5RemoteStreamLoop()
+    private var topPlayStationBar: some View {
+        HStack(spacing: 10) {
+            HStack(spacing: 8) {
+                Image(systemName: "gamecontroller.fill")
+                    .font(.system(size: 18, weight: .bold))
+                    .foregroundColor(.white)
+                    .padding(8)
+                    .background(psNeonAccent)
+                    .clipShape(Circle())
 
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
-            guard let self = self else { return }
-            self.scanForPS5OnLAN()
-            if self.psnAccountIDBase64.isEmpty {
-                self.extractAccountIDFromSonyWebCookies()
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(TranslatorV102Config.appVersionName)
+                        .font(.system(size: 15, weight: .bold))
+                        .foregroundColor(.white)
+                    HStack(spacing: 5) {
+                        Circle()
+                            .fill(coord.videoMgr.isConnectedToPS5 ? Color.green : (coord.videoMgr.isAccountRemembered ? Color.cyan : Color.orange))
+                            .frame(width: 7, height: 7)
+                        Text(coord.videoMgr.isConnectedToPS5
+                             ? "Chiaki Live: \(coord.videoMgr.ps5HostIP)"
+                             : (coord.videoMgr.isAccountRemembered ? "Đã nhớ TK: \(coord.videoMgr.psnUsername)" : "Chưa nối PS5"))
+                            .font(.system(size: 11, weight: .medium))
+                            .foregroundColor(.white.opacity(0.85))
+                    }
+                }
+            }
+
+            Spacer()
+
+            HStack(spacing: 4) {
+                Image(systemName: "tv.fill")
+                    .font(.caption2)
+                Text("TV: \(coord.server.connectedCount)")
+                    .font(.caption.bold())
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 6)
+            .background(coord.server.connectedCount > 0 ? Color.green.opacity(0.25) : Color.white.opacity(0.1))
+            .foregroundColor(coord.server.connectedCount > 0 ? .green : .white)
+            .clipShape(Capsule())
+
+            Button(action: { showPS5ConnectSheet = true }) {
+                HStack(spacing: 4) {
+                    Image(systemName: "link.badge.plus")
+                    Text(coord.videoMgr.isConnectedToPS5 ? "Đổi PS5" : "Kết nối PS5")
+                        .font(.caption.bold())
+                }
+                .padding(.horizontal, 12)
+                .padding(.vertical, 7)
+                .background(psNeonAccent)
+                .foregroundColor(.white)
+                .clipShape(Capsule())
+            }
+        }
+        .padding(.horizontal, 14)
+    }
+
+    private var ps5ScreenViewport: some View {
+        ZStack {
+            if let img = coord.videoMgr.currentFullFrame {
+                Image(uiImage: UIImage(cgImage: img))
+                    .resizable()
+                    .aspectRatio(16/9, contentMode: .fit)
+                    .overlay(
+                        GeometryReader { geo in
+                            ZStack {
+                                if coord.showROIGuideBox {
+                                    let roi = coord.videoMgr.getNormalizedROIRect(for: coord.roiMode)
+                                    ZStack(alignment: .topLeading) {
+                                        RoundedRectangle(cornerRadius: 8)
+                                            .stroke(
+                                                style: StrokeStyle(
+                                                    lineWidth: coord.roiMode == .fullScreen ? 1.4 : 2.2,
+                                                    dash: [6, 4]
+                                                )
+                                            )
+                                            .foregroundColor(coord.roiMode == .fullScreen ? .cyan.opacity(0.55) : .cyan)
+                                            .background(Color.cyan.opacity(coord.roiMode == .fullScreen ? 0.0 : 0.05))
+
+                                        if coord.roiMode != .fullScreen {
+                                            Text("ROI: \(coord.roiMode.rawValue) (Chạm kéo để di chuyển)")
+                                                .font(.system(size: 9, weight: .bold))
+                                                .foregroundColor(.black)
+                                                .padding(.horizontal, 6)
+                                                .padding(.vertical, 2)
+                                                .background(Color.cyan)
+                                                .cornerRadius(4)
+                                                .padding(4)
+                                        }
+                                    }
+                                    .frame(
+                                        width: roi.size.width * geo.size.width,
+                                        height: roi.size.height * geo.size.height
+                                    )
+                                    .position(
+                                        x: (roi.origin.x + roi.size.width / 2) * geo.size.width,
+                                        y: (roi.origin.y + roi.size.height / 2) * geo.size.height
+                                    )
+                                    .gesture(
+                                        DragGesture()
+                                            .onChanged { value in
+                                                guard coord.roiMode != .fullScreen else { return }
+                                                let newX = (value.location.x / geo.size.width) - (roi.size.width / 2)
+                                                let newY = (value.location.y / geo.size.height) - (roi.size.height / 2)
+                                                let updated = CGRect(
+                                                    x: newX,
+                                                    y: newY,
+                                                    width: roi.size.width,
+                                                    height: roi.size.height
+                                                )
+                                                coord.videoMgr.updateCustomROIRect(for: coord.roiMode, newRect: updated)
+                                            }
+                                    )
+                                }
+
+                                ForEach(coord.translatedBoxes) { box in
+                                    let pixelW = max(36.0, box.w * geo.size.width)
+                                    let pixelH = max(16.0, box.h * geo.size.height)
+                                    let matchedFontSize = calculateMatchingFontSize(boxWidth: pixelW, boxHeight: pixelH, text: box.text)
+
+                                    Text(box.text)
+                                        .font(.system(size: matchedFontSize, weight: .bold))
+                                        .foregroundColor(.yellow)
+                                        .multilineTextAlignment(.center)
+                                        .lineLimit(nil)
+                                        .minimumScaleFactor(0.65)
+                                        .padding(.horizontal, 6)
+                                        .padding(.vertical, 4)
+                                        .frame(
+                                            minWidth: pixelW + 14,
+                                            minHeight: pixelH + 10
+                                        )
+                                        .background(
+                                            RoundedRectangle(cornerRadius: 6)
+                                                .fill(Color.black.opacity(TranslatorV102Config.subtitleMaskBlackOpacity))
+                                        )
+                                        .overlay(
+                                            RoundedRectangle(cornerRadius: 6)
+                                                .stroke(Color.white.opacity(0.18), lineWidth: 0.8)
+                                        )
+                                        .position(
+                                            x: (box.x + box.w / 2.0) * geo.size.width,
+                                            y: (box.y + box.h / 2.0) * geo.size.height
+                                        )
+                                }
+                            }
+                        }
+                    )
+            } else {
+                VStack(spacing: 10) {
+                    ProgressView()
+                    Text("Đang khởi tạo luồng hình Chiaki PS5...")
+                        .font(.caption)
+                        .foregroundColor(.gray)
+                }
+            }
+        }
+        .aspectRatio(16/9, contentMode: .fit)
+        .background(Color.black)
+        .cornerRadius(14)
+        .overlay(
+            RoundedRectangle(cornerRadius: 14)
+                .stroke(
+                    LinearGradient(
+                        colors: [psNeonAccent.opacity(0.9), Color.cyan.opacity(0.3), psBluePrimary],
+                        startPoint: .topLeading,
+                        endPoint: .bottomTrailing
+                    ),
+                    lineWidth: 2
+                )
+        )
+        .shadow(color: psNeonAccent.opacity(0.35), radius: 12, x: 0, y: 4)
+        .padding(.horizontal, 12)
+    }
+
+    private func calculateMatchingFontSize(boxWidth: CGFloat, boxHeight: CGFloat, text: String) -> CGFloat {
+        let estimatedLines: CGFloat = (boxHeight > 34 && text.count > 42) ? 2.0 : 1.0
+        let singleLineHeight = boxHeight / estimatedLines
+        let rawFontSize = singleLineHeight * 0.78
+        return max(9.5, min(18.0, rawFontSize))
+    }
+
+    private var liveOCRAndTVTestStrip: some View {
+        HStack(spacing: 8) {
+            Image(systemName: coord.isShowingTVTestSentence ? "tv.and.mediabox.fill" : "viewfinder")
+                .foregroundColor(coord.isShowingTVTestSentence ? .green : .cyan)
+
+            Text(coord.isShowingTVTestSentence ? "TV Test: \(TranslatorV102Config.tvTestSentence)" : "Quét (\(coord.translatedBoxes.count) vùng): \(coord.lastRecognizedEnglish)")
+                .font(.system(size: 12, weight: .medium))
+                .foregroundColor(.white.opacity(0.92))
+                .lineLimit(1)
+
+            Spacer()
+
+            Button(action: {
+                coord.triggerTVTestSentence()
+            }) {
+                HStack(spacing: 4) {
+                    Image(systemName: "tv.badge.wifi")
+                    Text("Test phụ đề TV")
+                        .font(.system(size: 11, weight: .bold))
+                }
+                .padding(.horizontal, 10)
+                .padding(.vertical, 5)
+                .background(coord.isShowingTVTestSentence ? Color.green : psNeonAccent)
+                .foregroundColor(.white)
+                .cornerRadius(7)
+            }
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+        .background(Color.white.opacity(0.06))
+        .cornerRadius(10)
+        .padding(.horizontal, 12)
+    }
+
+    private var bottomDualSenseControlBar: some View {
+        VStack(spacing: 11) {
+            HStack {
+                Text("Vùng quét chữ:")
+                    .font(.caption.bold())
+                    .foregroundColor(.white.opacity(0.85))
+
+                Picker("Chế độ quét ROI", selection: $coord.roiMode) {
+                    ForEach(ROIMode.allCases, id: \.self) { mode in
+                        Text(mode.rawValue).tag(mode)
+                    }
+                }
+                .pickerStyle(SegmentedPickerStyle())
+
+                Toggle("", isOn: $coord.showROIGuideBox)
+                    .labelsHidden()
+            }
+
+            if coord.roiMode != .fullScreen {
+                VStack(spacing: 8) {
+                    HStack {
+                        Label("Căn chỉnh khung ROI (\(coord.roiMode.rawValue))", systemImage: "crop")
+                            .font(.system(size: 12, weight: .bold))
+                            .foregroundColor(.cyan)
+                        Spacer()
+                        Button(action: {
+                            withAnimation { showROICalibrationPanel.toggle() }
+                        }) {
+                            Text(showROICalibrationPanel ? "Thu gọn" : "Mở thanh căn chỉnh")
+                                .font(.system(size: 11, weight: .bold))
+                                .padding(.horizontal, 8)
+                                .padding(.vertical, 4)
+                                .background(Color.cyan.opacity(0.2))
+                                .foregroundColor(.cyan)
+                                .cornerRadius(6)
+                        }
+
+                        Button(action: {
+                            coord.videoMgr.resetROIRectToDefault(for: coord.roiMode)
+                        }) {
+                            Text("Mặc định")
+                                .font(.system(size: 11, weight: .medium))
+                                .padding(.horizontal, 8)
+                                .padding(.vertical, 4)
+                                .background(Color.white.opacity(0.1))
+                                .foregroundColor(.white)
+                                .cornerRadius(6)
+                        }
+                    }
+
+                    if showROICalibrationPanel {
+                        roiCalibrationSlidersView
+                    }
+                }
+                .padding(10)
+                .background(Color.black.opacity(0.28))
+                .cornerRadius(10)
+            }
+
+            HStack(spacing: 10) {
+                HStack(spacing: 4) {
+                    Image(systemName: "speedometer")
+                        .foregroundColor(.cyan)
+                        .font(.caption)
+                    Text("Tốc độ quét: \(Int(coord.scanFPS)) FPS")
+                        .font(.caption.bold())
+                        .foregroundColor(.white)
+                        .frame(width: 115, alignment: .leading)
+                }
+
+                Slider(
+                    value: $coord.scanFPS,
+                    in: TranslatorV102Config.minScanFPS...TranslatorV102Config.maxScanFPS,
+                    step: 1.0
+                )
+                .tint(psNeonAccent)
+            }
+
+            HStack {
+                Image(systemName: "sparkles")
+                    .foregroundColor(.yellow)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text("Dịch AI (Apple Intelligence)")
+                        .font(.system(size: 12, weight: .bold))
+                        .foregroundColor(.white)
+                    Text("Tự động dịch Hội thoại, Nhiệm vụ, Kỹ năng, Vật phẩm chưa có trong data")
+                        .font(.system(size: 10))
+                        .foregroundColor(.white.opacity(0.7))
+                }
+                Spacer()
+                Toggle("", isOn: $coord.enableAppleIntelligenceFallback)
+                    .labelsHidden()
+                    .tint(.blue)
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 7)
+            .background(Color.white.opacity(0.06))
+            .cornerRadius(10)
+
+            HStack(spacing: 10) {
+                Button(action: { showPS5ConnectSheet = true }) {
+                    HStack {
+                        Image(systemName: "play.tv.fill")
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("Liên kết máy PS5")
+                                .font(.system(size: 13, weight: .bold))
+                            Text(coord.videoMgr.isAccountRemembered ? "Đã nhớ: \(coord.videoMgr.psnUsername)" : "Lõi Chiaki & Mã PIN")
+                                .font(.system(size: 10))
+                                .foregroundColor(.white.opacity(0.8))
+                        }
+                        Spacer()
+                    }
+                    .padding(10)
+                    .background(psBluePrimary.opacity(0.85))
+                    .foregroundColor(.white)
+                    .cornerRadius(12)
+                }
+
+                Button(action: { showGameProfilesSheet = true }) {
+                    HStack {
+                        Image(systemName: "folder.fill.badge.gearshape")
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("Hồ sơ game")
+                                .font(.system(size: 13, weight: .bold))
+                            Text("\(coord.activeProfileFolderName) (\(coord.loadedLineCount) câu)")
+                                .font(.system(size: 10))
+                                .foregroundColor(.cyan)
+                                .lineLimit(1)
+                        }
+                        Spacer()
+                    }
+                    .padding(10)
+                    .background(Color.white.opacity(0.10))
+                    .foregroundColor(.white)
+                    .cornerRadius(12)
+                }
+            }
+        }
+        .padding(12)
+        .background(Color(red: 0.05, green: 0.10, blue: 0.22).opacity(0.92))
+        .cornerRadius(16)
+        .overlay(
+            RoundedRectangle(cornerRadius: 16)
+                .stroke(Color.white.opacity(0.12), lineWidth: 1)
+        )
+        .padding(.horizontal, 12)
+    }
+
+    private var roiCalibrationSlidersView: some View {
+        let currentRect = coord.videoMgr.getNormalizedROIRect(for: coord.roiMode)
+
+        return VStack(spacing: 6) {
+            HStack {
+                Text("Ngang (X): \(Int(currentRect.origin.x * 100))%")
+                    .font(.system(size: 11))
+                    .foregroundColor(.white.opacity(0.85))
+                    .frame(width: 95, alignment: .leading)
+                Slider(
+                    value: Binding(
+                        get: { Double(currentRect.origin.x) },
+                        set: { newX in
+                            var r = currentRect
+                            r.origin.x = CGFloat(newX)
+                            coord.videoMgr.updateCustomROIRect(for: coord.roiMode, newRect: r)
+                        }
+                    ),
+                    in: 0.02...0.80
+                )
+            }
+
+            HStack {
+                Text("Cao/Thấp (Y): \(Int(currentRect.origin.y * 100))%")
+                    .font(.system(size: 11))
+                    .foregroundColor(.white.opacity(0.85))
+                    .frame(width: 95, alignment: .leading)
+                Slider(
+                    value: Binding(
+                        get: { Double(currentRect.origin.y) },
+                        set: { newY in
+                            var r = currentRect
+                            r.origin.y = CGFloat(newY)
+                            coord.videoMgr.updateCustomROIRect(for: coord.roiMode, newRect: r)
+                        }
+                    ),
+                    in: 0.02...0.88
+                )
+            }
+
+            HStack {
+                Text("Độ rộng (W): \(Int(currentRect.size.width * 100))%")
+                    .font(.system(size: 11))
+                    .foregroundColor(.white.opacity(0.85))
+                    .frame(width: 95, alignment: .leading)
+                Slider(
+                    value: Binding(
+                        get: { Double(currentRect.size.width) },
+                        set: { newW in
+                            var r = currentRect
+                            r.size.width = CGFloat(newW)
+                            coord.videoMgr.updateCustomROIRect(for: coord.roiMode, newRect: r)
+                        }
+                    ),
+                    in: 0.20...0.96
+                )
+            }
+
+            HStack {
+                Text("Độ cao (H): \(Int(currentRect.size.height * 100))%")
+                    .font(.system(size: 11))
+                    .foregroundColor(.white.opacity(0.85))
+                    .frame(width: 95, alignment: .leading)
+                Slider(
+                    value: Binding(
+                        get: { Double(currentRect.size.height) },
+                        set: { newH in
+                            var r = currentRect
+                            r.size.height = CGFloat(newH)
+                            coord.videoMgr.updateCustomROIRect(for: coord.roiMode, newRect: r)
+                        }
+                    ),
+                    in: 0.08...0.90
+                )
             }
         }
     }
+}
 
-    // MARK: - Tự động trích xuất Account ID 8-byte thật từ Cookie đăng nhập Sony (WKWebsiteDataStore)
-    func extractAccountIDFromSonyWebCookies(completion: ((Bool) -> Void)? = nil) {
-        DispatchQueue.main.async {
-            WKWebsiteDataStore.default().httpCookieStore.getAllCookies { [weak self] cookies in
-                guard let self = self else {
-                    completion?(false)
-                    return
+// ============================================================================
+// 8. MÀN HÌNH QUẢN LÝ HỒ SƠ GAME
+// ============================================================================
+struct GameProfileFolderManagerView: View {
+    @ObservedObject var coord: PipelineCoordinator
+    @Environment(\.presentationMode) var presentationMode
+
+    @State private var newProfileName: String = ""
+    @State private var selectedFolderForImport: String = ""
+    @State private var showFileImporter: Bool = false
+
+    var body: some View {
+        NavigationView {
+            Form {
+                Section(header: Text("1. Hồ sơ Game đang kích hoạt")) {
+                    HStack {
+                        Image(systemName: "folder.fill.badge.checkmark")
+                            .foregroundColor(.cyan)
+                        Text("Thư mục đang dùng:")
+                        Spacer()
+                        Text("\(coord.activeProfileFolderName) (\(coord.loadedLineCount) câu)")
+                            .bold()
+                            .foregroundColor(.cyan)
+                    }
+
+                    Button(action: {
+                        coord.triggerTVTestSentence()
+                        presentationMode.wrappedValue.dismiss()
+                    }) {
+                        Label("Gửi câu Test \"\(TranslatorV102Config.tvTestSentence)\" lên TV", systemImage: "tv.badge.wifi")
+                            .font(.subheadline.bold())
+                            .foregroundColor(.green)
+                    }
                 }
+
+                Section(header: Text("2. Tạo thư mục Hồ sơ Game mới")) {
+                    TextField("Nhập tên Hồ sơ Game (VD: Until Dawn, God of War)", text: $newProfileName)
+
+                    HStack(spacing: 12) {
+                        Button(action: {
+                            guard !newProfileName.trimmingCharacters(in: CharacterSet.whitespaces).isEmpty else { return }
+                            coord.createNewGameProfileFolder(folderName: newProfileName)
+                            newProfileName = ""
+                        }) {
+                            Label("Chỉ tạo thư mục", systemImage: "folder.badge.plus")
+                                .font(.caption.bold())
+                        }
+                        .buttonStyle(.bordered)
+
+                        Button(action: {
+                            let target = newProfileName.trimmingCharacters(in: CharacterSet.whitespaces).isEmpty ? "Game Mới" : newProfileName
+                            coord.createNewGameProfileFolder(folderName: target)
+                            selectedFolderForImport = target
+                            newProfileName = ""
+                            showFileImporter = true
+                        }) {
+                            Label("Tạo thư mục & Chọn file .sqlite", systemImage: "doc.badge.plus")
+                                .font(.caption.bold())
+                        }
+                        .buttonStyle(.borderedProminent)
+                    }
+                }
+
+                Section(header: Text("3. Danh sách Thư mục Hồ sơ Game (/GameProfiles/)")) {
+                    if coord.gameProfiles.isEmpty {
+                        Text("Chưa có thư mục hồ sơ nào. Hãy tạo hồ sơ mới ở mục 2.")
+                            .font(.caption)
+                            .foregroundColor(.gray)
+                    } else {
+                        ForEach(coord.gameProfiles) { profile in
+                            VStack(alignment: .leading, spacing: 6) {
+                                HStack {
+                                    Image(systemName: "folder.fill")
+                                        .foregroundColor(coord.activeProfileFolderName == profile.folderName ? .green : .cyan)
+                                    VStack(alignment: .leading, spacing: 2) {
+                                        Text(profile.folderName)
+                                            .font(.headline)
+                                            .foregroundColor(.white)
+                                        Text("Thư mục: /GameProfiles/\(profile.folderName)/\(profile.sqliteFileName)")
+                                            .font(.caption2)
+                                            .foregroundColor(.gray)
+                                    }
+                                    Spacer()
+                                    if coord.activeProfileFolderName == profile.folderName {
+                                        Image(systemName: "checkmark.circle.fill")
+                                            .foregroundColor(.green)
+                                    }
+                                }
+
+                                HStack(spacing: 10) {
+                                    Button(action: {
+                                        coord.activateGameProfileFolder(folderName: profile.folderName)
+                                    }) {
+                                        Text(coord.activeProfileFolderName == profile.folderName ? "Đang sử dụng" : "Kích hoạt hồ sơ này")
+                                            .font(.caption.bold())
+                                            .padding(.horizontal, 10)
+                                            .padding(.vertical, 5)
+                                            .background(coord.activeProfileFolderName == profile.folderName ? Color.green.opacity(0.25) : Color.blue.opacity(0.3))
+                                            .foregroundColor(.white)
+                                            .cornerRadius(6)
+                                    }
+                                    .buttonStyle(.plain)
+
+                                    Button(action: {
+                                        selectedFolderForImport = profile.folderName
+                                        showFileImporter = true
+                                    }) {
+                                        Label("Nạp file .sqlite riêng", systemImage: "arrow.down.doc.fill")
+                                            .font(.caption)
+                                            .padding(.horizontal, 10)
+                                            .padding(.vertical, 5)
+                                            .background(Color.white.opacity(0.12))
+                                            .foregroundColor(.cyan)
+                                            .cornerRadius(6)
+                                    }
+                                    .buttonStyle(.plain)
+
+                                    Spacer()
+
+                                    Button(action: {
+                                        coord.deleteGameProfileFolder(folderName: profile.folderName)
+                                    }) {
+                                        Image(systemName: "trash")
+                                            .font(.caption)
+                                            .foregroundColor(.red)
+                                    }
+                                    .buttonStyle(.plain)
+                                }
+                            }
+                            .padding(.vertical, 4)
+                        }
+                    }
+                }
+
+                Section(header: Text("4. Thông tin Kết nối TV Samsung & AI")) {
+                    HStack {
+                        Text("Địa chỉ IP iPhone (Nhập vào TV):")
+                        Spacer()
+                        Text("\(coord.server.ipAddress):\(AppConfig.webSocketPort)")
+                            .font(.system(.body, design: .monospaced).bold())
+                            .foregroundColor(.green)
+                    }
+                    HStack {
+                        Text("Số TV Samsung đang kết nối:")
+                        Spacer()
+                        Text("\(coord.server.connectedCount) TV")
+                            .bold()
+                    }
+                    Toggle("Dịch dự phòng bằng AI (Apple Intelligence)", isOn: $coord.enableAppleIntelligenceFallback)
+                }
+            }
+            .navigationTitle("Quản lý Hồ sơ Game")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .navigationBarTrailing) {
+                    Button("Đóng") {
+                        presentationMode.wrappedValue.dismiss()
+                    }
+                }
+            }
+            .fileImporter(
+                isPresented: $showFileImporter,
+                allowedContentTypes: [.data, .item],
+                allowsMultipleSelection: false
+            ) { result in
+                if case .success(let urls) = result, let selectedURL = urls.first {
+                    let targetFolder = selectedFolderForImport.isEmpty ? coord.activeProfileFolderName : selectedFolderForImport
+                    coord.importSQLiteIntoProfileFolder(folderName: targetFolder, sourceURL: selectedURL)
+                }
+            }
+        }
+        .preferredColorScheme(.dark)
+    }
+}
+
+// ============================================================================
+// 9. MÀN HÌNH LIÊN KẾT CHIAKI PS5 & GHI NHỚ TÀI KHOẢN VĨNH VIỄN
+// ============================================================================
+struct PS5ConnectionWizardView: View {
+    @ObservedObject var coord: PipelineCoordinator
+    @Environment(\.presentationMode) var presentationMode
+    @State private var showPSNWebLogin = false
+
+    private let psBlue = Color(red: 0.0, green: 0.44, blue: 0.82)
+
+    var body: some View {
+        NavigationView {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 16) {
+                    // Khung trạng thái phản hồi từ Lõi Chiaki
+                    HStack(spacing: 12) {
+                        Image(systemName: coord.videoMgr.isConnectedToPS5 ? "checkmark.seal.fill" : "gamecontroller.fill")
+                            .font(.system(size: 28))
+                            .foregroundColor(.white)
+                            .padding(14)
+                            .background(coord.videoMgr.isConnectedToPS5 ? Color.green : psBlue)
+                            .clipShape(Circle())
+
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text("Lõi Chiaki PS5 Remote Play")
+                                .font(.headline)
+                                .foregroundColor(.white)
+                            Text(coord.videoMgr.statusLog)
+                                .font(.caption)
+                                .foregroundColor(coord.videoMgr.statusLog.contains("❌") || coord.videoMgr.statusLog.contains("⚠️") ? .yellow : .cyan)
+                        }
+                    }
+                    .padding()
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(Color(red: 0.06, green: 0.13, blue: 0.28))
+                    .cornerRadius(14)
+
+                    // BƯỚC 1: ĐỊA CHỈ IP MÁY PS5
+                    VStack(alignment: .leading, spacing: 10) {
+                        Label("BƯỚC 1: Địa chỉ IP của máy PS5", systemImage: "1.circle.fill")
+                            .font(.subheadline.bold())
+                            .foregroundColor(.cyan)
+
+                        HStack {
+                            TextField("VD: 192.168.2.23", text: $coord.videoMgr.ps5HostIP)
+                                .keyboardType(.numbersAndPunctuation)
+                                .padding(10)
+                                .background(Color.black.opacity(0.35))
+                                .cornerRadius(8)
+                                .foregroundColor(.white)
+
+                            Button(action: { coord.videoMgr.scanForPS5OnLAN() }) {
+                                HStack(spacing: 4) {
+                                    Image(systemName: "dot.radiowaves.left.and.right")
+                                    Text("Quét tìm PS5")
+                                        .font(.caption.bold())
+                                }
+                                .padding(.horizontal, 12)
+                                .padding(.vertical, 10)
+                                .background(psBlue)
+                                .foregroundColor(.white)
+                                .cornerRadius(8)
+                            }
+                        }
+                    }
+                    .padding()
+                    .background(Color.white.opacity(0.06))
+                    .cornerRadius(14)
+
+                    // BƯỚC 2: TÀI KHOẢN PSN PHỤ & GHI NHỚ TỰ ĐỘNG
+                    VStack(alignment: .leading, spacing: 10) {
+                        HStack {
+                            Label("BƯỚC 2: Tài khoản PSN Phụ", systemImage: "2.circle.fill")
+                                .font(.subheadline.bold())
+                                .foregroundColor(.cyan)
+                            Spacer()
+                            if coord.videoMgr.isAccountRemembered {
+                                Label("Đã ghi nhớ", systemImage: "checkmark.shield.fill")
+                                    .font(.caption.bold())
+                                    .foregroundColor(.green)
+                            }
+                        }
+
+                        Text("Sau khi lấy mã Account ID 8-byte 1 lần, ứng dụng sẽ tự động ghi nhớ vĩnh viễn tài khoản này:")
+                            .font(.caption)
+                            .foregroundColor(.gray)
+
+                        HStack {
+                            TextField("Tên tài khoản PSN phụ (VD: Miesoi93)", text: $coord.videoMgr.psnUsername)
+                                .padding(10)
+                                .background(Color.black.opacity(0.35))
+                                .cornerRadius(8)
+                                .foregroundColor(.white)
+
+                            Button(action: {
+                                coord.videoMgr.lookupAccountIDByPSNUsername()
+                            }) {
+                                HStack(spacing: 4) {
+                                    Image(systemName: "magnifyingglass")
+                                    Text("Tự lấy ID")
+                                        .font(.caption.bold())
+                                }
+                                .padding(.horizontal, 10)
+                                .padding(.vertical, 10)
+                                .background(Color.cyan.opacity(0.25))
+                                .foregroundColor(.cyan)
+                                .cornerRadius(8)
+                            }
+                        }
+
+                        HStack {
+                            TextField("Mã Account ID 8-byte Base64 (Hoặc số ID 19 số)", text: $coord.videoMgr.psnAccountIDBase64)
+                                .font(.caption.monospaced())
+                                .padding(10)
+                                .background(Color.black.opacity(0.35))
+                                .cornerRadius(8)
+                                .foregroundColor(.yellow)
+
+                            Button(action: { showPSNWebLogin = true }) {
+                                HStack(spacing: 4) {
+                                    Image(systemName: "person.badge.key.fill")
+                                    Text("Đăng nhập Sony")
+                                        .font(.caption.bold())
+                                }
+                                .padding(.horizontal, 12)
+                                .padding(.vertical, 10)
+                                .background(psBlue)
+                                .foregroundColor(.white)
+                                .cornerRadius(8)
+                            }
+                        }
+
+                        if coord.videoMgr.isAccountRemembered {
+                            HStack {
+                                Text("Đã lưu: \(coord.videoMgr.psnUsername) (\(coord.videoMgr.psnAccountIDBase64))")
+                                    .font(.caption2)
+                                    .foregroundColor(.green)
+                                Spacer()
+                                Button("Đổi TK khác") {
+                                    coord.videoMgr.clearRememberedAccount()
+                                }
+                                .font(.caption2.bold())
+                                .foregroundColor(.orange)
+                            }
+                        }
+                    }
+                    .padding()
+                    .background(Color.white.opacity(0.06))
+                    .cornerRadius(14)
+
+                    // BƯỚC 3: MÃ PIN 8 CHỮ SỐ TRÊN MÀN HÌNH PS5
+                    VStack(alignment: .leading, spacing: 10) {
+                        Label("BƯỚC 3: Mã PIN 8 số liên kết thiết bị (Chỉ cần nhập lần đầu)", systemImage: "3.circle.fill")
+                            .font(.subheadline.bold())
+                            .foregroundColor(.cyan)
+
+                        Text("Trên PS5 (ở tài khoản phụ Miesoi93): Cài đặt -> Hệ thống -> Chơi từ xa -> Liên kết thiết bị:")
+                            .font(.caption)
+                            .foregroundColor(.gray)
+
+                        TextField("Nhập 8 chữ số trên TV (VD: 4326 2954)", text: $coord.videoMgr.psnPinCode)
+                            .font(.system(size: 22, weight: .bold, design: .monospaced))
+                            .multilineTextAlignment(.center)
+                            .keyboardType(.numberPad)
+                            .padding(12)
+                            .background(Color.black.opacity(0.5))
+                            .overlay(
+                                RoundedRectangle(cornerRadius: 10)
+                                    .stroke(psBlue, lineWidth: 1.5)
+                            )
+                            .cornerRadius(10)
+                            .foregroundColor(.yellow)
+                    }
+                    .padding()
+                    .background(Color.white.opacity(0.06))
+                    .cornerRadius(14)
+
+                    Button(action: {
+                        coord.videoMgr.pairAndConnectToPS5(
+                            username: coord.videoMgr.psnUsername,
+                            accountIDBase64: coord.videoMgr.psnAccountIDBase64,
+                            pinCode: coord.videoMgr.psnPinCode,
+                            ip: coord.videoMgr.ps5HostIP
+                        )
+                    }) {
+                        HStack {
+                            Spacer()
+                            Image(systemName: "link.circle.fill")
+                                .font(.title3)
+                            Text("LIÊN KẾT CHIAKI & GHI NHỚ TÀI KHOẢN")
+                                .font(.system(size: 15, weight: .bold))
+                            Spacer()
+                        }
+                        .padding(.vertical, 14)
+                        .background(psBlue)
+                        .foregroundColor(.white)
+                        .cornerRadius(12)
+                    }
+
+                    if coord.videoMgr.isConnectedToPS5 {
+                        Button(action: {
+                            coord.videoMgr.disconnectPS5()
+                        }) {
+                            HStack {
+                                Spacer()
+                                Text("Ngắt kết nối PS5 hiện tại")
+                                    .font(.subheadline.bold())
+                                Spacer()
+                            }
+                            .padding(.vertical, 10)
+                            .background(Color.red.opacity(0.25))
+                            .foregroundColor(.red)
+                            .cornerRadius(10)
+                        }
+                    }
+                }
+                .padding()
+            }
+            .background(Color(red: 0.03, green: 0.05, blue: 0.12).ignoresSafeArea())
+            .navigationTitle("Kết nối PS5 Remote Play")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .navigationBarTrailing) {
+                    Button("Đóng") {
+                        presentationMode.wrappedValue.dismiss()
+                    }
+                }
+            }
+            .sheet(isPresented: $showPSNWebLogin) {
+                PSNWebLoginHelperView(coord: coord)
+            }
+        }
+        .preferredColorScheme(.dark)
+    }
+}
+
+// ============================================================================
+// 10. TRÌNH ĐĂNG NHẬP SONY OAUTH & BỘ QUÉT ĐỆ QUY ĐA TẦNG (JWT + NPSSO + 5 API)
+// ============================================================================
+struct PSNWebLoginHelperView: View {
+    @ObservedObject var coord: PipelineCoordinator
+    @Environment(\.presentationMode) var presentationMode
+    @State private var extractionStatus: String = "Đăng nhập tài khoản phụ (Miesoi93) một lần duy nhất. App sẽ tự lấy Account ID 8-byte và ghi nhớ vĩnh viễn."
+    @State private var manualCheckTrigger: Int = 0
+
+    var body: some View {
+        NavigationView {
+            VStack(spacing: 8) {
+                HStack(spacing: 8) {
+                    Text(extractionStatus)
+                        .font(.caption.bold())
+                        .foregroundColor(.cyan)
+                        .multilineTextAlignment(.leading)
+
+                    Spacer()
+
+                    Button(action: {
+                        extractionStatus = "Đang quét Cookie npsso & lấy Account ID 8-byte..."
+                        manualCheckTrigger += 1
+                    }) {
+                        HStack(spacing: 4) {
+                            Image(systemName: "bolt.shield.fill")
+                            Text("Lấy ID ngay")
+                                .font(.caption2.bold())
+                        }
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 6)
+                        .background(Color.green.opacity(0.25))
+                        .foregroundColor(.green)
+                        .cornerRadius(8)
+                    }
+                }
+                .padding(.horizontal, 12)
+                .padding(.top, 6)
+
+                SonyOAuthWebView(
+                    url: URL(string: TranslatorV102Config.sonyOAuthLoginURL)!,
+                    manualCheckTrigger: manualCheckTrigger,
+                    onExtractedAccount: { onlineID, base64ID, numericID in
+                        let finalUser = onlineID.isEmpty ? coord.videoMgr.psnUsername : onlineID
+                        coord.videoMgr.saveRememberedAccount(
+                            username: finalUser,
+                            accountIDBase64: base64ID,
+                            numericID: numericID
+                        )
+                        self.extractionStatus = "✅ Đã lấy & ghi nhớ thành công Account ID 8-byte (\(base64ID)) • Số ID: \(numericID)!"
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.9) {
+                            presentationMode.wrappedValue.dismiss()
+                        }
+                    },
+                    onStatusUpdate: { msg in
+                        self.extractionStatus = msg
+                    }
+                )
+            }
+            .navigationTitle("Đăng nhập Sony (Tự lấy 8-byte)")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .navigationBarTrailing) {
+                    Button("Đóng") {
+                        presentationMode.wrappedValue.dismiss()
+                    }
+                }
+            }
+        }
+        .preferredColorScheme(.dark)
+    }
+}
+
+struct SonyOAuthWebView: UIViewRepresentable {
+    let url: URL
+    let manualCheckTrigger: Int
+    let onExtractedAccount: (String, String, String) -> Void
+    let onStatusUpdate: (String) -> Void
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(onExtractedAccount: onExtractedAccount, onStatusUpdate: onStatusUpdate)
+    }
+
+    func makeUIView(context: Context) -> WKWebView {
+        // Sử dụng WKWebsiteDataStore.default() để lưu Cookie phiên đăng nhập Sony vĩnh viễn
+        let config = WKWebViewConfiguration()
+        config.websiteDataStore = WKWebsiteDataStore.default()
+        let webView = WKWebView(frame: .zero, configuration: config)
+        webView.navigationDelegate = context.coordinator
+        context.coordinator.attachedWebView = webView
+        webView.customUserAgent = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
+        webView.load(URLRequest(url: url))
+        return webView
+    }
+
+    func updateUIView(_ uiView: WKWebView, context: Context) {
+        if context.coordinator.lastManualTrigger != manualCheckTrigger {
+            context.coordinator.lastManualTrigger = manualCheckTrigger
+            context.coordinator.inspectCookiesAndDOMForAccountID(in: uiView, forceSilentAuth: true)
+        }
+    }
+
+    class Coordinator: NSObject, WKNavigationDelegate {
+        let onExtractedAccount: (String, String, String) -> Void
+        let onStatusUpdate: (String) -> Void
+        weak var attachedWebView: WKWebView?
+        var lastManualTrigger: Int = 0
+        private var didExtractSuccess = false
+        private var didExchangeCode = false
+        private var isTryingSilentCookieAuth = false
+
+        init(onExtractedAccount: @escaping (String, String, String) -> Void, onStatusUpdate: @escaping (String) -> Void) {
+            self.onExtractedAccount = onExtractedAccount
+            self.onStatusUpdate = onStatusUpdate
+        }
+
+        // 1. Bắt URL chuyển hướng com.scee.psxandroid.scecompcall://redirect?code=v3.xxxx
+        func webView(_ webView: WKWebView, decidePolicyFor navigationAction: WKNavigationAction, decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
+            guard let reqURL = navigationAction.request.url else {
+                decisionHandler(.allow)
+                return
+            }
+            let currentURL = reqURL.absoluteString
+
+            if handlePotentialRedirectURL(currentURL) {
+                decisionHandler(.cancel)
+                return
+            }
+
+            decisionHandler(.allow)
+        }
+
+        // 2. Bắt cả trường hợp WebKit báo lỗi Unsupported URL khi Sony redirect sang custom scheme scecompcall://
+        func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
+            let nsErr = error as NSError
+            if let failingURL = nsErr.userInfo[NSURLErrorFailingURLStringErrorKey] as? String {
+                _ = handlePotentialRedirectURL(failingURL)
+            }
+        }
+
+        // 3. Khi trang tải xong (didFinish): Tự động đọc Cookie npsso & gọi thẳng API basicProfile trong WKWebView
+        func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+            guard !didExtractSuccess else { return }
+            inspectCookiesAndDOMForAccountID(in: webView, forceSilentAuth: false)
+        }
+
+        private func handlePotentialRedirectURL(_ urlString: String) -> Bool {
+            guard urlString.hasPrefix(TranslatorV102Config.sonyOAuthRedirectPrefix) ||
+                  urlString.contains("scecompcall://redirect") ||
+                  urlString.contains("remoteplay/redirect") ||
+                  urlString.contains("code=v3.") else {
+                return false
+            }
+
+            if let components = URLComponents(string: urlString),
+               let code = components.queryItems?.first(where: { $0.name == "code" })?.value,
+               !code.isEmpty,
+               !didExchangeCode {
+                didExchangeCode = true
+                DispatchQueue.main.async {
+                    self.onStatusUpdate("Đã nhận mã OAuth từ Sony! Đang giải mã JWT & lấy Account ID 8-byte...")
+                }
+                exchangeOAuthCodeForAccountID(code: code)
+            }
+            return true
+        }
+
+        // Tự động đọc Cookie npsso và chạy truy vấn basicProfile ngay trong WKWebView khi trang tải xong
+        func inspectCookiesAndDOMForAccountID(in webView: WKWebView, forceSilentAuth: Bool) {
+            guard !didExtractSuccess else { return }
+
+            // Bước A: Gọi trực tiếp API basicProfile ngay trong phiên trình duyệt WKWebView (kèm Cookie trình duyệt)
+            let jsFetchProfile = """
+            (async function() {
+                try {
+                    const r1 = await fetch('https://web.np.playstation.com/api/basicProfile/v1/profile/users/me', { credentials: 'include' });
+                    if (r1.ok) {
+                        const j1 = await r1.json();
+                        return JSON.stringify(j1);
+                    }
+                } catch (e) {}
+                return "";
+            })();
+            """
+
+            webView.evaluateJavaScript(jsFetchProfile) { [weak self] result, _ in
+                guard let self = self, !self.didExtractSuccess else { return }
+                if let jsonStr = result as? String,
+                   !jsonStr.isEmpty,
+                   let data = jsonStr.data(using: .utf8),
+                   let jsonObj = try? JSONSerialization.jsonObject(with: data),
+                   let found = Self.extractAccountIDRecursively(from: jsonObj) {
+                    self.completeExtraction(onlineID: found.onlineID, base64ID: found.base64ID, numericID: found.numericID)
+                }
+            }
+
+            // Bước B: Kiểm tra Cookie npsso trong WKWebsiteDataStore để kích hoạt OAuth ngầm nếu trang không tự redirect
+            webView.configuration.websiteDataStore.httpCookieStore.getAllCookies { [weak self] cookies in
+                guard let self = self, !self.didExtractSuccess else { return }
                 let sonyCookies = cookies.filter {
                     $0.domain.contains("sony.com") || $0.domain.contains("playstation.net") || $0.domain.contains("playstation.com")
                 }
-                guard !sonyCookies.isEmpty else {
-                    completion?(false)
-                    return
-                }
+                guard !sonyCookies.isEmpty else { return }
 
                 for cookie in sonyCookies {
                     HTTPCookieStorage.shared.setCookie(cookie)
                 }
 
-                // Bước 1: Thử gọi thẳng cổng BasicProfile của PlayStation bằng Cookie hiện có
-                self.fetchBasicProfileWithCookies(sonyCookies) { foundDirect in
-                    if foundDirect {
-                        completion?(true)
-                        return
-                    }
+                let hasNpsso = sonyCookies.contains { $0.name.lowercased() == "npsso" && $0.value.count >= 24 }
+                let currentHost = webView.url?.host?.lowercased() ?? ""
+                let isPostLoginPage = currentHost.contains("my.account.sony.com") ||
+                                      currentHost.contains("playstation.com") ||
+                                      forceSilentAuth
 
-                    // Bước 2: Dùng Cookie (bao gồm npsso) để lấy OAuth Code ngầm
-                    let silentAuthURLStr = "https://ca.account.sony.com/api/authz/v3/oauth/authorize?access_type=offline&client_id=09515159-7237-4370-9b40-3806e67c0891&redirect_uri=com.scee.psxandroid.scecompcall%3A%2F%2Fredirect&response_type=code&scope=psn:mobile.v2.core%20psn:clientapp&prompt=none"
-                    guard let url = URL(string: silentAuthURLStr) else {
-                        completion?(false)
-                        return
+                if (hasNpsso || isPostLoginPage) && !self.didExchangeCode && !self.isTryingSilentCookieAuth {
+                    self.isTryingSilentCookieAuth = true
+                    DispatchQueue.main.async {
+                        self.onStatusUpdate("Đã phát hiện phiên đăng nhập Sony! Đang trích xuất mã Account ID 8-byte...")
                     }
-
-                    let config = URLSessionConfiguration.default
-                    config.httpShouldSetCookies = true
-                    config.httpCookieAcceptPolicy = .always
-
-                    let delegate = SilentOAuthRedirectCatcher { [weak self] code in
-                        guard let self = self, let code = code else {
-                            completion?(false)
-                            return
-                        }
-                        self.exchangeSonyCodeForRealAccountID(code: code, completion: completion)
-                    }
-
-                    let session = URLSession(configuration: config, delegate: delegate, delegateQueue: nil)
-                    var req = URLRequest(url: url)
-                    let cookieHeader = HTTPCookie.requestHeaderFields(with: sonyCookies)
-                    for (k, v) in cookieHeader {
-                        req.setValue(v, forHTTPHeaderField: k)
-                    }
-                    session.dataTask(with: req).resume()
+                    self.performSilentAuthorizeWithCookies(sonyCookies)
                 }
             }
         }
-    }
 
-    private func fetchBasicProfileWithCookies(_ cookies: [HTTPCookie], completion: @escaping (Bool) -> Void) {
-        guard let url = URL(string: "https://web.np.playstation.com/api/basicProfile/v1/profile/users/me") else {
-            completion(false)
-            return
+        private func performSilentAuthorizeWithCookies(_ cookies: [HTTPCookie]) {
+            let silentURLStr = TranslatorV102Config.sonyOAuthLoginURL + "&prompt=none"
+            guard let silentURL = URL(string: silentURLStr) else {
+                isTryingSilentCookieAuth = false
+                return
+            }
+
+            let config = URLSessionConfiguration.default
+            config.httpShouldSetCookies = true
+            config.httpCookieAcceptPolicy = .always
+
+            let catcher = SilentOAuthRedirectCatcher { [weak self] code in
+                guard let self = self else { return }
+                self.isTryingSilentCookieAuth = false
+                if let code = code, !code.isEmpty, !self.didExchangeCode {
+                    self.didExchangeCode = true
+                    DispatchQueue.main.async {
+                        self.onStatusUpdate("Đã lấy mã uỷ quyền từ Cookie Sony! Đang giải mã Account ID 8-byte...")
+                    }
+                    self.exchangeOAuthCodeForAccountID(code: code)
+                }
+            }
+
+            let session = URLSession(configuration: config, delegate: catcher, delegateQueue: nil)
+            var req = URLRequest(url: silentURL)
+            let headers = HTTPCookie.requestHeaderFields(with: cookies)
+            for (k, v) in headers {
+                req.setValue(v, forHTTPHeaderField: k)
+            }
+            session.dataTask(with: req).resume()
         }
-        var req = URLRequest(url: url)
-        req.timeoutInterval = 5.0
-        let cookieHeader = HTTPCookie.requestHeaderFields(with: cookies)
-        for (k, v) in cookieHeader {
-            req.setValue(v, forHTTPHeaderField: k)
+
+        // 4. Đổi OAuth code sang access_token kèm tham số token_format=jwt
+        private func exchangeOAuthCodeForAccountID(code: String) {
+            guard let tokenURL = URL(string: TranslatorV102Config.sonyOAuthTokenURL) else { return }
+            var req = URLRequest(url: tokenURL)
+            req.httpMethod = "POST"
+            req.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
+            req.setValue(TranslatorV102Config.sonyBasicAuthHeader, forHTTPHeaderField: "Authorization")
+
+            // Truyền thêm token_format=jwt để access_token trả về chứa sẵn account_id bên trong payload JWT
+            let bodyStr = "grant_type=authorization_code&code=\(code)&redirect_uri=\(TranslatorV102Config.sonyOAuthRedirectEncoded)&token_format=jwt"
+            req.httpBody = bodyStr.data(using: .utf8)
+
+            URLSession.shared.dataTask(with: req) { [weak self] data, _, _ in
+                guard let self = self else { return }
+                guard let data = data,
+                      let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                    self.didExchangeCode = false
+                    DispatchQueue.main.async {
+                        self.onStatusUpdate("Không đổi được token từ Sony. Hãy bấm 'Lấy ID ngay' hoặc đăng nhập lại.")
+                    }
+                    return
+                }
+
+                // Bước 4A: Quét đệ quy ngay trong JSON phản hồi của oauth/token
+                if let directFound = Self.extractAccountIDRecursively(from: json) {
+                    self.completeExtraction(
+                        onlineID: directFound.onlineID,
+                        base64ID: directFound.base64ID,
+                        numericID: directFound.numericID
+                    )
+                    return
+                }
+
+                guard let accessToken = json["access_token"] as? String else {
+                    self.didExchangeCode = false
+                    return
+                }
+
+                // Bước 4B: Giải mã trực tiếp chuỗi JWT của access_token (hoặc id_token) để lấy account_id tức thì
+                if let jwtFound = Self.decodeJWTAndExtractAccountID(from: accessToken) {
+                    self.completeExtraction(
+                        onlineID: jwtFound.onlineID,
+                        base64ID: jwtFound.base64ID,
+                        numericID: jwtFound.numericID
+                    )
+                    return
+                }
+
+                if let idToken = json["id_token"] as? String,
+                   let idJwtFound = Self.decodeJWTAndExtractAccountID(from: idToken) {
+                    self.completeExtraction(
+                        onlineID: idJwtFound.onlineID,
+                        base64ID: idJwtFound.base64ID,
+                        numericID: idJwtFound.numericID
+                    )
+                    return
+                }
+
+                // Bước 4C: Gọi chuỗi 5 cổng API Profile & Token Info chính thức của Sony
+                self.fetchPSNAccountID(accessToken: accessToken)
+            }.resume()
         }
-        req.setValue("https://www.playstation.com/", forHTTPHeaderField: "Referer")
 
-        URLSession.shared.dataTask(with: req) { [weak self] data, _, _ in
-            guard let self = self, let data = data,
-                  let extracted = ChiakiEmbeddedCore.shared.extractAccountIDFromJSONData(data) else {
-                completion(false)
-                return
-            }
-            DispatchQueue.main.async {
-                let user = extracted.onlineID.isEmpty ? self.psnUsername : extracted.onlineID
-                self.saveRememberedAccount(username: user, accountIDBase64: extracted.base64ID, numericID: extracted.numericID)
-                completion(true)
-            }
-        }.resume()
-    }
+        // 5. Chuỗi 5 cổng API lấy Account ID 64-bit chính thức của Sony (với bộ quét đệ quy JSON)
+        private func fetchPSNAccountID(accessToken: String) {
+            let endpoints: [(url: String, useBasicAuth: Bool)] = [
+                ("https://ca.account.sony.com/api/v1/oauth/token/\(accessToken)", true),
+                ("https://m.np.playstation.com/api/userProfile/v1/internal/users/me/profiles", false),
+                ("https://us-prof.np.community.playstation.net/userProfile/v1/users/me/profile2?fields=npId,onlineId,accountId,avatarUrls,plus", false),
+                ("https://web.np.playstation.com/api/basicProfile/v1/profile/users/me", false),
+                ("https://dms.api.playstation.com/api/v1/devices/accounts/me", false)
+            ]
 
-    // Đổi OAuth Code sang Token (có token_format=jwt) và quét chuỗi 5 cổng của Sony
-    func exchangeSonyCodeForRealAccountID(code: String, completion: ((Bool) -> Void)? = nil) {
-        guard let tokenURL = URL(string: "https://ca.account.sony.com/api/authz/v3/oauth/token") else {
-            completion?(false)
-            return
+            tryEndpoint(at: 0, endpoints: endpoints, accessToken: accessToken)
         }
-        var req = URLRequest(url: tokenURL)
-        req.httpMethod = "POST"
-        req.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
-        req.setValue("Basic MDk1MTUxNTktNzIzNy00MzcwLTliNDAtMzgwNmU2N2MwODkxOnVjUGprYTV0bnRCMktxc1A=", forHTTPHeaderField: "Authorization")
 
-        let encodedCode = code.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? code
-        let body = "grant_type=authorization_code&code=\(encodedCode)&redirect_uri=com.scee.psxandroid.scecompcall%3A%2F%2Fredirect&token_format=jwt"
-        req.httpBody = body.data(using: .utf8)
-
-        URLSession.shared.dataTask(with: req) { [weak self] data, _, _ in
-            guard let self = self, let data = data else {
-                completion?(false)
-                return
-            }
-
-            // Tầng 1: Quét trực tiếp JSON trả về từ cổng Token
-            if let directFound = ChiakiEmbeddedCore.shared.extractAccountIDFromJSONData(data) {
-                DispatchQueue.main.async {
-                    let user = directFound.onlineID.isEmpty ? self.psnUsername : directFound.onlineID
-                    self.saveRememberedAccount(username: user, accountIDBase64: directFound.base64ID, numericID: directFound.numericID)
-                    completion?(true)
-                }
-                return
-            }
-
-            guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                  let accessToken = json["access_token"] as? String else {
-                completion?(false)
-                return
-            }
-
-            // Tầng 2: Giải mã trực tiếp chuỗi JWT access_token / id_token
-            if let jwtFound = ChiakiEmbeddedCore.shared.extractAccountIDFromJWT(accessToken) {
-                DispatchQueue.main.async {
-                    let user = jwtFound.onlineID.isEmpty ? self.psnUsername : jwtFound.onlineID
-                    self.saveRememberedAccount(username: user, accountIDBase64: jwtFound.base64ID, numericID: jwtFound.numericID)
-                    completion?(true)
-                }
-                return
-            }
-            if let idToken = json["id_token"] as? String,
-               let idJwtFound = ChiakiEmbeddedCore.shared.extractAccountIDFromJWT(idToken) {
-                DispatchQueue.main.async {
-                    let user = idJwtFound.onlineID.isEmpty ? self.psnUsername : idJwtFound.onlineID
-                    self.saveRememberedAccount(username: user, accountIDBase64: idJwtFound.base64ID, numericID: idJwtFound.numericID)
-                    completion?(true)
-                }
-                return
-            }
-
-            // Tầng 3 -> 6: Truy vấn chuỗi 4 cổng Profile & Introspection chính thức của Sony
-            self.fetchPSNAccountIDMultiEndpoint(accessToken: accessToken) { onlineID, base64ID, numericID in
-                DispatchQueue.main.async {
-                    let user = onlineID.isEmpty ? self.psnUsername : onlineID
-                    self.saveRememberedAccount(username: user, accountIDBase64: base64ID, numericID: numericID)
-                    completion?(true)
-                }
-            } onFailure: {
-                completion?(false)
-            }
-        }.resume()
-    }
-
-    func fetchPSNAccountIDMultiEndpoint(
-        accessToken: String,
-        onSuccess: @escaping (String, String, String) -> Void,
-        onFailure: @escaping () -> Void
-    ) {
-        let endpoints: [(url: String, authHeader: String)] = [
-            // 1. Cổng UserProfile v1 chuẩn cho scope psn:mobile.v2.core (Hoạt động ổn định nhất 2026)
-            ("https://us-prof.np.community.playstation.net/userProfile/v1/users/me/profile2?fields=accountId,onlineId", "Bearer \(accessToken)"),
-            // 2. Cổng Mobile Internal UserProfile v1
-            ("https://m.np.playstation.com/api/userProfile/v1/internal/users/me/profiles", "Bearer \(accessToken)"),
-            // 3. Cổng OAuth Token Introspection của Sony
-            ("https://ca.account.sony.com/api/v1/oauth/token/\(accessToken)", "Basic MDk1MTUxNTktNzIzNy00MzcwLTliNDAtMzgwNmU2N2MwODkxOnVjUGprYTV0bnRCMktxc1A="),
-            // 4. Cổng Web BasicProfile v1
-            ("https://web.np.playstation.com/api/basicProfile/v1/profile/users/me", "Bearer \(accessToken)"),
-            // 5. Cổng DMS Devices Accounts
-            ("https://dms.api.playstation.com/api/v1/devices/accounts/me", "Bearer \(accessToken)")
-        ]
-
-        func tryEndpoint(at index: Int) {
+        private func tryEndpoint(at index: Int, endpoints: [(url: String, useBasicAuth: Bool)], accessToken: String) {
+            guard !didExtractSuccess else { return }
             guard index < endpoints.count else {
-                onFailure()
+                self.didExchangeCode = false
+                DispatchQueue.main.async {
+                    self.onStatusUpdate("⚠️ Chưa trích xuất được Account ID tự động. Hãy bấm nút 'Lấy ID ngay' ở góc phải.")
+                }
                 return
             }
-            let current = endpoints[index]
-            guard let url = URL(string: current.url) else {
-                tryEndpoint(at: index + 1)
+
+            let item = endpoints[index]
+            guard let url = URL(string: item.url) else {
+                tryEndpoint(at: index + 1, endpoints: endpoints, accessToken: accessToken)
                 return
             }
 
             var req = URLRequest(url: url)
             req.httpMethod = "GET"
             req.timeoutInterval = 6.0
-            req.setValue(current.authHeader, forHTTPHeaderField: "Authorization")
             req.setValue("application/json", forHTTPHeaderField: "Accept")
-
-            URLSession.shared.dataTask(with: req) { data, _, _ in
-                if let data = data,
-                   let found = ChiakiEmbeddedCore.shared.extractAccountIDFromJSONData(data) {
-                    onSuccess(found.onlineID, found.base64ID, found.numericID)
-                    return
-                }
-                tryEndpoint(at: index + 1)
-            }.resume()
-        }
-
-        tryEndpoint(at: 0)
-    }
-
-    // MARK: - Ghi nhớ vĩnh viễn tài khoản thật
-    func saveRememberedAccount(username: String, accountIDBase64: String, numericID: String = "") {
-        let cleanUser = username.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines)
-        if !cleanUser.isEmpty {
-            self.psnUsername = cleanUser
-        }
-
-        let norm = ChiakiEmbeddedCore.shared.normalizeAccountIDTo8Bytes(input: accountIDBase64, fallbackUsername: self.psnUsername)
-        guard norm.isValidRealID else {
-            self.statusLog = "⚠️ Mã Account ID chưa phải mã 8-byte thật từ Sony. Đang lấy từ phiên đăng nhập Sony..."
-            self.extractAccountIDFromSonyWebCookies()
-            return
-        }
-
-        self.psnAccountIDBase64 = norm.base64
-        self.psnNumericAccountID = numericID.isEmpty ? norm.numericString : numericID
-        self.isAccountRemembered = true
-
-        UserDefaults.standard.set(self.psnUsername, forKey: "psn_user_v102")
-        UserDefaults.standard.set(self.psnAccountIDBase64, forKey: "psn_aid_v102")
-        UserDefaults.standard.set(self.psnNumericAccountID, forKey: "psn_num_id_v102")
-        UserDefaults.standard.set(true, forKey: "psn_remembered_v102")
-        UserDefaults.standard.synchronize()
-
-        self.statusLog = "✅ Đã lưu & ghi nhớ vĩnh viễn tài khoản '\(self.psnUsername)' (Số ID Sony: \(self.psnNumericAccountID) • Base64: \(self.psnAccountIDBase64))."
-    }
-
-    func clearRememberedAccount() {
-        psnAccountIDBase64 = ""
-        psnNumericAccountID = ""
-        savedRegistKey = ""
-        savedRPKey = ""
-        isAccountRemembered = false
-        isConnectedToPS5 = false
-        isReceivingRealPS5Video = false
-        UserDefaults.standard.removeObject(forKey: "psn_aid_v102")
-        UserDefaults.standard.removeObject(forKey: "psn_num_id_v102")
-        UserDefaults.standard.removeObject(forKey: "chiaki_real_regist_key_v102")
-        UserDefaults.standard.removeObject(forKey: "chiaki_real_rp_key_v102")
-        UserDefaults.standard.set(false, forKey: "psn_remembered_v102")
-        statusLog = "Đã xoá tài khoản cũ. Hãy bấm 'Đăng nhập Sony' hoặc 'Tự lấy ID' để lấy mã 8-byte thật."
-    }
-
-    // MARK: - Tra cứu Account ID 8-byte thật từ Cookie Sony + Đa nguồn Public Lookup
-    func lookupAccountIDByPSNUsername() {
-        let targetUser = psnUsername.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines)
-        guard !targetUser.isEmpty else {
-            statusLog = "⚠️ Vui lòng nhập tên tài khoản PSN phụ (VD: Miesoi93) trước."
-            return
-        }
-
-        // Nếu người dùng nhập thẳng số ID 19 chữ số hoặc Hex 16 ký tự vào ô Account ID -> chuyển đổi ngay lập tức!
-        let manualCheck = ChiakiEmbeddedCore.shared.normalizeAccountIDTo8Bytes(input: psnAccountIDBase64, fallbackUsername: targetUser)
-        if manualCheck.isValidRealID {
-            saveRememberedAccount(username: targetUser, accountIDBase64: manualCheck.base64, numericID: manualCheck.numericString)
-            return
-        }
-
-        statusLog = "Đang trích xuất mã Account ID 8-byte thật của '\(targetUser)'..."
-
-        // Ưu tiên 1: Lấy trực tiếp từ phiên Cookie Sony đã đăng nhập trên máy
-        extractAccountIDFromSonyWebCookies { [weak self] success in
-            guard let self = self else { return }
-            if success { return }
-
-            // Ưu tiên 2: Tra cứu qua API công khai FlipScreen
-            guard let encodedUser = targetUser.addingPercentEncoding(withAllowedCharacters: CharacterSet.urlQueryAllowed),
-                  let url = URL(string: "https://psn.flipscreen.games/search.php?username=\(encodedUser)") else {
-                return
+            if item.useBasicAuth {
+                req.setValue(TranslatorV102Config.sonyBasicAuthHeader, forHTTPHeaderField: "Authorization")
+            } else {
+                req.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
             }
 
-            var req = URLRequest(url: url)
-            req.timeoutInterval = 7.0
             URLSession.shared.dataTask(with: req) { [weak self] data, _, _ in
-                guard let self = self else { return }
+                guard let self = self, !self.didExtractSuccess else { return }
                 if let data = data,
-                   let found = ChiakiEmbeddedCore.shared.extractAccountIDFromJSONData(data) {
-                    DispatchQueue.main.async {
-                        self.saveRememberedAccount(username: targetUser, accountIDBase64: found.base64ID, numericID: found.numericID)
-                    }
+                   let jsonObj = try? JSONSerialization.jsonObject(with: data),
+                   let found = Self.extractAccountIDRecursively(from: jsonObj) {
+                    self.completeExtraction(
+                        onlineID: found.onlineID,
+                        base64ID: found.base64ID,
+                        numericID: found.numericID
+                    )
                     return
                 }
-
-                DispatchQueue.main.async {
-                    self.statusLog = "⚠️ Hãy bấm nút 'Đăng nhập Sony' màu xanh bên dưới để App trích xuất trực tiếp mã Account ID 8-byte thật của '\(targetUser)'!"
-                }
+                self.tryEndpoint(at: index + 1, endpoints: endpoints, accessToken: accessToken)
             }.resume()
         }
-    }
 
-    // MARK: - 1. Quản lý & Căn chỉnh khung ROI
-    func getNormalizedROIRect(for mode: ROIMode) -> CGRect {
-        switch mode {
-        case .fullScreen:
-            return ROIDefaultConfig.fullScreenRect
-        case .dialogueOnly:
-            return customDialogueRect
-        case .questAndMenu:
-            return customQuestRect
-        }
-    }
-
-    func updateCustomROIRect(for mode: ROIMode, newRect: CGRect) {
-        let clampedW = max(0.15, min(0.96, newRect.width))
-        let clampedH = max(0.08, min(0.92, newRect.height))
-        let clampedX = max(0.02, min(0.98 - clampedW, newRect.origin.x))
-        let clampedY = max(0.02, min(0.98 - clampedH, newRect.origin.y))
-        let safeRect = CGRect(x: clampedX, y: clampedY, width: clampedW, height: clampedH)
-
-        switch mode {
-        case .fullScreen:
-            break
-        case .dialogueOnly:
-            customDialogueRect = safeRect
-            VideoSourceManager.saveRect(safeRect, key: "roi_dialogue_v102")
-        case .questAndMenu:
-            customQuestRect = safeRect
-            VideoSourceManager.saveRect(safeRect, key: "roi_quest_v102")
-        }
-    }
-
-    func resetROIRectToDefault(for mode: ROIMode) {
-        switch mode {
-        case .fullScreen:
-            break
-        case .dialogueOnly:
-            customDialogueRect = ROIDefaultConfig.dialogueDefaultRect
-            VideoSourceManager.saveRect(customDialogueRect, key: "roi_dialogue_v102")
-        case .questAndMenu:
-            customQuestRect = ROIDefaultConfig.questDefaultRect
-            VideoSourceManager.saveRect(customQuestRect, key: "roi_quest_v102")
-        }
-    }
-
-    private static func saveRect(_ rect: CGRect, key: String) {
-        let array: [Double] = [
-            Double(rect.origin.x),
-            Double(rect.origin.y),
-            Double(rect.size.width),
-            Double(rect.size.height)
-        ]
-        UserDefaults.standard.set(array, forKey: key)
-    }
-
-    private static func loadSavedRect(key: String, fallback: CGRect) -> CGRect {
-        guard let arr = UserDefaults.standard.array(forKey: key) as? [Double], arr.count == 4 else {
-            return fallback
-        }
-        return CGRect(x: arr[0], y: arr[1], width: arr[2], height: arr[3])
-    }
-
-    func cropFrameToSmartROI(fullImage: CGImage, mode: ROIMode) -> CGImage? {
-        let width = CGFloat(fullImage.width)
-        let height = CGFloat(fullImage.height)
-        let norm = getNormalizedROIRect(for: mode)
-        let targetRect = CGRect(
-            x: width * norm.origin.x,
-            y: height * norm.origin.y,
-            width: width * norm.size.width,
-            height: height * norm.size.height
-        )
-        return fullImage.cropping(to: targetRect.integral)
-    }
-
-    // MARK: - 2. Giao thức Chiaki DDP (UDP 9302)
-    func scanForPS5OnLAN() {
-        let cleanIP = ps5HostIP.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines)
-        connectionState = .scanningLAN
-        statusLog = "Chiaki DDP: Đang dò máy PS5 tại \(cleanIP):9302..."
-
-        let host = NWEndpoint.Host(cleanIP.isEmpty ? "255.255.255.255" : cleanIP)
-        guard let port = NWEndpoint.Port(rawValue: ROIDefaultConfig.ddpPort) else { return }
-
-        udpDiscoveryConn?.cancel()
-        udpDiscoveryConn = NWConnection(host: host, port: port, using: .udp)
-
-        var didRespond = false
-        udpDiscoveryConn?.stateUpdateHandler = { [weak self] state in
-            guard let self = self else { return }
-            if case .ready = state {
-                let srchPacket = "SRCH * HTTP/1.1\r\ndevice-discovery-protocol-version:00030010\r\n\r\n"
-                self.udpDiscoveryConn?.send(content: srchPacket.data(using: .utf8), completion: .contentProcessed({ _ in }))
-
-                self.udpDiscoveryConn?.receiveMessage { data, _, _, _ in
-                    guard let data = data, let text = String(data: data, encoding: .utf8) else { return }
-                    didRespond = true
-                    DispatchQueue.main.async {
-                        let hostName = self.extractHeader(from: text, key: "host-name") ?? "PS5 Console"
-                        let hostId = self.extractHeader(from: text, key: "host-id") ?? "PS5-LAN"
-                        self.discoveredPS5Name = hostName
-                        self.discoveredPS5HostID = hostId
-                        UserDefaults.standard.set(hostName, forKey: "ps5_name_v102")
-                        UserDefaults.standard.set(hostId, forKey: "ps5_hostid_v102")
-
-                        if text.contains("200 Ok") {
-                            self.statusLog = "✅ Chiaki tìm thấy máy '\(hostName)' (ID: \(hostId)) đang bật tại \(cleanIP)!"
-                        } else if text.contains("620 Server Standby") {
-                            self.statusLog = "Máy PS5 '\(hostName)' đang ở Chế độ nghỉ. Đang gửi lệnh WAKEUP..."
-                            self.sendChiakiWakeupPacket(ip: cleanIP)
-                        }
-                        if !self.isConnectedToPS5 {
-                            self.connectionState = .disconnected
-                        }
-                    }
-                }
+        private func completeExtraction(onlineID: String, base64ID: String, numericID: String) {
+            guard !didExtractSuccess else { return }
+            didExtractSuccess = true
+            DispatchQueue.main.async {
+                self.onExtractedAccount(onlineID, base64ID, numericID)
             }
         }
-        udpDiscoveryConn?.start(queue: .global())
 
-        DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) { [weak self] in
-            guard let self = self else { return }
-            if !didRespond && self.connectionState == .scanningLAN {
-                self.connectionState = self.isConnectedToPS5 ? .connected(hostName: self.discoveredPS5Name) : .disconnected
+        // MARK: - Giải mã JWT Payload (Base64URL) & Quét đệ quy JSON mọi cấp độ
+        static func decodeJWTAndExtractAccountID(from jwt: String) -> (onlineID: String, base64ID: String, numericID: String)? {
+            let segments = jwt.components(separatedBy: ".")
+            guard segments.count >= 2 else { return nil }
+
+            var base64 = segments[1]
+                .replacingOccurrences(of: "-", with: "+")
+                .replacingOccurrences(of: "_", with: "/")
+            let remainder = base64.count % 4
+            if remainder > 0 {
+                base64 += String(repeating: "=", count: 4 - remainder)
             }
-        }
-    }
 
-    func sendChiakiWakeupPacket(ip: String) {
-        let host = NWEndpoint.Host(ip)
-        guard let port = NWEndpoint.Port(rawValue: ROIDefaultConfig.ddpPort) else { return }
-        let conn = NWConnection(host: host, port: port, using: .udp)
-        conn.stateUpdateHandler = { [weak self] state in
-            guard let self = self else { return }
-            if case .ready = state {
-                let wakePacket = "WAKEUP * HTTP/1.1\r\nclient-type:vr\r\nauth-type:C\r\nmodel:w\r\napp-type:r\r\nuser-credential:\(self.psnAccountIDBase64)\r\ndevice-discovery-protocol-version:00030010\r\n\r\n"
-                conn.send(content: wakePacket.data(using: .utf8), completion: .contentProcessed({ _ in
-                    conn.cancel()
-                }))
+            guard let payloadData = Data(base64Encoded: base64),
+                  let jsonObj = try? JSONSerialization.jsonObject(with: payloadData) else {
+                return nil
             }
-        }
-        conn.start(queue: .global())
-    }
-
-    private func extractHeader(from text: String, key: String) -> String? {
-        for line in text.components(separatedBy: "\r\n") {
-            let parts = line.components(separatedBy: ":")
-            if parts.count >= 2 && parts[0].lowercased().trimmingCharacters(in: CharacterSet.whitespaces) == key.lowercased() {
-                return parts[1].trimmingCharacters(in: CharacterSet.whitespaces)
-            }
-        }
-        return nil
-    }
-
-    // MARK: - 3. Giao thức Chiaki Ghép đôi & Mở phiên điều khiển thực tế
-    func connectToPS5(username: String, pinCode: String, ip: String) {
-        pairAndConnectToPS5(username: username, accountIDBase64: psnAccountIDBase64, pinCode: pinCode, ip: ip)
-    }
-
-    func pairAndConnectToPS5(username: String, accountIDBase64: String, pinCode: String, ip: String) {
-        let cleanIP = ip.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines)
-        let cleanPIN = pinCode.replacingOccurrences(of: " ", with: "").replacingOccurrences(of: "-", with: "")
-        self.ps5HostIP = cleanIP
-
-        let parsed = ChiakiEmbeddedCore.shared.normalizeAccountIDTo8Bytes(input: accountIDBase64, fallbackUsername: username)
-        guard parsed.isValidRealID else {
-            self.isConnectedToPS5 = false
-            self.connectionState = .error(message: "Chưa có Account ID 8-byte thật")
-            self.statusLog = "⚠️ Đang trích xuất mã Account ID 8-byte thật từ phiên đăng nhập Sony..."
-            self.extractAccountIDFromSonyWebCookies { [weak self] ok in
-                guard let self = self else { return }
-                if ok && cleanPIN.count == 8 {
-                    self.performRawSocketChiakiRegistration(ip: cleanIP, pin: cleanPIN, accountIDBase64: self.psnAccountIDBase64)
-                } else if !ok {
-                    DispatchQueue.main.async {
-                        self.statusLog = "⚠️ Vui lòng bấm nút 'Đăng nhập Sony' ở Bước 2 (hoặc dán số Account ID 19 chữ số) để lấy mã 8-byte thật!"
-                    }
-                }
-            }
-            return
+            return extractAccountIDRecursively(from: jsonObj)
         }
 
-        saveRememberedAccount(username: username, accountIDBase64: parsed.base64, numericID: parsed.numericString)
+        static func extractAccountIDRecursively(from jsonObject: Any) -> (onlineID: String, base64ID: String, numericID: String)? {
+            var foundNumericID: UInt64?
+            var foundOnlineID: String = ""
 
-        if cleanPIN.count == 8 {
-            connectionState = .pairingPIN
-            statusLog = "Chiaki Core: Đang gửi gói ghép đôi 480-byte chuẩn Chiaki (PIN: \(cleanPIN), ID: \(parsed.base64)) tới \(cleanIP):9295..."
-            performRawSocketChiakiRegistration(ip: cleanIP, pin: cleanPIN, accountIDBase64: parsed.base64)
-        } else if !savedRegistKey.isEmpty {
-            connectionState = .connectingStream
-            statusLog = "Chiaki Core: Đang mở phiên Remote Play với PS5 (\(cleanIP))..."
-            startRealChiakiSessionInitAndCtrl(ip: cleanIP, registKey: savedRegistKey, rpKey: savedRPKey)
-        } else {
-            self.isConnectedToPS5 = false
-            self.connectionState = .error(message: "Chưa nhập mã PIN 8 số")
-            self.statusLog = "⚠️ Vui lòng nhập 8 chữ số Mã PIN đang hiển thị trên màn hình PS5 (Cài đặt -> Hệ thống -> Chơi từ xa -> Liên kết thiết bị)."
-        }
-    }
-
-    private func performRawSocketChiakiRegistration(ip: String, pin: String, accountIDBase64: String) {
-        rawRegistTCPConn?.cancel()
-
-        let host = NWEndpoint.Host(ip)
-        guard let port = NWEndpoint.Port(rawValue: ROIDefaultConfig.registAndCtrlPort) else { return }
-
-        let (payload480, aesKey, iv) = ChiakiEmbeddedCore.shared.buildChiakiPS5RegistPayload480(
-            pinString: pin,
-            accountIDBase64: accountIDBase64
-        )
-        let rawHTTPPacket = ChiakiEmbeddedCore.shared.buildRawHTTPRegistRequest(ip: ip, payload: payload480)
-
-        let tcpConn = NWConnection(host: host, port: port, using: .tcp)
-        rawRegistTCPConn = tcpConn
-        var didComplete = false
-
-        tcpConn.stateUpdateHandler = { [weak self] state in
-            guard let self = self else { return }
-            switch state {
-            case .ready:
-                tcpConn.send(content: rawHTTPPacket, completion: .contentProcessed({ _ in
-                    tcpConn.receive(minimumIncompleteLength: 1, maximumLength: 8192) { data, _, _, _ in
-                        guard !didComplete else { return }
-                        didComplete = true
-                        tcpConn.cancel()
-
-                        DispatchQueue.main.async {
-                            guard let data = data, !data.isEmpty else {
-                                self.isConnectedToPS5 = false
-                                self.connectionState = .error(message: "PS5 đóng kết nối cổng 9295")
-                                self.statusLog = "❌ Máy PS5 (\(ip)) không phản hồi gói ghép đôi. Hãy kiểm tra PS5 đang mở màn hình đếm ngược mã PIN 8 chữ số."
-                                return
-                            }
-
-                            let separator = Data("\r\n\r\n".utf8)
-                            let headerEndRange = data.range(of: separator)
-                            let headerData = headerEndRange != nil ? data.subdata(in: 0..<headerEndRange!.lowerBound) : data
-                            let bodyData = headerEndRange != nil ? data.subdata(in: headerEndRange!.upperBound..<data.count) : Data()
-                            let headerStr = String(data: headerData, encoding: .utf8) ?? ""
-
-                            if headerStr.contains("200 OK") || headerStr.contains("200 Ok") {
-                                let decryptedBody = ChiakiEmbeddedCore.shared.decryptRegistResponse(
-                                    cipherData: bodyData,
-                                    aesKey: aesKey,
-                                    iv: iv
-                                ) ?? ""
-
-                                let regKey = self.extractHeader(from: decryptedBody, key: "RP-RegistKey")
-                                    ?? self.extractHeader(from: headerStr, key: "RP-RegistKey")
-                                    ?? bodyData.prefix(16).map { String(format: "%02x", $0) }.joined()
-                                let rpKey = self.extractHeader(from: decryptedBody, key: "RP-Key")
-                                    ?? self.extractHeader(from: headerStr, key: "RP-Key")
-                                    ?? Data(aesKey).base64EncodedString()
-
-                                self.savedRegistKey = regKey
-                                self.savedRPKey = rpKey
-                                UserDefaults.standard.set(regKey, forKey: "chiaki_real_regist_key_v102")
-                                UserDefaults.standard.set(rpKey, forKey: "chiaki_real_rp_key_v102")
-                                UserDefaults.standard.synchronize()
-
-                                self.statusLog = "✅ Ghép đôi PIN thành công (HTTP 200 OK)! Đang mở phiên truyền hình ảnh PS5..."
-                                self.startRealChiakiSessionInitAndCtrl(ip: ip, registKey: regKey, rpKey: rpKey)
-                            } else {
-                                let reasonCode = self.extractHeader(from: headerStr, key: "RP-Application-Reason") ?? "HTTP 403"
-                                self.isConnectedToPS5 = false
-                                self.connectionState = .error(message: "PS5 từ chối (\(reasonCode))")
-                                self.statusLog = "❌ Máy PS5 (\(ip)) từ chối ghép đôi (Mã: \(reasonCode)). Hãy đảm bảo: (1) Đã lấy đúng Account ID 8-byte thật của '\(self.psnUsername)', và (2) Mã PIN 8 số trên TV còn hiệu lực."
+            func walk(_ node: Any) {
+                if let dict = node as? [String: Any] {
+                    for (rawKey, val) in dict {
+                        let key = rawKey.lowercased()
+                        if key == "onlineid" || key == "online_id" {
+                            if let s = val as? String, !s.isEmpty, foundOnlineID.isEmpty {
+                                foundOnlineID = s
                             }
                         }
-                    }
-                }))
-            case .failed(let err):
-                guard !didComplete else { return }
-                didComplete = true
-                DispatchQueue.main.async {
-                    self.isConnectedToPS5 = false
-                    self.connectionState = .error(message: err.localizedDescription)
-                    self.statusLog = "❌ Không kết nối được cổng 9295 của PS5 (\(ip)): \(err.localizedDescription)"
-                }
-            default:
-                break
-            }
-        }
-        tcpConn.start(queue: .global(qos: .userInteractive))
-    }
-
-    // Mở phiên điều khiển theo đúng quy trình 2 bước của Chiaki: /sie/ps5/rp/sess/init -> /sie/ps5/rp/sess/ctrl
-    private func startRealChiakiSessionInitAndCtrl(ip: String, registKey: String, rpKey: String) {
-        let host = NWEndpoint.Host(ip)
-        guard let port = NWEndpoint.Port(rawValue: ROIDefaultConfig.registAndCtrlPort) else { return }
-
-        let authBase64 = Data(registKey.utf8).base64EncodedString()
-        let initConn = NWConnection(host: host, port: port, using: .tcp)
-
-        initConn.stateUpdateHandler = { [weak self] state in
-            guard let self = self else { return }
-            if case .ready = state {
-                var initReq = "GET /sie/ps5/rp/sess/init HTTP/1.1\r\n"
-                initReq += "Host: \(ip):\(ROIDefaultConfig.registAndCtrlPort)\r\n"
-                initReq += "User-Agent: remoteplay Windows\r\n"
-                initReq += "Connection: close\r\n"
-                initReq += "RP-Auth: \(authBase64)\r\n"
-                initReq += "RP-Version: 1.0\r\n\r\n"
-
-                initConn.send(content: initReq.data(using: .utf8), completion: .contentProcessed({ _ in
-                    initConn.receive(minimumIncompleteLength: 1, maximumLength: 4096) { _, _, _, _ in
-                        initConn.cancel()
-                        DispatchQueue.main.async {
-                            self.openPersistentCtrlChannel(ip: ip, authBase64: authBase64)
-                        }
-                    }
-                }))
-            }
-        }
-        initConn.start(queue: .global(qos: .userInitiated))
-    }
-
-    private func openPersistentCtrlChannel(ip: String, authBase64: String) {
-        ctrlSessionTCPConn?.cancel()
-        let host = NWEndpoint.Host(ip)
-        guard let port = NWEndpoint.Port(rawValue: ROIDefaultConfig.registAndCtrlPort) else { return }
-
-        let conn = NWConnection(host: host, port: port, using: .tcp)
-        ctrlSessionTCPConn = conn
-
-        conn.stateUpdateHandler = { [weak self] state in
-            guard let self = self else { return }
-            if case .ready = state {
-                let didBase64 = Data(repeating: 0x01, count: 16).base64EncodedString()
-                var ctrlReq = "GET /sie/ps5/rp/sess/ctrl HTTP/1.1\r\n"
-                ctrlReq += "Host: \(ip):\(ROIDefaultConfig.registAndCtrlPort)\r\n"
-                ctrlReq += "User-Agent: remoteplay Windows\r\n"
-                ctrlReq += "Connection: keep-alive\r\n"
-                ctrlReq += "RP-Auth: \(authBase64)\r\n"
-                ctrlReq += "RP-Version: 1.0\r\n"
-                ctrlReq += "RP-Did: \(didBase64)\r\n"
-                ctrlReq += "RP-ControllerType: 3\r\n"
-                ctrlReq += "RP-ClientType: 11\r\n"
-                ctrlReq += "RP-OSType: Win10.0.0\r\n"
-                ctrlReq += "RP-ConPath: 1\r\n\r\n"
-
-                conn.send(content: ctrlReq.data(using: .utf8), completion: .contentProcessed({ _ in
-                    conn.receive(minimumIncompleteLength: 1, maximumLength: 4096) { data, _, _, _ in
-                        DispatchQueue.main.async {
-                            let resp = data != nil ? (String(data: data!, encoding: .utf8) ?? "") : ""
-                            if resp.contains("200 OK") || resp.contains("200 Ok") || resp.contains("RP-Server-") {
-                                self.isConnectedToPS5 = true
-                                self.isUsingTestSimulator = false
-                                let hostTitle = self.discoveredPS5Name.isEmpty ? "PS5 Console" : self.discoveredPS5Name
-                                self.connectionState = .connected(hostName: "\(hostTitle) (\(ip))")
-                                self.statusLog = "✅ Đã kết nối Remote Play với \(hostTitle) (\(ip))! Đang nhận luồng hình ảnh từ cổng UDP 9296..."
-                                self.openTakionVideoUDPStream(ip: ip)
-                            } else {
-                                self.isConnectedToPS5 = false
-                                self.connectionState = .error(message: "Phiên điều khiển bị từ chối")
-                                self.statusLog = "⚠️ PS5 từ chối mở phiên điều khiển. Vui lòng nhập mã PIN 8 chữ số mới trên TV để liên kết lại."
+                        if key == "accountid" || key == "account_id" || key == "user_id" || key == "userid" {
+                            if let num = parseUInt64AccountID(from: val), num > 1_000_000 {
+                                foundNumericID = num
                             }
                         }
+                        if key == "npid", let npIdStr = val as? String, foundNumericID == nil {
+                            if let decodedNp = extractAccountIDFromNpId(npIdStr) {
+                                foundNumericID = decodedNp
+                            }
+                        }
+                        walk(val)
                     }
-                }))
-            }
-        }
-        conn.start(queue: .global(qos: .userInitiated))
-    }
-
-    private func openTakionVideoUDPStream(ip: String) {
-        takionStreamConn?.cancel()
-        let host = NWEndpoint.Host(ip)
-        guard let port = NWEndpoint.Port(rawValue: ROIDefaultConfig.takionStreamPort) else { return }
-
-        let conn = NWConnection(host: host, port: port, using: .udp)
-        takionStreamConn = conn
-        let initTag = UInt32.random(in: 0x10000000...0xFFFFFFFE)
-
-        conn.stateUpdateHandler = { [weak self] state in
-            guard let self = self else { return }
-            if case .ready = state {
-                let initPacket = ChiakiEmbeddedCore.shared.buildTakionV12InitPacket(initTag: initTag)
-                conn.send(content: initPacket, completion: .contentProcessed({ _ in }))
-                self.receiveTakionVideoPackets()
-            }
-        }
-        conn.start(queue: .global(qos: .userInteractive))
-    }
-
-    private func receiveTakionVideoPackets() {
-        takionStreamConn?.receiveMessage { [weak self] data, _, _, error in
-            guard let self = self else { return }
-            if let data = data, !data.isEmpty {
-                DispatchQueue.main.async {
-                    self.receivedPacketsCount += 1
-                }
-                self.videoDecoder.feedTakionUDPPacket(data)
-            }
-            if error == nil && self.isConnectedToPS5 {
-                self.receiveTakionVideoPackets()
-            }
-        }
-    }
-
-    func disconnectPS5() {
-        rawRegistTCPConn?.cancel()
-        ctrlSessionTCPConn?.cancel()
-        takionStreamConn?.cancel()
-        udpDiscoveryConn?.cancel()
-        isConnectedToPS5 = false
-        isReceivingRealPS5Video = false
-        connectionState = .disconnected
-        statusLog = "Đã ngắt kết nối PS5."
-    }
-
-    // MARK: - 4. Luồng kết xuất màn hình
-    func startPS5RemoteStreamLoop() {
-        timer?.invalidate()
-        timer = Timer.scheduledTimer(withTimeInterval: 1.0 / 5.0, repeats: true) { [weak self] _ in
-            guard let self = self else { return }
-            if self.isReceivingRealPS5Video {
-                return
-            }
-            if let standbyImg = self.renderCleanStandbyCanvas() {
-                DispatchQueue.main.async {
-                    self.currentFullFrame = standbyImg
+                } else if let arr = node as? [Any] {
+                    for item in arr {
+                        walk(item)
+                    }
                 }
             }
+
+            walk(jsonObject)
+
+            guard let validNumeric = foundNumericID else { return nil }
+            var le = validNumeric.littleEndian
+            let base64ID = Data(bytes: &le, count: 8).base64EncodedString()
+            return (foundOnlineID, base64ID, String(validNumeric))
+        }
+
+        private static func parseUInt64AccountID(from value: Any) -> UInt64? {
+            if let num = value as? UInt64 {
+                return num
+            }
+            if let intVal = value as? Int64, intVal > 0 {
+                return UInt64(intVal)
+            }
+            if let intVal = value as? Int, intVal > 0 {
+                return UInt64(intVal)
+            }
+            if let nsNum = value as? NSNumber {
+                return nsNum.uint64Value
+            }
+            if let str = value as? String {
+                let trimmed = str.trimmingCharacters(in: .whitespacesAndNewlines)
+                if let u = UInt64(trimmed) {
+                    return u
+                }
+            }
+            return nil
+        }
+
+        private static func extractAccountIDFromNpId(_ npIdBase64: String) -> UInt64? {
+            guard let data = Data(base64Encoded: npIdBase64),
+                  let ascii = String(data: data, encoding: .ascii) else {
+                return nil
+            }
+            // Chuỗi npId giải mã thường chứa định dạng @b7.us... hoặc hex 16 ký tự của Account ID
+            let parts = ascii.components(separatedBy: CharacterSet.alphanumerics.inverted)
+            for part in parts where part.count == 16 {
+                if let hexVal = UInt64(part, radix: 16), hexVal > 1_000_000 {
+                    return hexVal
+                }
+            }
+            return nil
         }
     }
+}
 
-    private func renderCleanStandbyCanvas() -> CGImage? {
-        let size = CGSize(width: 1280, height: 720)
-        let renderer = UIGraphicsImageRenderer(size: size)
-        return renderer.image { context in
-            let ctx = context.cgContext
-            UIColor(red: 0.02, green: 0.05, blue: 0.12, alpha: 1.0).setFill()
-            ctx.fill(CGRect(origin: .zero, size: size))
-
-            UIColor(red: 0.0, green: 0.44, blue: 0.82, alpha: 0.22).setStroke()
-            let rect = UIBezierPath(roundedRect: CGRect(x: 60, y: 80, width: 1160, height: 560), cornerRadius: 18)
-            rect.lineWidth = 2.0
-            rect.stroke()
-        }.cgImage
+@main
+struct PS5TranslatorApp: App {
+    var body: some Scene {
+        WindowGroup {
+            MainTranslatorView()
+        }
     }
 }
