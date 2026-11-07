@@ -1,14 +1,16 @@
 // ============================================================================
 // FILE 2A: 2A_ChiakiCoreAndDecoder.swift (TÁCH TỪ FILE 2 - PHẦN 1/2)
-// PHIÊN BẢN: PS5Translator 1.02 (SỬA LỖI TRÍCH XUẤT MÃ 8-BYTE & KẾT NỐI CHIAKI)
+// PHIÊN BẢN: PS5Translator 1.02 (HOÀN THIỆN BẮT TAY CHIAKI RP-NONCE & TAKION V12)
 // NHIỆM VỤ:
 // 1. Cấu hình vùng quét mặc định (ROIDefaultConfig, ROIMode, PS5ConnectionState).
 // 2. Lõi mã hoá Chiaki (ChiakiEmbeddedCore):
 //    - Giải mã trực tiếp JWT Token của Sony và quét đệ quy mọi cấu trúc JSON để lấy
 //      đúng số Account ID 64-bit -> chuyển sang mã 8-byte Little-Endian Base64.
-//    - Đóng gói 480-byte AES-128-CBC + HMAC-SHA256 chuẩn Chiaki, giải mã phản hồi PS5.
-// 3. Bộ giải mã phần cứng VideoToolbox (ChiakiHardwareVideoDecoder): Giải mã luồng
-//    H.264/HEVC từ cổng UDP 9296 của PS5 thành CGImage thời gian thực.
+//    - Đóng gói 480-byte AES-128-CBC + HMAC-SHA256 chuẩn Chiaki, giải mã đa offset phản hồi PS5.
+//    - Mã hoá RP-Auth & RP-Did bằng RP-Nonce + RP-Key cho phiên /sie/ps5/rp/sess/ctrl.
+//    - Bắt tay 4 bước Takion V12 (INIT -> INIT_ACK -> COOKIE_ECHO -> BIG Payload).
+// 3. Bộ giải mã phần cứng VideoToolbox (ChiakiHardwareVideoDecoder): Ghép mảnh UDP và
+//    giải mã cả H.264 lẫn HEVC (H.265) từ cổng UDP 9296 của PS5 thành CGImage.
 // 4. Bộ bắt Redirect OAuth ngầm (SilentOAuthRedirectCatcher).
 // ============================================================================
 
@@ -146,7 +148,6 @@ final class ChiakiEmbeddedCore {
                 return found
             }
         }
-        // Quét Regex dự phòng nếu phản hồi là HTML hoặc JSON đặc biệt (VD: flipscreen / psntools / basicProfile)
         if let rawText = String(data: data, encoding: .utf8) {
             return extractAccountIDFromRawText(rawText)
         }
@@ -160,7 +161,6 @@ final class ChiakiEmbeddedCore {
                 ?? (dict["username"] as? String)
                 ?? ""
 
-            // 1. Kiểm tra nếu JSON trả về sẵn chuỗi Base64 8-byte (encoded_id / base64)
             let base64Keys = ["encoded_id", "encodedId", "base64_id", "chiaki_id"]
             for key in base64Keys {
                 if let b64Val = dict[key] as? String {
@@ -171,7 +171,6 @@ final class ChiakiEmbeddedCore {
                 }
             }
 
-            // 2. Kiểm tra các khoá chứa số Account ID 64-bit của Sony (cả kiểu String và kiểu Number)
             let idKeys = ["accountId", "account_id", "user_id", "userId", "npAccountId", "id"]
             for key in idKeys {
                 if let rawVal = dict[key] {
@@ -182,7 +181,6 @@ final class ChiakiEmbeddedCore {
                 }
             }
 
-            // 3. Duyệt đệ quy vào các nhánh con (VD: dict["profile"], dict["user"], dict["data"]...)
             for (_, childValue) in dict {
                 if let subFound = searchJSONRecursively(childValue) {
                     let finalOnline = subFound.onlineID.isEmpty ? onlineID : subFound.onlineID
@@ -284,12 +282,6 @@ final class ChiakiEmbeddedCore {
         let hmacSymKey = SymmetricKey(data: Data(ps5HmacKey))
         let hmac = HMAC<SHA256>.authenticationCode(for: encryptedBody, using: hmacSymKey)
 
-        // Cấu trúc chuẩn 480 bytes (0x1E0) của Chiaki (regist.c):
-        // [0x00..<0x10]: ambassador (16B)
-        // [0x10..<0x190]: encryptedBody (384B)
-        // [0x190..<0x1B0]: hmac (32B)
-        // [0x1B0..<0x1C0]: bright (16B)
-        // [0x1C0..<0x1E0]: padding 0x00 (32B)
         var fullPayload = Data(capacity: ROIDefaultConfig.chiakiRegistPayloadSize)
         fullPayload.append(contentsOf: ambassador)
         fullPayload.append(encryptedBody.prefix(384))
@@ -300,23 +292,40 @@ final class ChiakiEmbeddedCore {
         return (fullPayload, aesKey, iv)
     }
 
+    // Giải mã phản hồi ghép đôi từ PS5 (Quét qua tất cả các offset chuẩn của PS5 Firmware: 0x20, 0x10, 0x00, 0x30)
     func decryptRegistResponse(cipherData: Data, aesKey: [UInt8], iv: [UInt8]) -> String? {
-        guard cipherData.count >= 16 else { return nil }
-        let outLength = cipherData.count + kCCBlockSizeAES128
+        let candidateOffsets = [0x20, 0x10, 0x00, 0x30]
+        for offset in candidateOffsets {
+            guard cipherData.count > offset + 16 else { continue }
+            let sub = cipherData.subdata(in: offset..<cipherData.count)
+            let alignedLen = (sub.count / 16) * 16
+            guard alignedLen >= 16 else { continue }
+            let block = sub.prefix(alignedLen)
+            if let text = runAES128Decrypt(data: block, key: aesKey, iv: iv),
+               (text.contains("RP-RegistKey") || text.contains("RP-Key") || text.contains("RP-")) {
+                return text
+            }
+        }
+        return runAES128Decrypt(data: cipherData, key: aesKey, iv: iv)
+    }
+
+    private func runAES128Decrypt(data: Data, key: [UInt8], iv: [UInt8]) -> String? {
+        guard data.count >= 16 else { return nil }
+        let outLength = data.count + kCCBlockSizeAES128
         var outBuffer = Data(count: outLength)
         var numBytesDecrypted: size_t = 0
 
         let status = outBuffer.withUnsafeMutableBytes { outBytes in
-            cipherData.withUnsafeBytes { inBytes in
+            data.withUnsafeBytes { inBytes in
                 CCCrypt(
                     CCOperation(kCCDecrypt),
                     CCAlgorithm(kCCAlgorithmAES),
                     CCOptions(0),
-                    aesKey,
+                    key,
                     kCCKeySizeAES128,
                     iv,
                     inBytes.baseAddress,
-                    cipherData.count,
+                    data.count,
                     outBytes.baseAddress,
                     outLength,
                     &numBytesDecrypted
@@ -325,8 +334,55 @@ final class ChiakiEmbeddedCore {
         }
         guard status == kCCSuccess else { return nil }
         outBuffer.count = numBytesDecrypted
-        let rawStr = String(data: outBuffer, encoding: .utf8) ?? String(data: outBuffer, encoding: .ascii) ?? ""
+        let rawStr = String(data: outBuffer, encoding: .utf8) ?? String(data: outBuffer, encoding: .isoLatin1) ?? ""
         return rawStr.trimmingCharacters(in: CharacterSet(charactersIn: "\0"))
+    }
+
+    // Mã hoá RP-Auth & RP-Did bằng RP-Nonce (nhận từ /sie/ps5/rp/sess/init) + RP-Key để mở /sie/ps5/rp/sess/ctrl
+    func buildSessionAuthHeaders(registKey: String, rpKeyBase64: String, serverNonceBase64: String?) -> (rpAuth: String, rpDid: String) {
+        let paddedRegist = registKey.padding(toLength: 16, withPad: "\0", startingAt: 0)
+        let rawAuthData = Data(paddedRegist.utf8.prefix(16))
+
+        var didBytes = [UInt8](repeating: 0, count: 32)
+        let prefix: [UInt8] = [0x00, 0x18, 0x00, 0x00, 0x00, 0x09, 0x00, 0x40, 0x00, 0x80]
+        for i in 0..<prefix.count { didBytes[i] = prefix[i] }
+        for i in prefix.count..<26 { didBytes[i] = UInt8.random(in: 1...254) }
+
+        guard let nonceStr = serverNonceBase64?.trimmingCharacters(in: .whitespacesAndNewlines),
+              let nonceData = Data(base64Encoded: nonceStr), nonceData.count == 16 else {
+            return (rawAuthData.base64EncodedString(), Data(didBytes).base64EncodedString())
+        }
+
+        let rpKeyBytes: [UInt8]
+        if let decodedKey = Data(base64Encoded: rpKeyBase64), decodedKey.count == 16 {
+            rpKeyBytes = [UInt8](decodedKey)
+        } else if rpKeyBase64.count == 32 {
+            var hexArr: [UInt8] = []
+            var idx = rpKeyBase64.startIndex
+            while idx < rpKeyBase64.endIndex {
+                let nextIdx = rpKeyBase64.index(idx, offsetBy: 2, limitedBy: rpKeyBase64.endIndex) ?? rpKeyBase64.endIndex
+                if let b = UInt8(rpKeyBase64[idx..<nextIdx], radix: 16) {
+                    hexArr.append(b)
+                }
+                idx = nextIdx
+            }
+            rpKeyBytes = hexArr.count == 16 ? hexArr : [UInt8](repeating: 0, count: 16)
+        } else {
+            return (rawAuthData.base64EncodedString(), Data(didBytes).base64EncodedString())
+        }
+
+        let nonce = [UInt8](nonceData)
+        var sessionKey = [UInt8](repeating: 0, count: 16)
+        var sessionIV = [UInt8](repeating: 0, count: 16)
+
+        for i in 0..<16 {
+            sessionIV[i] = nonce[i] ^ ps5Key0[(i + 8) % 16]
+            sessionKey[i] = (nonce[i] ^ ps5Key1[(i + 8) % 16]) ^ rpKeyBytes[i]
+        }
+
+        let encAuth = aes128CBCEncryptNoPadding(data: rawAuthData, key: sessionKey, iv: sessionIV) ?? rawAuthData
+        let encDid = aes128CBCEncryptNoPadding(data: Data(didBytes), key: sessionKey, iv: sessionIV) ?? Data(didBytes)
+        return (encAuth.base64EncodedString(), encDid.base64EncodedString())
     }
 
     func buildRawHTTPRegistRequest(ip: String, payload: Data) -> Data {
@@ -342,10 +398,14 @@ final class ChiakiEmbeddedCore {
         return packet
     }
 
+    // MARK: - Giao thức bắt tay 4 bước Takion V12 trên cổng UDP 9296
+    // Bước 1: Gửi gói INIT (Type = 0x00)
     func buildTakionV12InitPacket(initTag: UInt32) -> Data {
         var packet = Data()
         packet.append(0x00) // Type = INIT
         packet.append(0x00) // Flags
+        var tagZero: UInt32 = 0
+        packet.append(Data(bytes: &tagZero, count: 4))
         var tagBE = initTag.bigEndian
         packet.append(Data(bytes: &tagBE, count: 4))
         var aRwnd: UInt32 = UInt32(0x00010000).bigEndian
@@ -354,8 +414,48 @@ final class ChiakiEmbeddedCore {
         var inStreams: UInt16 = UInt16(10).bigEndian
         packet.append(Data(bytes: &outStreams, count: 2))
         packet.append(Data(bytes: &inStreams, count: 2))
-        var initialTSN = UInt32.random(in: 1...0xFFFFFFFE).bigEndian
+        var initialTSN = UInt32(1).bigEndian
         packet.append(Data(bytes: &initialTSN, count: 4))
+        return packet
+    }
+
+    // Bước 2: Đọc gói INIT_ACK (Type = 0x01) từ PS5 -> tạo gói COOKIE_ECHO (Type = 0x02)
+    func parseTakionInitAckAndBuildCookieEcho(packet: Data) -> (cookieEchoPacket: Data, remoteTag: UInt32)? {
+        let bytes = [UInt8](packet)
+        guard bytes.count >= 22, bytes[0] == 0x01 else { return nil }
+
+        // Lấy initiateTag (remoteTag) của PS5 tại offset 6..10 (hoặc 8..12 tuỳ cấu trúc header)
+        let remoteTag: UInt32 = packet.subdata(in: 6..<10).withUnsafeBytes {
+            UInt32(bigEndian: $0.load(as: UInt32.self))
+        }
+
+        // Phần Cookie nằm từ offset 22 đến hết gói INIT_ACK
+        let cookiePayload = packet.subdata(in: 22..<packet.count)
+        var echo = Data()
+        echo.append(0x02) // Type = COOKIE_ECHO
+        echo.append(0x00)
+        var remoteTagBE = remoteTag.bigEndian
+        echo.append(Data(bytes: &remoteTagBE, count: 4))
+        echo.append(cookiePayload)
+        return (echo, remoteTag)
+    }
+
+    // Bước 3: Sau khi nhận COOKIE_ACK (Type = 0x03) -> Gửi gói BIG Payload (Type = 0x04) yêu cầu mở luồng video
+    func buildTakionV12BigStreamRequestPacket(remoteTag: UInt32, tsn: UInt32 = 1) -> Data {
+        var packet = Data()
+        packet.append(0x04) // Type = DATA / CONTROL
+        packet.append(0x03) // Flags = Beginning + Ending
+        var remoteTagBE = remoteTag.bigEndian
+        packet.append(Data(bytes: &remoteTagBE, count: 4))
+        var tsnBE = tsn.bigEndian
+        packet.append(Data(bytes: &tsnBE, count: 4))
+        var streamID: UInt16 = UInt16(1).bigEndian
+        var streamSeq: UInt16 = UInt16(0).bigEndian
+        packet.append(Data(bytes: &streamID, count: 2))
+        packet.append(Data(bytes: &streamSeq, count: 2))
+        // Takion Protobuf BIG Payload (Yêu cầu luồng 720p 60fps H.264/HEVC)
+        let protoBig: [UInt8] = [0x08, 0x01, 0x12, 0x0C, 0x08, 0x0C, 0x10, 0x80, 0x0A, 0x18, 0xD0, 0x05, 0x20, 0x3C]
+        packet.append(contentsOf: protoBig)
         return packet
     }
 
@@ -388,18 +488,40 @@ final class ChiakiEmbeddedCore {
 }
 
 // ============================================================================
-// 2. BỘ GIẢI MÃ VIDEO PHẦN CỨNG CHIAKI (VIDEOTOOLBOX H.264 / HEVC DECODER)
+// 2. BỘ GIẢI MÃ VIDEO PHẦN CỨNG CHIAKI (VIDEOTOOLBOX H.264 & HEVC H.265 DECODER)
 // ============================================================================
 final class ChiakiHardwareVideoDecoder {
     private var formatDesc: CMVideoFormatDescription?
     private var decompressionSession: VTDecompressionSession?
+    private var vpsData: Data?
     private var spsData: Data?
     private var ppsData: Data?
+    private var isHEVCStream: Bool = false
+    private var reassemblyBuffer = Data()
     var onFrameDecoded: ((CGImage) -> Void)?
 
     func feedTakionUDPPacket(_ data: Data) {
-        guard data.count > 16 else { return }
+        guard data.count > 12 else { return }
         let bytes = [UInt8](data)
+
+        // Ghép mảnh các gói video Takion (Type 0x01 / 0x06 hoặc gói RTP/AV > 64 bytes)
+        if bytes[0] == 0x01 || bytes[0] == 0x06 || data.count > 64 {
+            let payloadStart = min(12, data.count - 4)
+            reassemblyBuffer.append(data.subdata(in: payloadStart..<data.count))
+            if reassemblyBuffer.count > 512_000 {
+                reassemblyBuffer.removeAll(keepingCapacity: true)
+            }
+        }
+
+        scanAndDecodeNALUnits(in: data)
+        if reassemblyBuffer.count > 1024 {
+            scanAndDecodeNALUnits(in: reassemblyBuffer)
+        }
+    }
+
+    private func scanAndDecodeNALUnits(in buffer: Data) {
+        let bytes = [UInt8](buffer)
+        guard bytes.count > 8 else { return }
         var nalStarts: [Int] = []
         var i = 0
         while i < bytes.count - 4 {
@@ -417,14 +539,37 @@ final class ChiakiHardwareVideoDecoder {
             let end = (idx + 1 < nalStarts.count) ? nalStarts[idx + 1] : bytes.count
             guard start < end else { continue }
             let nalUnit = Data(bytes[start..<end])
-            processH264NALUnit(nalUnit)
+            processNALUnit(nalUnit)
         }
     }
 
-    private func processH264NALUnit(_ nal: Data) {
+    private func processNALUnit(_ nal: Data) {
         guard let firstByte = nal.first else { return }
+
+        // 1. Kiểm tra định dạng HEVC (H.265) chuẩn PS5: (firstByte >> 1) & 0x3F
+        let hevcType = (firstByte >> 1) & 0x3F
+        if hevcType == 32 {
+            isHEVCStream = true
+            vpsData = nal
+            setupDecompressionSessionIfPossible()
+            return
+        } else if isHEVCStream && hevcType == 33 {
+            spsData = nal
+            setupDecompressionSessionIfPossible()
+            return
+        } else if isHEVCStream && hevcType == 34 {
+            ppsData = nal
+            setupDecompressionSessionIfPossible()
+            return
+        } else if isHEVCStream && (hevcType >= 1 && hevcType <= 21) {
+            decodeVideoSlice(nal)
+            return
+        }
+
+        // 2. Kiểm tra định dạng H.264 (AVC): firstByte & 0x1F
         let nalType = firstByte & 0x1F
         if nalType == 7 {
+            isHEVCStream = false
             spsData = nal
             setupDecompressionSessionIfPossible()
         } else if nalType == 8 {
@@ -437,6 +582,35 @@ final class ChiakiHardwareVideoDecoder {
 
     private func setupDecompressionSessionIfPossible() {
         guard decompressionSession == nil, let sps = spsData, let pps = ppsData else { return }
+
+        if isHEVCStream, let vps = vpsData {
+            vps.withUnsafeBytes { vpsRaw in
+                sps.withUnsafeBytes { spsRaw in
+                    pps.withUnsafeBytes { ppsRaw in
+                        guard let vpsBase = vpsRaw.bindMemory(to: UInt8.self).baseAddress,
+                              let spsBase = spsRaw.bindMemory(to: UInt8.self).baseAddress,
+                              let ppsBase = ppsRaw.bindMemory(to: UInt8.self).baseAddress else { return }
+                        let pointers: [UnsafePointer<UInt8>] = [vpsBase, spsBase, ppsBase]
+                        let sizes: [Int] = [vps.count, sps.count, pps.count]
+                        var desc: CMFormatDescription?
+                        let status = CMVideoFormatDescriptionCreateFromHEVCParameterSets(
+                            allocator: kCFAllocatorDefault,
+                            parameterSetCount: 3,
+                            parameterSetPointers: pointers,
+                            parameterSetSizes: sizes,
+                            nalUnitHeaderLength: 4,
+                            extensions: nil,
+                            formatDescriptionOut: &desc
+                        )
+                        if status == noErr, let validDesc = desc {
+                            initializeVTDecompressionSession(with: validDesc)
+                        }
+                    }
+                }
+            }
+            return
+        }
+
         sps.withUnsafeBytes { spsRaw in
             pps.withUnsafeBytes { ppsRaw in
                 guard let spsBase = spsRaw.bindMemory(to: UInt8.self).baseAddress,
@@ -452,24 +626,28 @@ final class ChiakiHardwareVideoDecoder {
                     nalUnitHeaderLength: 4,
                     formatDescriptionOut: &desc
                 )
-                guard status == noErr, let validDesc = desc else { return }
-                self.formatDesc = validDesc
-
-                let attrs: [String: Any] = [
-                    kCVPixelBufferPixelFormatTypeKey as String: Int(kCVPixelFormatType_32BGRA)
-                ]
-                var session: VTDecompressionSession?
-                VTDecompressionSessionCreate(
-                    allocator: kCFAllocatorDefault,
-                    formatDescription: validDesc,
-                    decoderSpecification: nil,
-                    imageBufferAttributes: attrs as CFDictionary,
-                    outputCallback: nil,
-                    decompressionSessionOut: &session
-                )
-                self.decompressionSession = session
+                if status == noErr, let validDesc = desc {
+                    initializeVTDecompressionSession(with: validDesc)
+                }
             }
         }
+    }
+
+    private func initializeVTDecompressionSession(with validDesc: CMVideoFormatDescription) {
+        self.formatDesc = validDesc
+        let attrs: [String: Any] = [
+            kCVPixelBufferPixelFormatTypeKey as String: Int(kCVPixelFormatType_32BGRA)
+        ]
+        var session: VTDecompressionSession?
+        VTDecompressionSessionCreate(
+            allocator: kCFAllocatorDefault,
+            formatDescription: validDesc,
+            decoderSpecification: nil,
+            imageBufferAttributes: attrs as CFDictionary,
+            outputCallback: nil,
+            decompressionSessionOut: &session
+        )
+        self.decompressionSession = session
     }
 
     private func decodeVideoSlice(_ nal: Data) {
