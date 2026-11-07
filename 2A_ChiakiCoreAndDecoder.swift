@@ -1,10 +1,12 @@
 // ============================================================================
 // FILE 2A: 2A_ChiakiCoreAndDecoder.swift (TÁCH TỪ FILE 2 - PHẦN 1/2)
-// PHIÊN BẢN: PS5Translator 1.02
+// PHIÊN BẢN: PS5Translator 1.02 (SỬA LỖI TRÍCH XUẤT MÃ 8-BYTE & KẾT NỐI CHIAKI)
 // NHIỆM VỤ:
 // 1. Cấu hình vùng quét mặc định (ROIDefaultConfig, ROIMode, PS5ConnectionState).
-// 2. Lõi mã hoá Chiaki (ChiakiEmbeddedCore): Đóng gói 480-byte AES-128-CBC + HMAC-SHA256,
-//    giải mã phản hồi PS5 và tạo gói bắt tay Takion V12.
+// 2. Lõi mã hoá Chiaki (ChiakiEmbeddedCore):
+//    - Giải mã trực tiếp JWT Token của Sony và quét đệ quy mọi cấu trúc JSON để lấy
+//      đúng số Account ID 64-bit -> chuyển sang mã 8-byte Little-Endian Base64.
+//    - Đóng gói 480-byte AES-128-CBC + HMAC-SHA256 chuẩn Chiaki, giải mã phản hồi PS5.
 // 3. Bộ giải mã phần cứng VideoToolbox (ChiakiHardwareVideoDecoder): Giải mã luồng
 //    H.264/HEVC từ cổng UDP 9296 của PS5 thành CGImage thời gian thực.
 // 4. Bộ bắt Redirect OAuth ngầm (SilentOAuthRedirectCatcher).
@@ -52,7 +54,7 @@ enum PS5ConnectionState: Equatable {
 }
 
 // ============================================================================
-// 1. LÕI MÃ HOÁ CHIAKI RPCRYPT CHUẨN C-STRUCT (CHIAKI/LIB/SRC/RPCRYPT.C & REGIST.C)
+// 1. LÕI MÃ HOÁ CHIAKI RPCRYPT & TRÍCH XUẤT ĐA TẦNG ACCOUNT ID 8-BYTE
 // ============================================================================
 final class ChiakiEmbeddedCore {
     static let shared = ChiakiEmbeddedCore()
@@ -88,8 +90,13 @@ final class ChiakiEmbeddedCore {
         return false
     }
 
+    // Chuyển số Account ID 64-bit sang chuỗi Base64 8-byte Little-Endian chuẩn Chiaki
+    func convertUInt64ToBase64LittleEndian(_ numericID: UInt64) -> String {
+        var le = numericID.littleEndian
+        return Data(bytes: &le, count: 8).base64EncodedString()
+    }
+
     // Chuẩn hoá Account ID sang đúng 8-byte Little-Endian Base64 chuẩn Chiaki
-    // Không bao giờ tự sinh mã giả nếu chưa có ID thật
     func normalizeAccountIDTo8Bytes(input: String, fallbackUsername: String) -> (base64: String, numericString: String, isValidRealID: Bool) {
         let trimmed = input.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines)
         if isFakeGeneratedAccountID(trimmed, username: fallbackUsername) {
@@ -98,9 +105,7 @@ final class ChiakiEmbeddedCore {
 
         // 1. Nếu là dãy số 64-bit của Sony (10 - 20 chữ số)
         if trimmed.allSatisfy({ $0.isNumber }), let numericID = UInt64(trimmed), numericID > 1000000 {
-            var le = numericID.littleEndian
-            let data = Data(bytes: &le, count: 8)
-            return (data.base64EncodedString(), String(numericID), true)
+            return (convertUInt64ToBase64LittleEndian(numericID), String(numericID), true)
         }
 
         // 2. Nếu là chuỗi Base64 giải mã ra đúng 8 bytes thật
@@ -112,18 +117,131 @@ final class ChiakiEmbeddedCore {
             }
         }
 
-        // 3. Nếu là chuỗi Hex 16 ký tự (VD: từ script Chiaki trên PC)
+        // 3. Nếu là chuỗi Hex 16 ký tự (VD: từ PSNTools / script Chiaki)
         let cleanHex = trimmed.replacingOccurrences(of: "0x", with: "").replacingOccurrences(of: " ", with: "")
         if cleanHex.count == 16, let hexVal = UInt64(cleanHex, radix: 16), hexVal > 1000000 {
-            var le = hexVal.littleEndian
-            let data = Data(bytes: &le, count: 8)
-            return (data.base64EncodedString(), String(hexVal), true)
+            return (convertUInt64ToBase64LittleEndian(hexVal), String(hexVal), true)
         }
 
         return ("", "", false)
     }
 
-    // Đóng gói gói tin đăng ký 480 bytes (0x1E0) chuẩn xác theo chiaki_regist_request_payload_format
+    // MARK: - Giải mã trực tiếp JWT Token của Sony hoặc JSON bất kỳ để lấy Account ID 8-byte
+    func extractAccountIDFromJWT(_ jwtString: String) -> (onlineID: String, base64ID: String, numericID: String)? {
+        let segments = jwtString.components(separatedBy: ".")
+        guard segments.count >= 2 else { return nil }
+        var base64Payload = segments[1]
+            .replacingOccurrences(of: "-", with: "+")
+            .replacingOccurrences(of: "_", with: "/")
+        while base64Payload.count % 4 != 0 {
+            base64Payload.append("=")
+        }
+        guard let payloadData = Data(base64Encoded: base64Payload) else { return nil }
+        return extractAccountIDFromJSONData(payloadData)
+    }
+
+    func extractAccountIDFromJSONData(_ data: Data) -> (onlineID: String, base64ID: String, numericID: String)? {
+        if let jsonObj = try? JSONSerialization.jsonObject(with: data, options: [.fragmentsAllowed]) {
+            if let found = searchJSONRecursively(jsonObj) {
+                return found
+            }
+        }
+        // Quét Regex dự phòng nếu phản hồi là HTML hoặc JSON đặc biệt (VD: flipscreen / psntools / basicProfile)
+        if let rawText = String(data: data, encoding: .utf8) {
+            return extractAccountIDFromRawText(rawText)
+        }
+        return nil
+    }
+
+    private func searchJSONRecursively(_ obj: Any) -> (onlineID: String, base64ID: String, numericID: String)? {
+        if let dict = obj as? [String: Any] {
+            let onlineID = (dict["onlineId"] as? String)
+                ?? (dict["online_id"] as? String)
+                ?? (dict["username"] as? String)
+                ?? ""
+
+            // 1. Kiểm tra nếu JSON trả về sẵn chuỗi Base64 8-byte (encoded_id / base64)
+            let base64Keys = ["encoded_id", "encodedId", "base64_id", "chiaki_id"]
+            for key in base64Keys {
+                if let b64Val = dict[key] as? String {
+                    let norm = normalizeAccountIDTo8Bytes(input: b64Val, fallbackUsername: onlineID)
+                    if norm.isValidRealID {
+                        return (onlineID, norm.base64, norm.numericString)
+                    }
+                }
+            }
+
+            // 2. Kiểm tra các khoá chứa số Account ID 64-bit của Sony (cả kiểu String và kiểu Number)
+            let idKeys = ["accountId", "account_id", "user_id", "userId", "npAccountId", "id"]
+            for key in idKeys {
+                if let rawVal = dict[key] {
+                    if let num = parseValidPSNUInt64(rawVal) {
+                        let b64 = convertUInt64ToBase64LittleEndian(num)
+                        return (onlineID, b64, String(num))
+                    }
+                }
+            }
+
+            // 3. Duyệt đệ quy vào các nhánh con (VD: dict["profile"], dict["user"], dict["data"]...)
+            for (_, childValue) in dict {
+                if let subFound = searchJSONRecursively(childValue) {
+                    let finalOnline = subFound.onlineID.isEmpty ? onlineID : subFound.onlineID
+                    return (finalOnline, subFound.base64ID, subFound.numericID)
+                }
+            }
+        } else if let array = obj as? [Any] {
+            for item in array {
+                if let subFound = searchJSONRecursively(item) {
+                    return subFound
+                }
+            }
+        }
+        return nil
+    }
+
+    func extractAccountIDFromRawText(_ text: String) -> (onlineID: String, base64ID: String, numericID: String)? {
+        let patterns = [
+            "\"accountId\"\\s*:\\s*\"?(\\d{15,20})\"?",
+            "\"account_id\"\\s*:\\s*\"?(\\d{15,20})\"?",
+            "\"user_id\"\\s*:\\s*\"?(\\d{15,20})\"?",
+            "Account ID[^0-9]*(\\d{15,20})"
+        ]
+        for pattern in patterns {
+            if let regex = try? NSRegularExpression(pattern: pattern, options: .caseInsensitive),
+               let match = regex.firstMatch(in: text, options: [], range: NSRange(text.startIndex..., in: text)),
+               match.numberOfRanges > 1,
+               let range = Range(match.range(at: 1), in: text) {
+                let digits = String(text[range])
+                if let num = UInt64(digits), num > 1000000 {
+                    return ("", convertUInt64ToBase64LittleEndian(num), String(num))
+                }
+            }
+        }
+        return nil
+    }
+
+    private func parseValidPSNUInt64(_ raw: Any) -> UInt64? {
+        if let uintVal = raw as? UInt64, uintVal > 1000000 {
+            return uintVal
+        }
+        if let intVal = raw as? Int64, intVal > 1000000 {
+            return UInt64(intVal)
+        }
+        if let intVal = raw as? Int, intVal > 1000000 {
+            return UInt64(intVal)
+        }
+        if let numObj = raw as? NSNumber {
+            let uVal = numObj.uint64Value
+            if uVal > 1000000 { return uVal }
+        }
+        let str = String(describing: raw).trimmingCharacters(in: CharacterSet.whitespacesAndNewlines)
+        if !str.isEmpty, str.allSatisfy({ $0.isNumber }), let uVal = UInt64(str), uVal > 1000000 {
+            return uVal
+        }
+        return nil
+    }
+
+    // MARK: - Đóng gói gói tin đăng ký 480 bytes (0x1E0) chuẩn xác theo Chiaki
     func buildChiakiPS5RegistPayload480(pinString: String, accountIDBase64: String) -> (payload: Data, aesKey: [UInt8], iv: [UInt8]) {
         let pinNumber = UInt32(pinString) ?? 0
         let pinBytes: [UInt8] = [
@@ -150,17 +268,14 @@ final class ChiakiEmbeddedCore {
             aesKey[i] = nonce[i] ^ ps5Key1[(i + 8) % 16] ^ pinBytes[i % 4]
         }
 
-        // Khung dữ liệu nội bộ 384 bytes (0x180) lấp đầy bằng 'A' (0x41), ghi Header tại offset 0x38 (56 trong vùng 384B = 0x48 trong toàn bộ 480B)
-        var innerBuffer = [UInt8](repeating: 0x41, count: 384)
+        // Khung dữ liệu nội bộ 384 bytes (0x180) đệm 0x00, ghi Header tại offset 0x38 (56)
+        var innerBuffer = [UInt8](repeating: 0x00, count: 384)
         var innerHeaders = "Client-Type: \(ROIDefaultConfig.rpClientType)\r\n"
         innerHeaders += "Np-AccountId: \(accountIDBase64)\r\n\r\n"
         let headerBytes = Array(innerHeaders.utf8)
         let innerOffset = 56 // 0x48 (72) - 0x10 (16) = 56
         for i in 0..<min(headerBytes.count, 384 - innerOffset) {
             innerBuffer[innerOffset + i] = headerBytes[i]
-        }
-        if innerOffset + headerBytes.count < 384 {
-            innerBuffer[innerOffset + headerBytes.count] = 0x00
         }
 
         let plainData = Data(innerBuffer)
@@ -174,13 +289,13 @@ final class ChiakiEmbeddedCore {
         // [0x10..<0x190]: encryptedBody (384B)
         // [0x190..<0x1B0]: hmac (32B)
         // [0x1B0..<0x1C0]: bright (16B)
-        // [0x1C0..<0x1E0]: padding 'A' (32B)
+        // [0x1C0..<0x1E0]: padding 0x00 (32B)
         var fullPayload = Data(capacity: ROIDefaultConfig.chiakiRegistPayloadSize)
         fullPayload.append(contentsOf: ambassador)
         fullPayload.append(encryptedBody.prefix(384))
         fullPayload.append(contentsOf: hmac)
         fullPayload.append(contentsOf: bright)
-        fullPayload.append(contentsOf: [UInt8](repeating: 0x41, count: 32))
+        fullPayload.append(contentsOf: [UInt8](repeating: 0x00, count: 32))
 
         return (fullPayload, aesKey, iv)
     }
@@ -210,7 +325,8 @@ final class ChiakiEmbeddedCore {
         }
         guard status == kCCSuccess else { return nil }
         outBuffer.count = numBytesDecrypted
-        return String(data: outBuffer, encoding: .utf8) ?? String(data: outBuffer, encoding: .ascii)
+        let rawStr = String(data: outBuffer, encoding: .utf8) ?? String(data: outBuffer, encoding: .ascii) ?? ""
+        return rawStr.trimmingCharacters(in: CharacterSet(charactersIn: "\0"))
     }
 
     func buildRawHTTPRegistRequest(ip: String, payload: Data) -> Data {
@@ -422,7 +538,6 @@ final class ChiakiHardwareVideoDecoder {
     }
 }
 
-
 // Bộ bắt Redirect OAuth ngầm từ Cookie Sony đã đăng nhập
 final class SilentOAuthRedirectCatcher: NSObject, URLSessionTaskDelegate {
     private let onCodeCaptured: (String?) -> Void
@@ -440,7 +555,7 @@ final class SilentOAuthRedirectCatcher: NSObject, URLSessionTaskDelegate {
         completionHandler: @escaping (URLRequest?) -> Void
     ) {
         if let loc = request.url?.absoluteString,
-           (loc.contains("scecompcall://redirect") || loc.contains("remoteplay/redirect")),
+           (loc.contains("scecompcall://redirect") || loc.contains("remoteplay/redirect") || loc.contains("code=")),
            let comps = URLComponents(string: loc),
            let code = comps.queryItems?.first(where: { $0.name == "code" })?.value,
            !didFinish {
