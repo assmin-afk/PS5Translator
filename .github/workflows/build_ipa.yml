@@ -34,13 +34,18 @@ jobs:
           #endif
           EOF
 
-          # Trich xuat toan bo hang so static const + ham chiaki_regist_request_payload_format tu regist.c
+          # Chi trich xuat cac bien static const va ham chiaki_regist_request_payload_format (khong lay cac ham thread khac)
           python3 - << 'PYEOF'
+          import re
+
           with open("Sources/ChiakiNative/upstream/regist.c", "r", encoding="utf-8") as f:
               src = f.read()
 
           idx = src.find("chiaki_regist_request_payload_format")
           if idx != -1:
+              start = src.rfind("ChiakiErrorCode", 0, idx)
+              if start == -1:
+                  start = idx
               brace_open = src.find("{", idx)
               depth = 0
               end = brace_open
@@ -53,13 +58,10 @@ jobs:
                           end = i + 1
                           break
 
-              # Lay toan bo phan dau file regist.c (chua request_inner_online_id_fmt, request_inner_account_id_fmt, client_type...) den het ham
-              top_part = src[:end]
-              clean_lines = []
-              for line in top_part.splitlines():
-                  if line.strip().startswith("#include"):
-                      continue
-                  clean_lines.append(line)
+              func_code = src[start:end]
+              # Chi lay cac khai bao #define va static const nam truoc ham
+              defines = re.findall(r'^\s*#define\s+.*$', src[:start], flags=re.MULTILINE)
+              static_consts = re.findall(r'static\s+const\s+[\s\S]*?;', src[:start])
 
               with open("Sources/ChiakiNative/ChiakiRegistFormat.c", "w", encoding="utf-8") as out:
                   out.write('#include <chiaki/regist.h>\n')
@@ -69,11 +71,16 @@ jobs:
                   out.write('#include <openssl/hmac.h>\n')
                   out.write('#include <string.h>\n')
                   out.write('#include <stdio.h>\n\n')
-                  out.write("\n".join(clean_lines) + "\n")
-              print("Extracted constants + chiaki_regist_request_payload_format successfully!")
+                  for d in defines:
+                      out.write(d + "\n")
+                  out.write("\n")
+                  for sc in static_consts:
+                      out.write(sc + "\n\n")
+                  out.write(func_code + "\n")
+              print("Extracted static consts and chiaki_regist_request_payload_format cleanly!")
           PYEOF
 
-      - name: 3. Tao Shim OpenSSL Chuan Bit-Exact (CFB128/CBC/ECB) & Cau noi C-Bridge
+      - name: 3. Tao Shim OpenSSL Chuan Bit-Exact (CFB128/CBC/ECB) & Cau noi C-Bridge (9 tham so)
         run: |
           cat << 'EOF' > Sources/ChiakiNative/include/openssl/evp.h
           #ifndef CHIAKI_OPENSSL_EVP_SHIM_H
@@ -187,7 +194,6 @@ jobs:
               if (!tmp) return 0;
 
               if (ctx->mode == 2) {
-                  // Chuan OpenSSL CRYPTO_cfb128_encrypt (AES-128-CFB128 bit-exact)
                   for (int i = 0; i < inl; i++) {
                       if (ctx->num == 0) {
                           size_t moved = 0;
@@ -222,7 +228,6 @@ jobs:
                   if (outl) *outl = inl;
                   return 1;
               } else if (ctx->mode == 1) {
-                  // AES-128-ECB
                   size_t moved = 0;
                   CCCryptorStatus st = CCCrypt(
                       ctx->encrypt ? kCCEncrypt : kCCDecrypt,
@@ -246,7 +251,6 @@ jobs:
                   if (outl) *outl = (int)moved;
                   return 1;
               } else {
-                  // AES-128-CBC (Cap nhat IV lien tuc giua cac lan goi Update)
                   int blocks = inl / 16;
                   for (int b = 0; b < blocks; b++) {
                       const uint8_t *blk_in = in + (b * 16);
@@ -437,6 +441,45 @@ jobs:
               return CHIAKI_ERR_SUCCESS;
           }
 
+          static int decode_b64_account_id_8bytes(const char *b64_str, uint8_t out_bytes[8]) {
+              if (!b64_str) return -1;
+              static const int8_t b64_table[256] = {
+                  -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+                  -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+                  -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,62,-1,-1,-1,63,
+                  52,53,54,55,56,57,58,59,60,61,-1,-1,-1,-2,-1,-1,
+                  -1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9,10,11,12,13,14,
+                  15,16,17,18,19,20,21,22,23,24,25,-1,-1,-1,-1,-1,
+                  -1,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,
+                  41,42,43,44,45,46,47,48,49,50,51,-1,-1,-1,-1,-1,
+                  -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+                  -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+                  -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+                  -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+                  -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+                  -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+                  -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+                  -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1
+              };
+              uint32_t val = 0;
+              int valb = -8;
+              size_t out_idx = 0;
+              for (const unsigned char *p = (const unsigned char *)b64_str; *p; p++) {
+                  int8_t d = b64_table[*p];
+                  if (d == -1) continue;
+                  if (d == -2) break;
+                  val = (val << 6) + (uint32_t)d;
+                  valb += 6;
+                  if (valb >= 0) {
+                      if (out_idx < 8) {
+                          out_bytes[out_idx++] = (uint8_t)((val >> valb) & 0xFF);
+                      }
+                      valb -= 8;
+                  }
+              }
+              return (out_idx == 8) ? 0 : -1;
+          }
+
           int chiaki_bridge_build_ps5_regist_payload(
               const char *pin_str,
               const char *account_id_b64,
@@ -456,34 +499,25 @@ jobs:
               uint8_t ambassador[16];
               chiaki_random_bytes_crypt(ambassador, 16);
 
-              uint8_t decoded_aid[16] = {0};
-              size_t decoded_len = sizeof(decoded_aid);
-              if (chiaki_base64_decode(account_id_b64, strlen(account_id_b64) + 1, decoded_aid, &decoded_len) != CHIAKI_ERR_SUCCESS || decoded_len < 8) {
-                  decoded_len = sizeof(decoded_aid);
-                  if (chiaki_base64_decode(account_id_b64, strlen(account_id_b64), decoded_aid, &decoded_len) != CHIAKI_ERR_SUCCESS || decoded_len < 8) {
-                      return -2;
-                  }
+              uint8_t decoded_aid[8] = {0};
+              if (decode_b64_account_id_8bytes(account_id_b64, decoded_aid) != 0) {
+                  return -2;
               }
 
-              ChiakiRegistInfo info;
-              memset(&info, 0, sizeof(info));
-              info.psn_online_id = "Maivy1125";
-              memcpy(info.psn_account_id, decoded_aid, 8);
-              info.pin = pin;
-
-              ChiakiLog dummy_log;
-              memset(&dummy_log, 0, sizeof(dummy_log));
               memset(&g_last_rpcrypt, 0, sizeof(g_last_rpcrypt));
-
               size_t buf_size = 1024;
+
+              // Goi dung 9 tham so theo khai bao trong include/chiaki/regist.h dong 96
               ChiakiErrorCode err = chiaki_regist_request_payload_format(
-                  &dummy_log,
                   CHIAKI_TARGET_PS5_1,
                   ambassador,
                   out_payload,
                   &buf_size,
                   &g_last_rpcrypt,
-                  &info
+                  "Maivy1125",
+                  decoded_aid,
+                  pin,
+                  NULL
               );
               if (err != CHIAKI_ERR_SUCCESS) {
                   return -3;
@@ -722,6 +756,7 @@ jobs:
                     - "-Wno-implicit-function-declaration"
                     - "-Wno-strict-prototypes"
                     - "-Wno-documentation"
+                    - "-Wno-unused-function"
                   CODE_SIGN_IDENTITY: ""
                   CODE_SIGNING_REQUIRED: NO
                   CODE_SIGNING_ALLOWED: NO
