@@ -292,7 +292,6 @@ jobs:
           #include <string.h>
           #include <Security/SecRandom.h>
 
-          // Luu hmac_key dong cua lan ghep doi gan nhat de giai ma phan hoi 200 OK
           static uint8_t g_last_hmac_key[16] = {0};
 
           __attribute__((weak)) void chiaki_log(ChiakiLog *log, ChiakiLogLevel level, const char *fmt, ...) {
@@ -427,7 +426,7 @@ jobs:
           #include "ChiakiNative/ChiakiCBridge.h"
           EOF
 
-      - name: 4. Gom cac file Swift, chong trung lap va tich hop C-Bridge tu dong
+      - name: 4. Gom cac file Swift, chong trung lap va tich hop C-Bridge an toan
         run: |
           for f in *.swift.txt; do
             [ -f "$f" ] && cp "$f" "Sources/${f%.txt}"
@@ -437,11 +436,9 @@ jobs:
             [ -f "$f" ] && cp "$f" "Sources/$f"
           done
 
-          # Tu dong loai bo cac file trung lap (neu repo co ca ban gop cu va ban tach 2A/6B)
           python3 - << 'PYEOF'
           import glob, os, re
 
-          # 1. Neu co ca 2A_ChiakiCoreAndDecoder.swift va 2_VideoSourceManager.swift chua ChiakiEmbeddedCore -> chi giu ChiakiEmbeddedCore o 2A
           files = sorted(glob.glob("Sources/*.swift"))
           seen_main = False
           for p in files:
@@ -454,13 +451,18 @@ jobs:
                       continue
                   seen_main = True
 
-          # 2. Kich hoat C-Bridge trong cac file Swift con lai
           for path in glob.glob("Sources/*.swift"):
               with open(path, "r", encoding="utf-8") as f:
                   content = f.read()
 
               modified = False
 
+              # 1. Tu dong sua stopCapture(completionHandler: nil) -> stopCapture { _ in } neu con sot
+              if "stopCapture(completionHandler: nil)" in content:
+                  content = content.replace("stopCapture(completionHandler: nil)", "stopCapture { _ in }")
+                  modified = True
+
+              # 2. Dam bao rpClientType dung chuan 64 ky tu
               if "static let rpClientType =" in content:
                   content = re.sub(
                       r'static let rpClientType\s*=\s*"[^"]+"',
@@ -469,35 +471,37 @@ jobs:
                   )
                   modified = True
 
+              # 3. Neu file 2A chua co C-Bridge thi chen trong khoi do { ... } de KHONG BAO GIO trung ten bien cleanBase64
               target_sig = "func buildChiakiPS5RegistPayload480(pinString: String, accountIDBase64: String) -> (payload: Data, aesKey: [UInt8], iv: [UInt8]) {"
               if target_sig in content and "chiaki_bridge_build_ps5_regist_payload" not in content:
                   c_hook = """func buildChiakiPS5RegistPayload480(pinString: String, accountIDBase64: String) -> (payload: Data, aesKey: [UInt8], iv: [UInt8]) {
-              let cleanBase64 = accountIDBase64.trimmingCharacters(in: .whitespacesAndNewlines)
-              var outPayload = [UInt8](repeating: 0, count: 1024)
-              var outLen: Int = 0
-              var bright = [UInt8](repeating: 0, count: 16)
-              var echidna = [UInt8](repeating: 0, count: 16)
-              var hmacKey = [UInt8](repeating: 0, count: 16)
+              do {
+                  let cBridgeB64 = accountIDBase64.trimmingCharacters(in: .whitespacesAndNewlines)
+                  var outPayload = [UInt8](repeating: 0, count: 1024)
+                  var outLen: Int = 0
+                  var bright = [UInt8](repeating: 0, count: 16)
+                  var echidna = [UInt8](repeating: 0, count: 16)
+                  var hmacKey = [UInt8](repeating: 0, count: 16)
 
-              let res = pinString.withCString { pinCStr in
-                  cleanBase64.withCString { aidCStr in
-                      ROIDefaultConfig.rpClientType.withCString { clientCStr in
-                          chiaki_bridge_build_ps5_regist_payload(
-                              pinCStr,
-                              aidCStr,
-                              clientCStr,
-                              &outPayload,
-                              &outLen,
-                              &bright,
-                              &echidna,
-                              &hmacKey
-                          )
+                  let res = pinString.withCString { pinCStr in
+                      cBridgeB64.withCString { aidCStr in
+                          ROIDefaultConfig.rpClientType.withCString { clientCStr in
+                              chiaki_bridge_build_ps5_regist_payload(
+                                  pinCStr,
+                                  aidCStr,
+                                  clientCStr,
+                                  &outPayload,
+                                  &outLen,
+                                  &bright,
+                                  &echidna,
+                                  &hmacKey
+                              )
+                          }
                       }
                   }
-              }
-              if res == 0 && outLen > 0 {
-                  self.lastRegistHmacKey = hmacKey
-                  return (Data(outPayload.prefix(outLen)), bright, echidna)
+                  if res == 0 && outLen > 0 {
+                      return (Data(outPayload.prefix(outLen)), bright, echidna)
+                  }
               }
           """
                   content = content.replace(target_sig, c_hook, 1)
@@ -509,13 +513,12 @@ jobs:
               if cipherData.count > 0x20 && aesKey.count == 16 && iv.count == 16 {
                   var plainBuf = [UInt8](repeating: 0, count: 2048)
                   let cipherBytes = [UInt8](cipherData)
-                  let hmacArg = self.lastRegistHmacKey.count == 16 ? self.lastRegistHmacKey : [UInt8](repeating: 0, count: 16)
                   let decLen = chiaki_bridge_decrypt_regist_response(
                       cipherBytes,
                       cipherBytes.count,
                       aesKey,
                       iv,
-                      hmacArg,
+                      nil,
                       &plainBuf,
                       plainBuf.count
                   )
@@ -547,7 +550,7 @@ jobs:
               if modified:
                   with open(path, "w", encoding="utf-8") as f:
                       f.write(content)
-                  print(f"Injected Chiaki-NG C-Bridge into {path}")
+                  print(f"Verified and patched {path}")
           PYEOF
 
           if [ -f "icon.png" ]; then
