@@ -318,6 +318,7 @@ jobs:
           #include "ChiakiCBridge.h"
           #include <chiaki/rpcrypt.h>
           #include <chiaki/log.h>
+          #include <CommonCrypto/CommonHMAC.h>
           #include <stdlib.h>
           #include <stdio.h>
           #include <string.h>
@@ -325,6 +326,12 @@ jobs:
 
           static ChiakiRPCrypt g_last_rpcrypt;
           static int g_has_last_rpcrypt = 0;
+
+          // Khoa HMAC PS5 chuan tu regist.c cua chiaki-ng
+          static const uint8_t g_ps5_regist_hmac_key[16] = {
+              0x62, 0x47, 0x9c, 0x30, 0x37, 0x65, 0x4e, 0x26,
+              0x86, 0x0f, 0x9d, 0x2f, 0x5c, 0x70, 0x10, 0x3c
+          };
 
           __attribute__((weak)) void chiaki_log(ChiakiLog *log, ChiakiLogLevel level, const char *fmt, ...) {
               (void)log; (void)level; (void)fmt;
@@ -355,8 +362,9 @@ jobs:
                   for (int i = 0; i < 16; i++) ambassador[i] = (uint8_t)(arc4random() & 0xFF);
               }
 
+              // Khi khung Preface 0x1E0 dien bang 'A' (0x41), offset key_0_off trong regist.c cua chiaki-ng la 0x109
               memset(&g_last_rpcrypt, 0, sizeof(g_last_rpcrypt));
-              ChiakiErrorCode err = chiaki_rpcrypt_init_regist(&g_last_rpcrypt, CHIAKI_TARGET_PS5_1, ambassador, 0, pin);
+              ChiakiErrorCode err = chiaki_rpcrypt_init_regist(&g_last_rpcrypt, CHIAKI_TARGET_PS5_1, ambassador, 0x109, pin);
               if (err != CHIAKI_ERR_SUCCESS) {
                   return -2;
               }
@@ -364,7 +372,7 @@ jobs:
 
               memcpy(out_bright, g_last_rpcrypt.bright, 16);
               memcpy(out_echidna, ambassador, 16);
-              memset(out_hmac_key, 0, 16);
+              memcpy(out_hmac_key, g_ps5_regist_hmac_key, 16);
 
               memset(out_payload, 0x41, 0x1E0);
               memcpy(out_payload + 0x7B, ambassador, 8);
@@ -382,7 +390,15 @@ jobs:
                   return -3;
               }
 
-              chiaki_rpcrypt_hmac(&g_last_rpcrypt, out_payload + 0x1C0, (const uint8_t *)record_buf, (size_t)record_len);
+              // Tinh HMAC-SHA256 truc tiep bang Apple CommonCrypto CCHmac (khong goi _chiaki_rpcrypt_hmac)
+              CCHmac(
+                  kCCHmacAlgSHA256,
+                  g_ps5_regist_hmac_key,
+                  16,
+                  record_buf,
+                  (size_t)record_len,
+                  out_payload + 0x1C0
+              );
 
               err = chiaki_rpcrypt_encrypt(
                   &g_last_rpcrypt,
