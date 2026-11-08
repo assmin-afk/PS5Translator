@@ -12,7 +12,7 @@ jobs:
       - name: 1. Tai code du an va icon.png ve may chu Mac
         uses: actions/checkout@v4
 
-      - name: 2. Tai thu vien C goc cua chiaki-ng (rpcrypt.c, regist.c, takion.c)
+      - name: 2. Tai thu vien C goc cua chiaki-ng (rpcrypt.c, regist.c, base64.c)
         run: |
           git clone --depth 1 https://github.com/streetpea/chiaki-ng.git chiaki_upstream || \
           git clone --depth 1 https://git.sr.ht/~thestr4ng3r/chiaki chiaki_upstream
@@ -22,9 +22,9 @@ jobs:
           mkdir -p Sources/ChiakiNative/upstream
 
           cp chiaki_upstream/lib/src/rpcrypt.c Sources/ChiakiNative/rpcrypt.c
-          cp chiaki_upstream/lib/src/regist.c Sources/ChiakiNative/upstream/regist.c || true
-          cp chiaki_upstream/lib/src/takion.c Sources/ChiakiNative/upstream/takion.c || true
-          cp -R chiaki_upstream/lib/include/chiaki/* Sources/ChiakiNative/include/chiaki/ || true
+          cp chiaki_upstream/lib/src/base64.c Sources/ChiakiNative/base64.c
+          cp chiaki_upstream/lib/src/regist.c Sources/ChiakiNative/upstream/regist.c
+          cp -R chiaki_upstream/lib/include/chiaki/* Sources/ChiakiNative/include/chiaki/
 
           cat << 'EOF' > Sources/ChiakiNative/include/chiaki_export.h
           #ifndef CHIAKI_EXPORT_H
@@ -34,7 +34,42 @@ jobs:
           #endif
           EOF
 
-      - name: 3. Tao Shim OpenSSL -> Apple CommonCrypto (CBC + ECB + CFB128) & Cau noi C-Bridge
+          # Trich xuat nguyen ban ham chiaki_regist_request_payload_format tu regist.c cua chiaki-ng
+          python3 - << 'PYEOF'
+          with open("Sources/ChiakiNative/upstream/regist.c", "r", encoding="utf-8") as f:
+              src = f.read()
+
+          idx = src.find("chiaki_regist_request_payload_format")
+          if idx != -1:
+              start = src.rfind("ChiakiErrorCode", 0, idx)
+              if start == -1:
+                  start = idx
+              brace_open = src.find("{", idx)
+              depth = 0
+              end = brace_open
+              for i in range(brace_open, len(src)):
+                  if src[i] == "{":
+                      depth += 1
+                  elif src[i] == "}":
+                      depth -= 1
+                      if depth == 0:
+                          end = i + 1
+                          break
+              func_code = src[start:end]
+              with open("Sources/ChiakiNative/ChiakiRegistFormat.c", "w", encoding="utf-8") as out:
+                  out.write('#include <chiaki/regist.h>\n')
+                  out.write('#include <chiaki/rpcrypt.h>\n')
+                  out.write('#include <chiaki/base64.h>\n')
+                  out.write('#include <chiaki/log.h>\n')
+                  out.write('#include <openssl/hmac.h>\n')
+                  out.write('#include <string.h>\n')
+                  out.write('#include <stdio.h>\n\n')
+                  out.write(func_code + "\n")
+              print("Extracted chiaki_regist_request_payload_format successfully:")
+              print(func_code)
+          PYEOF
+
+      - name: 3. Tao Shim OpenSSL Chuan Bit-Exact (CFB128/CBC/ECB) & Cau noi C-Bridge
         run: |
           cat << 'EOF' > Sources/ChiakiNative/include/openssl/evp.h
           #ifndef CHIAKI_OPENSSL_EVP_SHIM_H
@@ -47,16 +82,15 @@ jobs:
           #include <CommonCrypto/CommonDigest.h>
 
           typedef struct {
-              int mode; // 0 = AES-128-CBC, 1 = AES-128-ECB, 2 = AES-128-CFB128
+              int mode; // 0 = CBC, 1 = ECB, 2 = CFB128
           } EVP_CIPHER;
 
           typedef struct {
-              CCCryptorRef cryptor;
               int mode;
-              CCOperation op;
+              int encrypt;
               uint8_t key[16];
               uint8_t iv[16];
-              int has_key;
+              int num;
           } EVP_CIPHER_CTX;
 
           static inline const EVP_CIPHER *EVP_aes_128_cbc(void) {
@@ -87,64 +121,23 @@ jobs:
           }
 
           static inline void EVP_CIPHER_CTX_free(EVP_CIPHER_CTX *ctx) {
-              if (!ctx) return;
-              if (ctx->cryptor) {
-                  CCCryptorRelease(ctx->cryptor);
-                  ctx->cryptor = NULL;
-              }
-              free(ctx);
+              if (ctx) free(ctx);
           }
 
           static inline int EVP_CIPHER_CTX_init_common(
               EVP_CIPHER_CTX *ctx,
-              CCOperation op,
+              int encrypt,
               const EVP_CIPHER *cipher,
               const unsigned char *key,
               const unsigned char *iv
           ) {
               if (!ctx) return 0;
-              if (ctx->cryptor) {
-                  CCCryptorRelease(ctx->cryptor);
-                  ctx->cryptor = NULL;
-              }
               if (cipher) ctx->mode = cipher->mode;
-              ctx->op = op;
-              if (key) {
-                  memcpy(ctx->key, key, 16);
-                  ctx->has_key = 1;
-              }
-              if (iv) {
-                  memcpy(ctx->iv, iv, 16);
-              } else if (!key) {
-                  memset(ctx->iv, 0, 16);
-              }
-
-              if (!ctx->has_key) {
-                  return 1;
-              }
-
-              CCMode cc_mode = kCCModeCBC;
-              if (ctx->mode == 1) {
-                  cc_mode = kCCModeECB;
-              } else if (ctx->mode == 2) {
-                  cc_mode = kCCModeCFB;
-              }
-
-              CCCryptorStatus st = CCCryptorCreateWithMode(
-                  op,
-                  cc_mode,
-                  kCCAlgorithmAES,
-                  ccNoPadding,
-                  (ctx->mode == 1) ? NULL : ctx->iv,
-                  ctx->key,
-                  kCCKeySizeAES128,
-                  NULL,
-                  0,
-                  0,
-                  0,
-                  &ctx->cryptor
-              );
-              return (st == kCCSuccess) ? 1 : 0;
+              ctx->encrypt = encrypt;
+              if (key) memcpy(ctx->key, key, 16);
+              if (iv) memcpy(ctx->iv, iv, 16);
+              ctx->num = 0;
+              return 1;
           }
 
           static inline int EVP_EncryptInit_ex(
@@ -155,7 +148,7 @@ jobs:
               const unsigned char *iv
           ) {
               (void)impl;
-              return EVP_CIPHER_CTX_init_common(ctx, kCCEncrypt, cipher, key, iv);
+              return EVP_CIPHER_CTX_init_common(ctx, 1, cipher, key, iv);
           }
 
           static inline int EVP_DecryptInit_ex(
@@ -166,12 +159,112 @@ jobs:
               const unsigned char *iv
           ) {
               (void)impl;
-              return EVP_CIPHER_CTX_init_common(ctx, kCCDecrypt, cipher, key, iv);
+              return EVP_CIPHER_CTX_init_common(ctx, 0, cipher, key, iv);
           }
 
           static inline int EVP_CIPHER_CTX_set_padding(EVP_CIPHER_CTX *ctx, int pad) {
               (void)ctx; (void)pad;
               return 1;
+          }
+
+          static inline int EVP_CipherUpdate_Internal(
+              EVP_CIPHER_CTX *ctx,
+              unsigned char *out,
+              int *outl,
+              const unsigned char *in,
+              int inl
+          ) {
+              if (!ctx || inl <= 0) {
+                  if (outl) *outl = 0;
+                  return 1;
+              }
+
+              uint8_t *tmp = (uint8_t *)malloc((size_t)inl + 16);
+              if (!tmp) return 0;
+
+              if (ctx->mode == 2) {
+                  // Chuan OpenSSL CRYPTO_cfb128_encrypt (AES-128-CFB128 bit-exact)
+                  for (int i = 0; i < inl; i++) {
+                      if (ctx->num == 0) {
+                          size_t moved = 0;
+                          CCCrypt(
+                              kCCEncrypt,
+                              kCCAlgorithmAES,
+                              kCCOptionECBMode,
+                              ctx->key,
+                              16,
+                              NULL,
+                              ctx->iv,
+                              16,
+                              ctx->iv,
+                              16,
+                              &moved
+                          );
+                      }
+                      if (ctx->encrypt) {
+                          uint8_t c = in[i] ^ ctx->iv[ctx->num];
+                          ctx->iv[ctx->num] = c;
+                          tmp[i] = c;
+                      } else {
+                          uint8_t cc = in[i];
+                          uint8_t v = ctx->iv[ctx->num];
+                          ctx->iv[ctx->num] = cc;
+                          tmp[i] = cc ^ v;
+                      }
+                      ctx->num = (ctx->num + 1) & 0x0F;
+                  }
+                  memcpy(out, tmp, (size_t)inl);
+                  free(tmp);
+                  if (outl) *outl = inl;
+                  return 1;
+              } else if (ctx->mode == 1) {
+                  // AES-128-ECB
+                  size_t moved = 0;
+                  CCCryptorStatus st = CCCrypt(
+                      ctx->encrypt ? kCCEncrypt : kCCDecrypt,
+                      kCCAlgorithmAES,
+                      kCCOptionECBMode,
+                      ctx->key,
+                      16,
+                      NULL,
+                      in,
+                      (size_t)inl,
+                      tmp,
+                      (size_t)inl + 16,
+                      &moved
+                  );
+                  if (st != kCCSuccess) {
+                      free(tmp);
+                      return 0;
+                  }
+                  memcpy(out, tmp, moved);
+                  free(tmp);
+                  if (outl) *outl = (int)moved;
+                  return 1;
+              } else {
+                  // AES-128-CBC (Cap nhat IV lien tuc giua cac lan goi Update)
+                  int blocks = inl / 16;
+                  for (int b = 0; b < blocks; b++) {
+                      const uint8_t *blk_in = in + (b * 16);
+                      uint8_t *blk_out = tmp + (b * 16);
+                      size_t moved = 0;
+                      if (ctx->encrypt) {
+                          uint8_t xored[16];
+                          for (int j = 0; j < 16; j++) xored[j] = blk_in[j] ^ ctx->iv[j];
+                          CCCrypt(kCCEncrypt, kCCAlgorithmAES, kCCOptionECBMode, ctx->key, 16, NULL, xored, 16, blk_out, 16, &moved);
+                          memcpy(ctx->iv, blk_out, 16);
+                      } else {
+                          uint8_t dec[16];
+                          CCCrypt(kCCDecrypt, kCCAlgorithmAES, kCCOptionECBMode, ctx->key, 16, NULL, blk_in, 16, dec, 16, &moved);
+                          for (int j = 0; j < 16; j++) blk_out[j] = dec[j] ^ ctx->iv[j];
+                          memcpy(ctx->iv, blk_in, 16);
+                      }
+                  }
+                  memcpy(out, tmp, (size_t)(blocks * 16));
+                  free(tmp);
+                  if (outl) *outl = blocks * 16;
+                  return 1;
+              }
           }
 
           static inline int EVP_EncryptUpdate(
@@ -181,11 +274,7 @@ jobs:
               const unsigned char *in,
               int inl
           ) {
-              if (!ctx || !ctx->cryptor) return 0;
-              size_t moved = 0;
-              CCCryptorStatus st = CCCryptorUpdate(ctx->cryptor, in, (size_t)inl, out, (size_t)inl + 16, &moved);
-              if (outl) *outl = (int)moved;
-              return (st == kCCSuccess) ? 1 : 0;
+              return EVP_CipherUpdate_Internal(ctx, out, outl, in, inl);
           }
 
           static inline int EVP_DecryptUpdate(
@@ -195,11 +284,7 @@ jobs:
               const unsigned char *in,
               int inl
           ) {
-              if (!ctx || !ctx->cryptor) return 0;
-              size_t moved = 0;
-              CCCryptorStatus st = CCCryptorUpdate(ctx->cryptor, in, (size_t)inl, out, (size_t)inl + 16, &moved);
-              if (outl) *outl = (int)moved;
-              return (st == kCCSuccess) ? 1 : 0;
+              return EVP_CipherUpdate_Internal(ctx, out, outl, in, inl);
           }
 
           static inline int EVP_EncryptFinal_ex(EVP_CIPHER_CTX *ctx, unsigned char *outm, int *outl) {
@@ -316,7 +401,9 @@ jobs:
 
           cat << 'EOF' > Sources/ChiakiNative/ChiakiCBridge.c
           #include "ChiakiCBridge.h"
+          #include <chiaki/regist.h>
           #include <chiaki/rpcrypt.h>
+          #include <chiaki/base64.h>
           #include <chiaki/log.h>
           #include <CommonCrypto/CommonHMAC.h>
           #include <stdlib.h>
@@ -327,12 +414,6 @@ jobs:
           static ChiakiRPCrypt g_last_rpcrypt;
           static int g_has_last_rpcrypt = 0;
 
-          // Khoa HMAC PS5 chuan tu regist.c cua chiaki-ng
-          static const uint8_t g_ps5_regist_hmac_key[16] = {
-              0x62, 0x47, 0x9c, 0x30, 0x37, 0x65, 0x4e, 0x26,
-              0x86, 0x0f, 0x9d, 0x2f, 0x5c, 0x70, 0x10, 0x3c
-          };
-
           __attribute__((weak)) void chiaki_log(ChiakiLog *log, ChiakiLogLevel level, const char *fmt, ...) {
               (void)log; (void)level; (void)fmt;
           }
@@ -340,6 +421,16 @@ jobs:
           __attribute__((weak)) const char *chiaki_error_string(ChiakiErrorCode code) {
               (void)code;
               return "chiaki_err";
+          }
+
+          __attribute__((weak)) ChiakiErrorCode chiaki_random_bytes_crypt(uint8_t *buf, size_t buf_size) {
+              if (SecRandomCopyBytes(kSecRandomDefault, buf_size, buf) == errSecSuccess) {
+                  return CHIAKI_ERR_SUCCESS;
+              }
+              for (size_t i = 0; i < buf_size; i++) {
+                  buf[i] = (uint8_t)(arc4random() & 0xFF);
+              }
+              return CHIAKI_ERR_SUCCESS;
           }
 
           int chiaki_bridge_build_ps5_regist_payload(
@@ -352,66 +443,51 @@ jobs:
               uint8_t out_echidna[16],
               uint8_t out_hmac_key[16]
           ) {
-              if (!pin_str || !account_id_b64 || !client_type_str || !out_payload || !out_len) {
+              (void)client_type_str;
+              if (!pin_str || !account_id_b64 || !out_payload || !out_len) {
                   return -1;
               }
 
               uint32_t pin = (uint32_t)strtoul(pin_str, NULL, 10);
               uint8_t ambassador[16];
-              if (SecRandomCopyBytes(kSecRandomDefault, 16, ambassador) != errSecSuccess) {
-                  for (int i = 0; i < 16; i++) ambassador[i] = (uint8_t)(arc4random() & 0xFF);
-              }
+              chiaki_random_bytes_crypt(ambassador, 16);
 
-              // Khi khung Preface 0x1E0 dien bang 'A' (0x41), offset key_0_off trong regist.c cua chiaki-ng la 0x109
-              memset(&g_last_rpcrypt, 0, sizeof(g_last_rpcrypt));
-              ChiakiErrorCode err = chiaki_rpcrypt_init_regist(&g_last_rpcrypt, CHIAKI_TARGET_PS5_1, ambassador, 0x109, pin);
-              if (err != CHIAKI_ERR_SUCCESS) {
+              uint8_t decoded_aid[16] = {0};
+              size_t decoded_len = sizeof(decoded_aid);
+              if (chiaki_base64_decode(account_id_b64, strlen(account_id_b64), decoded_aid, &decoded_len) != CHIAKI_ERR_SUCCESS || decoded_len < 8) {
                   return -2;
               }
-              g_has_last_rpcrypt = 1;
 
-              memcpy(out_bright, g_last_rpcrypt.bright, 16);
-              memcpy(out_echidna, ambassador, 16);
-              memcpy(out_hmac_key, g_ps5_regist_hmac_key, 16);
+              ChiakiRegistInfo info;
+              memset(&info, 0, sizeof(info));
+              info.psn_online_id = "Maivy1125";
+              memcpy(info.psn_account_id, decoded_aid, 8);
+              info.pin = pin;
 
-              memset(out_payload, 0x41, 0x1E0);
-              memcpy(out_payload + 0x7B, ambassador, 8);
-              memcpy(out_payload + 0x158, ambassador + 8, 8);
+              ChiakiLog dummy_log;
+              memset(&dummy_log, 0, sizeof(dummy_log));
+              memset(&g_last_rpcrypt, 0, sizeof(g_last_rpcrypt));
 
-              char record_buf[256];
-              int record_len = snprintf(
-                  record_buf,
-                  sizeof(record_buf),
-                  "Client-Type: %s\r\nNp-AccountId: %s\r\n",
-                  client_type_str,
-                  account_id_b64
+              size_t buf_size = 1024;
+              ChiakiErrorCode err = chiaki_regist_request_payload_format(
+                  &dummy_log,
+                  CHIAKI_TARGET_PS5_1,
+                  ambassador,
+                  out_payload,
+                  &buf_size,
+                  &g_last_rpcrypt,
+                  &info
               );
-              if (record_len <= 0 || record_len >= (int)sizeof(record_buf)) {
+              if (err != CHIAKI_ERR_SUCCESS) {
                   return -3;
               }
 
-              // Tinh HMAC-SHA256 truc tiep bang Apple CommonCrypto CCHmac (khong goi _chiaki_rpcrypt_hmac)
-              CCHmac(
-                  kCCHmacAlgSHA256,
-                  g_ps5_regist_hmac_key,
-                  16,
-                  record_buf,
-                  (size_t)record_len,
-                  out_payload + 0x1C0
-              );
+              g_has_last_rpcrypt = 1;
+              memcpy(out_bright, g_last_rpcrypt.bright, 16);
+              memcpy(out_echidna, g_last_rpcrypt.ambassador, 16);
+              memcpy(out_hmac_key, g_last_rpcrypt.bright, 16);
 
-              err = chiaki_rpcrypt_encrypt(
-                  &g_last_rpcrypt,
-                  0,
-                  (const uint8_t *)record_buf,
-                  out_payload + 0x1E0,
-                  (size_t)record_len
-              );
-              if (err != CHIAKI_ERR_SUCCESS) {
-                  return -4;
-              }
-
-              *out_len = (size_t)(0x1E0 + record_len);
+              *out_len = buf_size;
               return 0;
           }
 
@@ -428,7 +504,6 @@ jobs:
               if (!cipher || cipher_len <= 0x20 || !out_plain || !g_has_last_rpcrypt) return -1;
 
               ChiakiRPCrypt rpcrypt = g_last_rpcrypt;
-
               size_t enc_len = cipher_len - 0x20;
               if (enc_len >= max_plain_len) enc_len = max_plain_len - 1;
 
@@ -463,7 +538,7 @@ jobs:
           #include "ChiakiNative/ChiakiCBridge.h"
           EOF
 
-      - name: 4. Gom cac file Swift, chong trung lap va tich hop C-Bridge an toan
+      - name: 4. Gom cac file Swift va BAT BUOC moc noi C-Bridge vao Swift
         run: |
           for f in *.swift.txt; do
             [ -f "$f" ] && cp "$f" "Sources/${f%.txt}"
@@ -506,9 +581,81 @@ jobs:
                   )
                   modified = True
 
+              # BAT BUOC moc noi ham buildChiakiPS5RegistPayload480 sang C-Bridge (trong khoi do {} de khong trung bien)
+              target_sig = "func buildChiakiPS5RegistPayload480(pinString: String, accountIDBase64: String) -> (payload: Data, aesKey: [UInt8], iv: [UInt8]) {"
+              if target_sig in content and "chiaki_bridge_build_ps5_regist_payload" not in content:
+                  c_hook = """func buildChiakiPS5RegistPayload480(pinString: String, accountIDBase64: String) -> (payload: Data, aesKey: [UInt8], iv: [UInt8]) {
+              do {
+                  let cAidB64 = accountIDBase64.trimmingCharacters(in: .whitespacesAndNewlines)
+                  var outPayload = [UInt8](repeating: 0, count: 1024)
+                  var outLen: Int = 0
+                  var bright = [UInt8](repeating: 0, count: 16)
+                  var echidna = [UInt8](repeating: 0, count: 16)
+                  var hmacKey = [UInt8](repeating: 0, count: 16)
+
+                  let res = pinString.withCString { pinCStr in
+                      cAidB64.withCString { aidCStr in
+                          ROIDefaultConfig.rpClientType.withCString { clientCStr in
+                              chiaki_bridge_build_ps5_regist_payload(
+                                  pinCStr,
+                                  aidCStr,
+                                  clientCStr,
+                                  &outPayload,
+                                  &outLen,
+                                  &bright,
+                                  &echidna,
+                                  &hmacKey
+                              )
+                          }
+                      }
+                  }
+                  if res == 0 && outLen > 0 {
+                      return (Data(outPayload.prefix(outLen)), bright, echidna)
+                  }
+              }
+          """
+                  content = content.replace(target_sig, c_hook, 1)
+                  modified = True
+
+              # BAT BUOC moc noi ham decryptRegistResponse sang C-Bridge
+              decrypt_sig = "func decryptRegistResponse(cipherData: Data, aesKey: [UInt8], iv: [UInt8]) -> String? {"
+              if decrypt_sig in content and "chiaki_bridge_decrypt_regist_response" not in content:
+                  decrypt_hook = """func decryptRegistResponse(cipherData: Data, aesKey: [UInt8], iv: [UInt8]) -> String? {
+              if cipherData.count > 0x20 && aesKey.count == 16 && iv.count == 16 {
+                  var plainBuf = [UInt8](repeating: 0, count: 2048)
+                  let cipherBytes = [UInt8](cipherData)
+                  let decLen = chiaki_bridge_decrypt_regist_response(
+                      cipherBytes,
+                      cipherBytes.count,
+                      aesKey,
+                      iv,
+                      nil,
+                      &plainBuf,
+                      plainBuf.count
+                  )
+                  if decLen > 0 {
+                      let data = Data(plainBuf.prefix(Int(decLen)))
+                      if let text = String(data: data, encoding: .utf8) ?? String(data: data, encoding: .isoLatin1),
+                         (text.contains("PS5-RegistKey") || text.contains("RP-RegistKey") || text.contains("RP-Key")) {
+                          return text.trimmingCharacters(in: CharacterSet(charactersIn: "\\0"))
+                      }
+                  }
+              }
+          """
+                  content = content.replace(decrypt_sig, decrypt_hook, 1)
+                  modified = True
+
+              # Chuan hoa HTTP Header /sie/ps5/rp/sess/rgst theo dung regist.c cua chiaki-ng
+              old_http = 'var rawHTTP = "POST /sie/ps5/rp/sess/rgst HTTP/1.1\\r\\n"'
+              new_http = 'var rawHTTP = "POST /sie/ps5/rp/sess/rgst HTTP/1.1\\r\\n HTTP/1.1\\r\\n"'
+              if old_http in content and new_http not in content:
+                  content = content.replace(old_http, new_http)
+                  modified = True
+
               if modified:
                   with open(path, "w", encoding="utf-8") as f:
                       f.write(content)
+                  print(f"Successfully hooked C-Bridge into {path}")
           PYEOF
 
           if [ -f "icon.png" ]; then
