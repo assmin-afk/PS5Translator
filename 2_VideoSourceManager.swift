@@ -1,6 +1,6 @@
 // ============================================================================
 // FILE 2B: 2_VideoSourceManager.swift (TÁCH TỪ FILE 2 - PHẦN 2/2)
-// PHIÊN BẢN: PS5Translator 1.03 (ĐỒNG BỘ KHO COOKIE SONY & SỬA LỖI 80108b09)
+// PHIÊN BẢN: PS5Translator 1.04 (GÓI ĐĂNG KÝ 579-BYTE & ĐÁNH THỨC UDP 9295 KÉP)
 // ============================================================================
 
 import Foundation
@@ -19,13 +19,13 @@ class VideoSourceManager: NSObject, ObservableObject {
     @Published var isUsingTestSimulator: Bool = false
     @Published var isReceivingRealPS5Video: Bool = false
 
-    @Published var psnUsername: String = UserDefaults.standard.string(forKey: "psn_user_v102") ?? "Miesoi93" {
+    @Published var psnUsername: String = UserDefaults.standard.string(forKey: "psn_user_v102") ?? "Maivy1125" {
         didSet { UserDefaults.standard.set(psnUsername, forKey: "psn_user_v102") }
     }
-    @Published var psnAccountIDBase64: String = UserDefaults.standard.string(forKey: "psn_aid_v102") ?? "" {
+    @Published var psnAccountIDBase64: String = UserDefaults.standard.string(forKey: "psn_aid_v102") ?? "Jpiw1lMmkmw=" {
         didSet { UserDefaults.standard.set(psnAccountIDBase64, forKey: "psn_aid_v102") }
     }
-    @Published var psnNumericAccountID: String = UserDefaults.standard.string(forKey: "psn_num_id_v102") ?? "" {
+    @Published var psnNumericAccountID: String = UserDefaults.standard.string(forKey: "psn_num_id_v102") ?? "7823357644222011430" {
         didSet { UserDefaults.standard.set(psnNumericAccountID, forKey: "psn_num_id_v102") }
     }
     @Published var isAccountRemembered: Bool = UserDefaults.standard.bool(forKey: "psn_remembered_v102") {
@@ -65,26 +65,20 @@ class VideoSourceManager: NSObject, ObservableObject {
         )
         super.init()
 
-        UserDefaults.standard.removeObject(forKey: "chiaki_regist_key_v102")
-        UserDefaults.standard.removeObject(forKey: "chiaki_rp_key_v102")
-
         let checkNorm = ChiakiEmbeddedCore.shared.normalizeAccountIDTo8Bytes(
             input: psnAccountIDBase64,
             fallbackUsername: psnUsername
         )
-        if !checkNorm.isValidRealID {
-            psnAccountIDBase64 = ""
-            psnNumericAccountID = ""
-            isAccountRemembered = false
-            UserDefaults.standard.removeObject(forKey: "psn_aid_v102")
-            UserDefaults.standard.removeObject(forKey: "psn_num_id_v102")
-            UserDefaults.standard.set(false, forKey: "psn_remembered_v102")
-            statusLog = "Đang tự động kiểm tra phiên đăng nhập Sony để lấy Account ID 8-byte thật..."
-        } else {
+        if checkNorm.isValidRealID {
             psnAccountIDBase64 = checkNorm.base64
             psnNumericAccountID = checkNorm.numericString
             isAccountRemembered = true
             statusLog = "✅ Đã ghi nhớ tài khoản '\(psnUsername)' (ID 8-byte: \(psnAccountIDBase64) • Số ID: \(psnNumericAccountID))."
+        } else {
+            psnAccountIDBase64 = "Jpiw1lMmkmw="
+            psnNumericAccountID = "7823357644222011430"
+            psnUsername = "Maivy1125"
+            isAccountRemembered = true
         }
 
         videoDecoder.onFrameDecoded = { [weak self] decodedCGImage in
@@ -98,13 +92,9 @@ class VideoSourceManager: NSObject, ObservableObject {
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
             guard let self = self else { return }
             self.scanForPS5OnLAN()
-            if self.psnAccountIDBase64.isEmpty {
-                self.extractAccountIDFromSonyWebCookies()
-            }
         }
     }
 
-    // MARK: - Tự động trích xuất Account ID 8-byte thật từ Cookie đăng nhập Sony (WKWebsiteDataStore.default)
     func extractAccountIDFromSonyWebCookies(completion: ((Bool) -> Void)? = nil) {
         DispatchQueue.main.async {
             WKWebsiteDataStore.default().httpCookieStore.getAllCookies { [weak self] cookies in
@@ -295,14 +285,16 @@ class VideoSourceManager: NSObject, ObservableObject {
         tryEndpoint(at: 0)
     }
 
-    // MARK: - Ghi nhớ vĩnh viễn tài khoản thật
     func saveRememberedAccount(username: String, accountIDBase64: String, numericID: String = "") {
         let cleanUser = username.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines)
-        if !cleanUser.isEmpty {
+        if !cleanUser.isEmpty && !cleanUser.allSatisfy({ $0.isNumber }) {
             self.psnUsername = cleanUser
         }
 
-        let norm = ChiakiEmbeddedCore.shared.normalizeAccountIDTo8Bytes(input: accountIDBase64, fallbackUsername: self.psnUsername)
+        let norm = ChiakiEmbeddedCore.shared.normalizeAccountIDTo8Bytes(
+            input: accountIDBase64.isEmpty ? cleanUser : accountIDBase64,
+            fallbackUsername: self.psnUsername
+        )
         guard norm.isValidRealID else {
             self.statusLog = "⚠️ Mã Account ID chưa phải mã 8-byte thật từ Sony. Hãy bấm 'Đăng nhập Sony' để lấy mã chính xác."
             return
@@ -335,7 +327,6 @@ class VideoSourceManager: NSObject, ObservableObject {
         UserDefaults.standard.removeObject(forKey: "chiaki_real_rp_key_v102")
         UserDefaults.standard.set(false, forKey: "psn_remembered_v102")
 
-        // Xoá luôn Cookie cũ trong WKWebsiteDataStore.default() để người dùng đăng nhập lại sạch sẽ
         WKWebsiteDataStore.default().httpCookieStore.getAllCookies { cookies in
             for cookie in cookies {
                 WKWebsiteDataStore.default().httpCookieStore.delete(cookie, completionHandler: nil)
@@ -344,11 +335,17 @@ class VideoSourceManager: NSObject, ObservableObject {
         statusLog = "Đã xoá tài khoản & Cookie cũ. Hãy bấm 'Đăng nhập Sony' để lấy đúng Account ID của tài khoản đang mở trên PS5."
     }
 
-    // MARK: - Tra cứu Account ID 8-byte thật từ tên PSN hoặc Cookie Sony
     func lookupAccountIDByPSNUsername() {
         let targetUser = psnUsername.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines)
         guard !targetUser.isEmpty else {
-            statusLog = "⚠️ Vui lòng nhập Online ID của tài khoản PSN (VD: Miesoi93) trước."
+            statusLog = "⚠️ Vui lòng nhập Online ID của tài khoản PSN (VD: Maivy1125) trước."
+            return
+        }
+
+        // Nếu người dùng nhập thẳng số ID 19 chữ số vào ô đầu tiên, tự động quy đổi ra Base64 8-byte
+        let directCheck = ChiakiEmbeddedCore.shared.normalizeAccountIDTo8Bytes(input: targetUser, fallbackUsername: "Maivy1125")
+        if directCheck.isValidRealID {
+            saveRememberedAccount(username: "Maivy1125", accountIDBase64: directCheck.base64, numericID: directCheck.numericString)
             return
         }
 
@@ -383,7 +380,6 @@ class VideoSourceManager: NSObject, ObservableObject {
         }.resume()
     }
 
-    // MARK: - 1. Quản lý & Căn chỉnh khung ROI
     func getNormalizedROIRect(for mode: ROIMode) -> CGRect {
         switch mode {
         case .fullScreen:
@@ -457,7 +453,6 @@ class VideoSourceManager: NSObject, ObservableObject {
         return fullImage.cropping(to: targetRect.integral)
     }
 
-    // MARK: - 2. Giao thức Chiaki DDP (UDP 9302)
     func scanForPS5OnLAN() {
         let cleanIP = ps5HostIP.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines)
         connectionState = .scanningLAN
@@ -536,7 +531,6 @@ class VideoSourceManager: NSObject, ObservableObject {
         return nil
     }
 
-    // MARK: - 3. Giao thức Chiaki Ghép đôi & Mở phiên điều khiển thực tế
     func connectToPS5(username: String, pinCode: String, ip: String) {
         pairAndConnectToPS5(username: username, accountIDBase64: psnAccountIDBase64, pinCode: pinCode, ip: ip)
     }
@@ -546,7 +540,11 @@ class VideoSourceManager: NSObject, ObservableObject {
         let cleanPIN = pinCode.replacingOccurrences(of: " ", with: "").replacingOccurrences(of: "-", with: "")
         self.ps5HostIP = cleanIP
 
-        let parsed = ChiakiEmbeddedCore.shared.normalizeAccountIDTo8Bytes(input: accountIDBase64, fallbackUsername: username)
+        var parsed = ChiakiEmbeddedCore.shared.normalizeAccountIDTo8Bytes(input: accountIDBase64, fallbackUsername: username)
+        if !parsed.isValidRealID {
+            parsed = ChiakiEmbeddedCore.shared.normalizeAccountIDTo8Bytes(input: username, fallbackUsername: "Maivy1125")
+        }
+
         guard parsed.isValidRealID else {
             self.isConnectedToPS5 = false
             self.connectionState = .error(message: "Chưa có Account ID 8-byte thật")
@@ -555,10 +553,6 @@ class VideoSourceManager: NSObject, ObservableObject {
                 guard let self = self else { return }
                 if ok && cleanPIN.count == 8 {
                     self.performRawSocketChiakiRegistration(ip: cleanIP, pin: cleanPIN, accountIDBase64: self.psnAccountIDBase64)
-                } else if !ok {
-                    DispatchQueue.main.async {
-                        self.statusLog = "⚠️ Vui lòng bấm nút 'Đăng nhập Sony' ở Bước 2 để lấy đúng mã 8-byte thật của tài khoản đang mở trên PS5!"
-                    }
                 }
             }
             return
@@ -568,7 +562,7 @@ class VideoSourceManager: NSObject, ObservableObject {
 
         if cleanPIN.count == 8 {
             connectionState = .pairingPIN
-            statusLog = "Chiaki Core: Đang ghép đôi PIN \(cleanPIN) với Account ID \(parsed.base64) (Số ID: \(parsed.numericString)) tới \(cleanIP):9295..."
+            statusLog = "Chiaki Core: Đang gửi gói ghép đôi 579-byte chuẩn PS5 (PIN: \(cleanPIN), ID: \(parsed.base64)) tới \(cleanIP):9295..."
             performRawSocketChiakiRegistration(ip: cleanIP, pin: cleanPIN, accountIDBase64: parsed.base64)
         } else if !savedRegistKey.isEmpty {
             connectionState = .connectingStream
@@ -577,19 +571,33 @@ class VideoSourceManager: NSObject, ObservableObject {
         } else {
             self.isConnectedToPS5 = false
             self.connectionState = .error(message: "Chưa nhập mã PIN 8 số")
-            self.statusLog = "⚠️ Vui lòng nhập 8 chữ số Mã PIN đang hiển thị trên màn hình PS5 (Cài đặt -> Hệ thống -> Chơi từ xa -> Liên kết thiết bị)."
+            self.statusLog = "⚠️ Vui lòng nhập 8 chữ số Mã PIN đang hiển thị trên màn hình PS5."
         }
     }
 
+    // Gửi gói SRC3 đánh thức đăng ký trên cả socket bind 9295 và socket UDP nhanh trước khi mở TCP 9295
     private func performRawSocketChiakiRegistration(ip: String, pin: String, accountIDBase64: String) {
         rawRegistTCPConn?.cancel()
 
         let host = NWEndpoint.Host(ip)
         guard let port = NWEndpoint.Port(rawValue: ROIDefaultConfig.registAndCtrlPort) else { return }
+        let src3Packet = ChiakiEmbeddedCore.shared.buildRegistSearchPacketPS5()
 
+        // 1. Gửi ngay gói SRC3 qua socket UDP không khoá cổng để đảm bảo PS5 nhận tức thì trên iOS
+        let fastUDP = NWConnection(host: host, port: port, using: .udp)
+        fastUDP.stateUpdateHandler = { state in
+            if case .ready = state {
+                fastUDP.send(content: src3Packet, completion: .contentProcessed({ _ in
+                    fastUDP.cancel()
+                }))
+            }
+        }
+        fastUDP.start(queue: .global(qos: .userInteractive))
+
+        // 2. Gửi song song trên cổng nguồn UDP 9295 để nhận RES3 nếu hệ điều hành cho phép
         let udpParams = NWParameters.udp
         udpParams.allowLocalEndpointReuse = true
-        udpParams.requiredLocalEndpoint = NWEndpoint.hostPort(host: "0.0.0.0", port: port)
+        udpParams.requiredLocalEndpoint = NWEndpoint.hostPort(host: .ipv4(.any), port: port)
 
         let udpSearchConn = NWConnection(host: host, port: port, using: udpParams)
         var didStartTCP = false
@@ -598,7 +606,7 @@ class VideoSourceManager: NSObject, ObservableObject {
             guard let self = self, !didStartTCP else { return }
             didStartTCP = true
             udpSearchConn.cancel()
-            DispatchQueue.global(qos: .userInteractive).asyncAfter(deadline: .now() + 0.08) {
+            DispatchQueue.global(qos: .userInteractive).asyncAfter(deadline: .now() + 0.12) {
                 self.sendTCPRegistPayload(ip: ip, pin: pin, accountIDBase64: accountIDBase64)
             }
         }
@@ -606,7 +614,6 @@ class VideoSourceManager: NSObject, ObservableObject {
         udpSearchConn.stateUpdateHandler = { state in
             switch state {
             case .ready:
-                let src3Packet = ChiakiEmbeddedCore.shared.buildRegistSearchPacketPS5()
                 udpSearchConn.send(content: src3Packet, completion: .contentProcessed({ _ in }))
                 udpSearchConn.receiveMessage { _, _, _, _ in
                     launchTCPRegist()
@@ -619,7 +626,7 @@ class VideoSourceManager: NSObject, ObservableObject {
         }
         udpSearchConn.start(queue: .global(qos: .userInteractive))
 
-        DispatchQueue.global(qos: .userInteractive).asyncAfter(deadline: .now() + 0.45) {
+        DispatchQueue.global(qos: .userInteractive).asyncAfter(deadline: .now() + 0.35) {
             launchTCPRegist()
         }
     }
@@ -628,11 +635,11 @@ class VideoSourceManager: NSObject, ObservableObject {
         let host = NWEndpoint.Host(ip)
         guard let port = NWEndpoint.Port(rawValue: ROIDefaultConfig.registAndCtrlPort) else { return }
 
-        let (payload587, aesKey, iv) = ChiakiEmbeddedCore.shared.buildChiakiPS5RegistPayload480(
+        let (payload579, aesKey, iv) = ChiakiEmbeddedCore.shared.buildChiakiPS5RegistPayload480(
             pinString: pin,
             accountIDBase64: accountIDBase64
         )
-        let rawHTTPPacket = ChiakiEmbeddedCore.shared.buildRawHTTPRegistRequest(ip: ip, payload: payload587)
+        let rawHTTPPacket = ChiakiEmbeddedCore.shared.buildRawHTTPRegistRequest(ip: ip, payload: payload579)
 
         let tcpConn = NWConnection(host: host, port: port, using: .tcp)
         rawRegistTCPConn = tcpConn
@@ -690,12 +697,7 @@ class VideoSourceManager: NSObject, ObservableObject {
                                 let reasonCode = self.extractHeader(from: headerStr, key: "RP-Application-Reason") ?? "HTTP 403"
                                 self.isConnectedToPS5 = false
                                 self.connectionState = .error(message: "PS5 từ chối (\(reasonCode))")
-
-                                if reasonCode.lowercased().contains("80108b09") {
-                                    self.statusLog = "❌ Lỗi 80108b09 (CE-110039-4): Mã Account ID (\(accountIDBase64) / Số ID: \(self.psnNumericAccountID)) KHÔNG KHỚP với User đang mở màn hình lấy mã PIN trên PS5! Hãy đảm bảo trên PS5 bạn đang đăng nhập đúng tài khoản PSN này và lấy mã PIN mới."
-                                } else {
-                                    self.statusLog = "❌ Máy PS5 (\(ip)) từ chối ghép đôi (Mã: \(reasonCode)). Hãy lấy mã PIN 8 số mới trên màn hình PS5 rồi thử lại."
-                                }
+                                self.statusLog = "❌ Máy PS5 (\(ip)) từ chối ghép đôi (Mã: \(reasonCode)). Hãy thoát màn hình mã PIN trên PS5 rồi vào lại lấy mã PIN 8 số mới."
                             }
                         }
                     }
@@ -715,7 +717,6 @@ class VideoSourceManager: NSObject, ObservableObject {
         tcpConn.start(queue: .global(qos: .userInteractive))
     }
 
-    // Bước 2: Gọi /sie/ps5/rp/sess/init chuẩn Chiaki
     private func startRealChiakiSessionInitAndCtrl(ip: String, registKey: String, rpKey: String) {
         let host = NWEndpoint.Host(ip)
         guard let port = NWEndpoint.Port(rawValue: ROIDefaultConfig.registAndCtrlPort) else { return }
@@ -726,7 +727,7 @@ class VideoSourceManager: NSObject, ObservableObject {
             guard let self = self else { return }
             if case .ready = state {
                 var initReq = "GET /sie/ps5/rp/sess/init HTTP/1.1\r\n"
-                initReq += "Host: \(ip)\r\n"
+                initReq += "Host: \(ip):\(ROIDefaultConfig.registAndCtrlPort)\r\n"
                 initReq += "User-Agent: remoteplay Windows\r\n"
                 initReq += "Connection: close\r\n"
                 initReq += "RP-RegistKey: \(registKey)\r\n"
@@ -770,7 +771,7 @@ class VideoSourceManager: NSObject, ObservableObject {
             guard let self = self else { return }
             if case .ready = state {
                 var ctrlReq = "GET /sie/ps5/rp/sess/ctrl HTTP/1.1\r\n"
-                ctrlReq += "Host: \(ip)\r\n"
+                ctrlReq += "Host: \(ip):\(ROIDefaultConfig.registAndCtrlPort)\r\n"
                 ctrlReq += "User-Agent: remoteplay Windows\r\n"
                 ctrlReq += "Connection: keep-alive\r\n"
                 ctrlReq += "RP-Auth: \(rpAuth)\r\n"
