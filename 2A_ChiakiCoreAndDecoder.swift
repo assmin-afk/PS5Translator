@@ -1,9 +1,6 @@
 // ============================================================================
 // FILE 2A: 2A_ChiakiCoreAndDecoder.swift (TÁCH TỪ FILE 2 - PHẦN 1/2)
-// PHIÊN BẢN: PS5Translator 1.05
-// NHIỆM VỤ:
-// 1. Khôi phục chuẩn gói đăng ký 587-byte (Client-Type 64 ký tự) & C-Bridge Hook.
-// 2. Bộ giải mã phần cứng VideoToolbox H.264/HEVC & ReplayKit Live Frame Receiver.
+// PHIÊN BẢN: PS5Translator 1.06 (ĐỒNG BỘ C-BRIDGE CHIAKI-NG & REPLAYKIT STREAM)
 // ============================================================================
 
 import Foundation
@@ -26,7 +23,7 @@ struct ROIDefaultConfig {
     static let ddpPort: UInt16 = 9302
     static let registAndCtrlPort: UInt16 = 9295
     static let takionStreamPort: UInt16 = 9296
-    // BẮT BUỘC DÙNG ĐÚNG CHUẨN 64 KÝ TỰ (GÓI 587 BYTES) ĐỂ KHÔNG BỊ LỖI 80108b09:
+    // Chuẩn 64 ký tự (Gói 587 bytes = 480B Preface + 107B Record) của PS5:
     static let rpClientType = "dabfa2ec873de5839bee8d3f4c0239c4282c07c25c6077a2931afcf0adc0d34f"
     static let chiakiRegistPrefaceSize = 480 // 0x1E0 bytes Preface chuẩn Chiaki
 }
@@ -64,6 +61,9 @@ final class ChiakiEmbeddedCore {
         0x62, 0x47, 0x9C, 0x30, 0x37, 0x65, 0x4E, 0x26,
         0x86, 0x0F, 0x9D, 0x2F, 0x5C, 0x70, 0x10, 0x3C
     ]
+
+    // Lưu lại hmacKey động sinh từ C-Bridge của lần ghép đôi gần nhất
+    private var lastRegistHmacKey: [UInt8] = []
 
     func isFakeGeneratedAccountID(_ input: String, username: String) -> Bool {
         let trimmed = input.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines)
@@ -234,7 +234,7 @@ final class ChiakiEmbeddedCore {
         return Data([0x53, 0x52, 0x43, 0x33]) // "SRC3"
     }
 
-    // Đóng gói gói tin 587 bytes (480B Preface + 107B Encrypted Record)
+    // Đóng gói gói tin 587 bytes (Sẽ được build_ipa.yml tự động móc nối sang rpcrypt.c của chiaki-ng)
     func buildChiakiPS5RegistPayload480(pinString: String, accountIDBase64: String) -> (payload: Data, aesKey: [UInt8], iv: [UInt8]) {
         let pinNumber = UInt32(pinString) ?? 0
         let pinBytes: [UInt8] = [
@@ -256,7 +256,6 @@ final class ChiakiEmbeddedCore {
             iv[i] = ambassador[(i + 8) % 16] ^ ps5Key0[i]
             aesKey[i] = ambassador[i] ^ ps5Key1[i]
         }
-        // Chỉ XOR 4 byte mã PIN vào 4 byte đầu của khoá theo chuẩn uint32_t pin
         for i in 0..<4 {
             aesKey[i] ^= pinBytes[i]
         }
@@ -313,10 +312,12 @@ final class ChiakiEmbeddedCore {
         return Data(outBytes)
     }
 
+    // Giải mã phản hồi 200 OK từ PS5 (Ưu tiên offset 0x20 chuẩn regist.c của Chiaki)
     func decryptRegistResponse(cipherData: Data, aesKey: [UInt8], iv: [UInt8]) -> String? {
         guard !cipherData.isEmpty else { return nil }
 
-        let candidateOffsets = [0x00, 0x10, 0x20, 0x30]
+        // Trong regist.c của chiaki-ng, 32 bytes đầu (0x00..<0x20) là HMAC, phần mã hoá nằm từ 0x20 trở đi
+        let candidateOffsets = [0x20, 0x00, 0x10, 0x30]
 
         for offset in candidateOffsets where cipherData.count > offset + 16 {
             let sub = cipherData.subdata(in: offset..<cipherData.count)
@@ -423,9 +424,19 @@ final class ChiakiEmbeddedCore {
         return rawStr.trimmingCharacters(in: CharacterSet(charactersIn: "\0"))
     }
 
+    // Chuyển đổi RegistKey (có thể là chuỗi Hex 16 ký tự hoặc ASCII) sang đúng mảng 16 bytes chuẩn Chiaki
+    func parseRegistKeyTo16Bytes(_ registKey: String) -> Data {
+        let clean = registKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        var bytes = [UInt8](repeating: 0, count: 16)
+        let utf8 = Array(clean.utf8)
+        for i in 0..<min(16, utf8.count) {
+            bytes[i] = utf8[i]
+        }
+        return Data(bytes)
+    }
+
     func buildSessionAuthHeaders(registKey: String, rpKeyBase64: String, serverNonceBase64: String?) -> (rpAuth: String, rpDid: String) {
-        let paddedRegist = registKey.padding(toLength: 16, withPad: "\0", startingAt: 0)
-        let rawAuthData = Data(paddedRegist.utf8.prefix(16))
+        let rawAuthData = parseRegistKeyTo16Bytes(registKey)
 
         var didBytes = [UInt8](repeating: 0, count: 32)
         let prefix: [UInt8] = [0x00, 0x18, 0x00, 0x00, 0x00, 0x09, 0x00, 0x40, 0x00, 0x80]
@@ -436,20 +447,12 @@ final class ChiakiEmbeddedCore {
             return (rawAuthData.base64EncodedString(), Data(didBytes).base64EncodedString())
         }
 
+        let cleanRPKey = rpKeyBase64.trimmingCharacters(in: .whitespacesAndNewlines)
         let rpKeyBytes: [UInt8]
-        if let decodedKey = Data(base64Encoded: rpKeyBase64), decodedKey.count == 16 {
+        if cleanRPKey.count == 32, let hexData = Self.hexStringToBytes(cleanRPKey), hexData.count == 16 {
+            rpKeyBytes = hexData
+        } else if let decodedKey = Data(base64Encoded: cleanRPKey), decodedKey.count == 16 {
             rpKeyBytes = [UInt8](decodedKey)
-        } else if rpKeyBase64.count == 32 {
-            var hexArr: [UInt8] = []
-            var idx = rpKeyBase64.startIndex
-            while idx < rpKeyBase64.endIndex {
-                let nextIdx = rpKeyBase64.index(idx, offsetBy: 2, limitedBy: rpKeyBase64.endIndex) ?? rpKeyBase64.endIndex
-                if let b = UInt8(rpKeyBase64[idx..<nextIdx], radix: 16) {
-                    hexArr.append(b)
-                }
-                idx = nextIdx
-            }
-            rpKeyBytes = hexArr.count == 16 ? hexArr : [UInt8](repeating: 0, count: 16)
         } else {
             return (rawAuthData.base64EncodedString(), Data(didBytes).base64EncodedString())
         }
@@ -464,8 +467,23 @@ final class ChiakiEmbeddedCore {
         }
 
         let encAuth = chiakiRPCryptXOR(data: rawAuthData, key: sessionKey, iv: sessionIV, counter: 0)
-        let encDid = chiakiRPCryptXOR(data: Data(didBytes), key: sessionKey, iv: sessionIV, counter: 0)
+        let encDid = chiakiRPCryptXOR(data: Data(didBytes), key: sessionKey, iv: sessionIV, counter: 1)
         return (encAuth.base64EncodedString(), encDid.base64EncodedString())
+    }
+
+    static func hexStringToBytes(_ hex: String) -> [UInt8]? {
+        let chars = Array(hex)
+        guard chars.count % 2 == 0 else { return nil }
+        var bytes: [UInt8] = []
+        bytes.reserveCapacity(chars.count / 2)
+        var i = 0
+        while i < chars.count {
+            let pair = String(chars[i..<i+2])
+            guard let b = UInt8(pair, radix: 16) else { return nil }
+            bytes.append(b)
+            i += 2
+        }
+        return bytes
     }
 
     func buildRawHTTPRegistRequest(ip: String, payload: Data) -> Data {
@@ -578,7 +596,6 @@ final class ChiakiHardwareVideoDecoder {
     private let ciContext = CIContext(options: nil)
     var onFrameDecoded: ((CGImage) -> Void)?
 
-    // Hỗ trợ chuyển đổi trực tiếp CMSampleBuffer từ ReplayKit / PS Remote Play PiP sang CGImage cho OCR
     func decodeReplayKitSampleBuffer(_ sampleBuffer: CMSampleBuffer) {
         guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
         let ciImage = CIImage(cvPixelBuffer: pixelBuffer)
