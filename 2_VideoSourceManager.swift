@@ -1,6 +1,6 @@
 // ============================================================================
 // FILE 2B: 2_VideoSourceManager.swift (TÁCH TỪ FILE 2 - PHẦN 2/2)
-// PHIÊN BẢN: PS5Translator 1.06 (CHUẨN 587-BYTE C-BRIDGE & REPLAYKIT LIVE CAPTURE)
+// PHIÊN BẢN: PS5Translator 1.07 (CHUẨN 587-BYTE C-BRIDGE & FIX STOPCAPTURE)
 // ============================================================================
 
 import Foundation
@@ -912,7 +912,8 @@ class VideoSourceManager: NSObject, ObservableObject {
         takionStreamConn?.cancel()
         udpDiscoveryConn?.cancel()
         if isReplayKitCapturing {
-            RPScreenRecorder.shared().stopCapture(completionHandler: nil)
+            // SỬA LỖI DÒNG 915: Dùng trailing closure chuẩn ReplayKit iOS SDK
+            RPScreenRecorder.shared().stopCapture { _ in }
             isReplayKitCapturing = false
         }
         isConnectedToPS5 = false
