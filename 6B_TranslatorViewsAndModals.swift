@@ -1,13 +1,6 @@
 // ============================================================================
 // FILE 6B: 6B_TranslatorViewsAndModals.swift (TÁCH TỪ FILE 6 - PHẦN 2/2)
-// PHIÊN BẢN: PS5Translator 1.02
-// NHIỆM VỤ:
-// 1. Giao diện chính (MainTranslatorView): Khung hình 16:9, kéo thả & căn chỉnh ROI,
-//    hiển thị hộp chữ dịch đè đúng vị trí chữ gốc với nền đen mờ và bằng cỡ chữ gốc.
-// 2. Màn hình quản lý Hồ sơ game theo thư mục (GameProfileFolderManagerView).
-// 3. Màn hình liên kết Chiaki PS5 & ghi nhớ tài khoản (PS5ConnectionWizardView).
-// 4. Trình đăng nhập Sony OAuth tự lấy Account ID 8-byte (PSNWebLoginHelperView).
-// 5. Điểm khởi chạy ứng dụng (@main PS5TranslatorApp).
+// PHIÊN BẢN: PS5Translator 1.03 (ĐỒNG BỘ WKWEBSITEDATASTORE.DEFAULT & SỬA LỖI 80108b09)
 // ============================================================================
 
 import SwiftUI
@@ -15,7 +8,7 @@ import WebKit
 import UniformTypeIdentifiers
 
 // ============================================================================
-// 7. GIAO DIỆN CHÍNH PS5TRANSLATOR 1.02 (HIỂN THỊ ĐÈ ĐÚNG CHỖ & BẰNG CỠ CHỮ GỐC)
+// 7. GIAO DIỆN CHÍNH PS5TRANSLATOR
 // ============================================================================
 struct MainTranslatorView: View {
     @StateObject private var coord = PipelineCoordinator()
@@ -746,7 +739,7 @@ struct PS5ConnectionWizardView: View {
                     // BƯỚC 2: TÀI KHOẢN PSN PHỤ & GHI NHỚ TỰ ĐỘNG
                     VStack(alignment: .leading, spacing: 10) {
                         HStack {
-                            Label("BƯỚC 2: Tài khoản PSN Phụ", systemImage: "2.circle.fill")
+                            Label("BƯỚC 2: Tài khoản PSN (Phải trùng với User mở mã PIN trên PS5)", systemImage: "2.circle.fill")
                                 .font(.subheadline.bold())
                                 .foregroundColor(.cyan)
                             Spacer()
@@ -757,12 +750,12 @@ struct PS5ConnectionWizardView: View {
                             }
                         }
 
-                        Text("Sau khi lấy mã Account ID 8-byte 1 lần, ứng dụng sẽ tự động ghi nhớ vĩnh viễn tài khoản này:")
+                        Text("Lưu ý: Trên PS5 bạn đang mở màn hình lấy mã PIN ở User nào thì phải đăng nhập đúng tài khoản PSN đó ở đây:")
                             .font(.caption)
                             .foregroundColor(.gray)
 
                         HStack {
-                            TextField("Tên tài khoản PSN phụ (VD: Miesoi93)", text: $coord.videoMgr.psnUsername)
+                            TextField("Online ID tài khoản PSN (VD: Miesoi93)", text: $coord.videoMgr.psnUsername)
                                 .padding(10)
                                 .background(Color.black.opacity(0.35))
                                 .cornerRadius(8)
@@ -785,7 +778,7 @@ struct PS5ConnectionWizardView: View {
                         }
 
                         HStack {
-                            TextField("Mã Account ID 8-byte Base64 (Hoặc số ID 19 số)", text: $coord.videoMgr.psnAccountIDBase64)
+                            TextField("Mã Account ID 8-byte Base64 (Hoặc dán số ID 19 chữ số)", text: $coord.videoMgr.psnAccountIDBase64)
                                 .font(.caption.monospaced())
                                 .padding(10)
                                 .background(Color.black.opacity(0.35))
@@ -808,11 +801,11 @@ struct PS5ConnectionWizardView: View {
 
                         if coord.videoMgr.isAccountRemembered {
                             HStack {
-                                Text("Đã lưu: \(coord.videoMgr.psnUsername) (\(coord.videoMgr.psnAccountIDBase64))")
+                                Text("Online ID: \(coord.videoMgr.psnUsername) • Số ID: \(coord.videoMgr.psnNumericAccountID) • Base64: \(coord.videoMgr.psnAccountIDBase64)")
                                     .font(.caption2)
                                     .foregroundColor(.green)
                                 Spacer()
-                                Button("Đổi TK khác") {
+                                Button("Xoá & Đổi TK") {
                                     coord.videoMgr.clearRememberedAccount()
                                 }
                                 .font(.caption2.bold())
@@ -830,7 +823,7 @@ struct PS5ConnectionWizardView: View {
                             .font(.subheadline.bold())
                             .foregroundColor(.cyan)
 
-                        Text("Trên PS5 (ở tài khoản phụ Miesoi93): Cài đặt -> Hệ thống -> Chơi từ xa -> Liên kết thiết bị:")
+                        Text("Trên PS5 (ở đúng tài khoản PSN vừa chọn): Cài đặt -> Hệ thống -> Chơi từ xa -> Liên kết thiết bị:")
                             .font(.caption)
                             .foregroundColor(.gray)
 
@@ -911,12 +904,12 @@ struct PS5ConnectionWizardView: View {
 }
 
 // ============================================================================
-// 10. TRÌNH ĐĂNG NHẬP SONY OAUTH & BỘ QUÉT ĐỆ QUY ĐA TẦNG (JWT + NPSSO + 5 API)
+// 10. TRÌNH ĐĂNG NHẬP SONY OAUTH & BỘ QUÉT ĐỆ QUY ĐA TẦNG (ĐỒNG BỘ COOKIE DEFAULT)
 // ============================================================================
 struct PSNWebLoginHelperView: View {
     @ObservedObject var coord: PipelineCoordinator
     @Environment(\.presentationMode) var presentationMode
-    @State private var extractionStatus: String = "Đăng nhập tài khoản phụ (Miesoi93) một lần duy nhất. App sẽ tự lấy Account ID 8-byte và ghi nhớ vĩnh viễn."
+    @State private var extractionStatus: String = "Đăng nhập đúng tài khoản PSN đang mở trên máy PS5. App sẽ tự lấy Account ID 8-byte và ghi nhớ vĩnh viễn."
     @State private var manualCheckTrigger: Int = 0
 
     var body: some View {
@@ -959,7 +952,7 @@ struct PSNWebLoginHelperView: View {
                             accountIDBase64: base64ID,
                             numericID: numericID
                         )
-                        self.extractionStatus = "✅ Đã lấy & ghi nhớ thành công Account ID 8-byte (\(base64ID)) • Số ID: \(numericID)!"
+                        self.extractionStatus = "✅ Đã lấy thành công Account ID 8-byte (\(base64ID)) • Số ID: \(numericID)!"
                         DispatchQueue.main.asyncAfter(deadline: .now() + 0.9) {
                             presentationMode.wrappedValue.dismiss()
                         }
@@ -994,9 +987,9 @@ struct SonyOAuthWebView: UIViewRepresentable {
     }
 
     func makeUIView(context: Context) -> WKWebView {
-        // Sử dụng WKWebsiteDataStore.default() để lưu Cookie phiên đăng nhập Sony vĩnh viễn
+        // SỬA LỖI QUAN TRỌNG: Bắt buộc dùng WKWebsiteDataStore.default() để đồng bộ Cookie với VideoSourceManager
         let config = WKWebViewConfiguration()
-        config.websiteDataStore = WKWebsiteDataStore.nonPersistent()
+        config.websiteDataStore = WKWebsiteDataStore.default()
         let webView = WKWebView(frame: .zero, configuration: config)
         webView.navigationDelegate = context.coordinator
         context.coordinator.attachedWebView = webView
@@ -1026,7 +1019,6 @@ struct SonyOAuthWebView: UIViewRepresentable {
             self.onStatusUpdate = onStatusUpdate
         }
 
-        // 1. Bắt URL chuyển hướng com.scee.psxandroid.scecompcall://redirect?code=v3.xxxx
         func webView(_ webView: WKWebView, decidePolicyFor navigationAction: WKNavigationAction, decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
             guard let reqURL = navigationAction.request.url else {
                 decisionHandler(.allow)
@@ -1042,7 +1034,6 @@ struct SonyOAuthWebView: UIViewRepresentable {
             decisionHandler(.allow)
         }
 
-        // 2. Bắt cả trường hợp WebKit báo lỗi Unsupported URL khi Sony redirect sang custom scheme scecompcall://
         func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
             let nsErr = error as NSError
             if let failingURL = nsErr.userInfo[NSURLErrorFailingURLStringErrorKey] as? String {
@@ -1050,7 +1041,6 @@ struct SonyOAuthWebView: UIViewRepresentable {
             }
         }
 
-        // 3. Khi trang tải xong (didFinish): Tự động đọc Cookie npsso & gọi thẳng API basicProfile trong WKWebView
         func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
             guard !didExtractSuccess else { return }
             inspectCookiesAndDOMForAccountID(in: webView, forceSilentAuth: false)
@@ -1077,11 +1067,9 @@ struct SonyOAuthWebView: UIViewRepresentable {
             return true
         }
 
-        // Tự động đọc Cookie npsso và chạy truy vấn basicProfile ngay trong WKWebView khi trang tải xong
         func inspectCookiesAndDOMForAccountID(in webView: WKWebView, forceSilentAuth: Bool) {
             guard !didExtractSuccess else { return }
 
-            // Bước A: Gọi trực tiếp API basicProfile ngay trong phiên trình duyệt WKWebView (kèm Cookie trình duyệt)
             let jsFetchProfile = """
             (async function() {
                 try {
@@ -1100,13 +1088,11 @@ struct SonyOAuthWebView: UIViewRepresentable {
                 if let jsonStr = result as? String,
                    !jsonStr.isEmpty,
                    let data = jsonStr.data(using: .utf8),
-                   let jsonObj = try? JSONSerialization.jsonObject(with: data),
-                   let found = Self.extractAccountIDRecursively(from: jsonObj) {
+                   let found = ChiakiEmbeddedCore.shared.extractAccountIDFromJSONData(data) {
                     self.completeExtraction(onlineID: found.onlineID, base64ID: found.base64ID, numericID: found.numericID)
                 }
             }
 
-            // Bước B: Kiểm tra Cookie npsso trong WKWebsiteDataStore để kích hoạt OAuth ngầm nếu trang không tự redirect
             webView.configuration.websiteDataStore.httpCookieStore.getAllCookies { [weak self] cookies in
                 guard let self = self, !self.didExtractSuccess else { return }
                 let sonyCookies = cookies.filter {
@@ -1166,7 +1152,6 @@ struct SonyOAuthWebView: UIViewRepresentable {
             session.dataTask(with: req).resume()
         }
 
-        // 4. Đổi OAuth code sang access_token kèm tham số token_format=jwt
         private func exchangeOAuthCodeForAccountID(code: String) {
             guard let tokenURL = URL(string: TranslatorV102Config.sonyOAuthTokenURL) else { return }
             var req = URLRequest(url: tokenURL)
@@ -1174,8 +1159,8 @@ struct SonyOAuthWebView: UIViewRepresentable {
             req.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
             req.setValue(TranslatorV102Config.sonyBasicAuthHeader, forHTTPHeaderField: "Authorization")
 
-            // Truyền thêm token_format=jwt để access_token trả về chứa sẵn account_id bên trong payload JWT
-            let bodyStr = "grant_type=authorization_code&code=\(code)&redirect_uri=\(TranslatorV102Config.sonyOAuthRedirectEncoded)&token_format=jwt"
+            let encodedCode = code.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? code
+            let bodyStr = "grant_type=authorization_code&code=\(encodedCode)&redirect_uri=\(TranslatorV102Config.sonyOAuthRedirectEncoded)&token_format=jwt"
             req.httpBody = bodyStr.data(using: .utf8)
 
             URLSession.shared.dataTask(with: req) { [weak self] data, _, _ in
@@ -1189,8 +1174,7 @@ struct SonyOAuthWebView: UIViewRepresentable {
                     return
                 }
 
-                // Bước 4A: Quét đệ quy ngay trong JSON phản hồi của oauth/token
-                if let directFound = Self.extractAccountIDRecursively(from: json) {
+                if let directFound = ChiakiEmbeddedCore.shared.extractAccountIDFromJSONData(data) {
                     self.completeExtraction(
                         onlineID: directFound.onlineID,
                         base64ID: directFound.base64ID,
@@ -1204,8 +1188,7 @@ struct SonyOAuthWebView: UIViewRepresentable {
                     return
                 }
 
-                // Bước 4B: Giải mã trực tiếp chuỗi JWT của access_token (hoặc id_token) để lấy account_id tức thì
-                if let jwtFound = Self.decodeJWTAndExtractAccountID(from: accessToken) {
+                if let jwtFound = ChiakiEmbeddedCore.shared.extractAccountIDFromJWT(accessToken) {
                     self.completeExtraction(
                         onlineID: jwtFound.onlineID,
                         base64ID: jwtFound.base64ID,
@@ -1215,7 +1198,7 @@ struct SonyOAuthWebView: UIViewRepresentable {
                 }
 
                 if let idToken = json["id_token"] as? String,
-                   let idJwtFound = Self.decodeJWTAndExtractAccountID(from: idToken) {
+                   let idJwtFound = ChiakiEmbeddedCore.shared.extractAccountIDFromJWT(idToken) {
                     self.completeExtraction(
                         onlineID: idJwtFound.onlineID,
                         base64ID: idJwtFound.base64ID,
@@ -1224,19 +1207,17 @@ struct SonyOAuthWebView: UIViewRepresentable {
                     return
                 }
 
-                // Bước 4C: Gọi chuỗi 5 cổng API Profile & Token Info chính thức của Sony
                 self.fetchPSNAccountID(accessToken: accessToken)
             }.resume()
         }
 
-        // 5. Chuỗi 5 cổng API lấy Account ID 64-bit chính thức của Sony (với bộ quét đệ quy JSON)
         private func fetchPSNAccountID(accessToken: String) {
             let endpoints: [(url: String, useBasicAuth: Bool)] = [
+                ("https://dms.api.playstation.com/api/v1/devices/accounts/me", false),
                 ("https://ca.account.sony.com/api/v1/oauth/token/\(accessToken)", true),
-                ("https://m.np.playstation.com/api/userProfile/v1/internal/users/me/profiles", false),
                 ("https://us-prof.np.community.playstation.net/userProfile/v1/users/me/profile2?fields=npId,onlineId,accountId,avatarUrls,plus", false),
-                ("https://web.np.playstation.com/api/basicProfile/v1/profile/users/me", false),
-                ("https://dms.api.playstation.com/api/v1/devices/accounts/me", false)
+                ("https://m.np.playstation.com/api/userProfile/v1/internal/users/me/profiles", false),
+                ("https://web.np.playstation.com/api/basicProfile/v1/profile/users/me", false)
             ]
 
             tryEndpoint(at: 0, endpoints: endpoints, accessToken: accessToken)
@@ -1271,8 +1252,7 @@ struct SonyOAuthWebView: UIViewRepresentable {
             URLSession.shared.dataTask(with: req) { [weak self] data, _, _ in
                 guard let self = self, !self.didExtractSuccess else { return }
                 if let data = data,
-                   let jsonObj = try? JSONSerialization.jsonObject(with: data),
-                   let found = Self.extractAccountIDRecursively(from: jsonObj) {
+                   let found = ChiakiEmbeddedCore.shared.extractAccountIDFromJSONData(data) {
                     self.completeExtraction(
                         onlineID: found.onlineID,
                         base64ID: found.base64ID,
@@ -1290,103 +1270,6 @@ struct SonyOAuthWebView: UIViewRepresentable {
             DispatchQueue.main.async {
                 self.onExtractedAccount(onlineID, base64ID, numericID)
             }
-        }
-
-        // MARK: - Giải mã JWT Payload (Base64URL) & Quét đệ quy JSON mọi cấp độ
-        static func decodeJWTAndExtractAccountID(from jwt: String) -> (onlineID: String, base64ID: String, numericID: String)? {
-            let segments = jwt.components(separatedBy: ".")
-            guard segments.count >= 2 else { return nil }
-
-            var base64 = segments[1]
-                .replacingOccurrences(of: "-", with: "+")
-                .replacingOccurrences(of: "_", with: "/")
-            let remainder = base64.count % 4
-            if remainder > 0 {
-                base64 += String(repeating: "=", count: 4 - remainder)
-            }
-
-            guard let payloadData = Data(base64Encoded: base64),
-                  let jsonObj = try? JSONSerialization.jsonObject(with: payloadData) else {
-                return nil
-            }
-            return extractAccountIDRecursively(from: jsonObj)
-        }
-
-        static func extractAccountIDRecursively(from jsonObject: Any) -> (onlineID: String, base64ID: String, numericID: String)? {
-            var foundNumericID: UInt64?
-            var foundOnlineID: String = ""
-
-            func walk(_ node: Any) {
-                if let dict = node as? [String: Any] {
-                    for (rawKey, val) in dict {
-                        let key = rawKey.lowercased()
-                        if key == "onlineid" || key == "online_id" {
-                            if let s = val as? String, !s.isEmpty, foundOnlineID.isEmpty {
-                                foundOnlineID = s
-                            }
-                        }
-                        if key == "accountid" || key == "account_id" || key == "user_id" || key == "userid" {
-                            if let num = parseUInt64AccountID(from: val), num > 1_000_000 {
-                                foundNumericID = num
-                            }
-                        }
-                        if key == "npid", let npIdStr = val as? String, foundNumericID == nil {
-                            if let decodedNp = extractAccountIDFromNpId(npIdStr) {
-                                foundNumericID = decodedNp
-                            }
-                        }
-                        walk(val)
-                    }
-                } else if let arr = node as? [Any] {
-                    for item in arr {
-                        walk(item)
-                    }
-                }
-            }
-
-            walk(jsonObject)
-
-            guard let validNumeric = foundNumericID else { return nil }
-            var le = validNumeric.littleEndian
-            let base64ID = Data(bytes: &le, count: 8).base64EncodedString()
-            return (foundOnlineID, base64ID, String(validNumeric))
-        }
-
-        private static func parseUInt64AccountID(from value: Any) -> UInt64? {
-            if let num = value as? UInt64 {
-                return num
-            }
-            if let intVal = value as? Int64, intVal > 0 {
-                return UInt64(intVal)
-            }
-            if let intVal = value as? Int, intVal > 0 {
-                return UInt64(intVal)
-            }
-            if let nsNum = value as? NSNumber {
-                return nsNum.uint64Value
-            }
-            if let str = value as? String {
-                let trimmed = str.trimmingCharacters(in: .whitespacesAndNewlines)
-                if let u = UInt64(trimmed) {
-                    return u
-                }
-            }
-            return nil
-        }
-
-        private static func extractAccountIDFromNpId(_ npIdBase64: String) -> UInt64? {
-            guard let data = Data(base64Encoded: npIdBase64),
-                  let ascii = String(data: data, encoding: .ascii) else {
-                return nil
-            }
-            // Chuỗi npId giải mã thường chứa định dạng @b7.us... hoặc hex 16 ký tự của Account ID
-            let parts = ascii.components(separatedBy: CharacterSet.alphanumerics.inverted)
-            for part in parts where part.count == 16 {
-                if let hexVal = UInt64(part, radix: 16), hexVal > 1_000_000 {
-                    return hexVal
-                }
-            }
-            return nil
         }
     }
 }
