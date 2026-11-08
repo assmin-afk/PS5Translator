@@ -323,7 +323,8 @@ jobs:
           #include <string.h>
           #include <Security/SecRandom.h>
 
-          static uint8_t g_last_hmac_key[16] = {0};
+          static ChiakiRPCrypt g_last_rpcrypt;
+          static int g_has_last_rpcrypt = 0;
 
           __attribute__((weak)) void chiaki_log(ChiakiLog *log, ChiakiLogLevel level, const char *fmt, ...) {
               (void)log; (void)level; (void)fmt;
@@ -354,17 +355,16 @@ jobs:
                   for (int i = 0; i < 16; i++) ambassador[i] = (uint8_t)(arc4random() & 0xFF);
               }
 
-              ChiakiRPCrypt rpcrypt;
-              memset(&rpcrypt, 0, sizeof(rpcrypt));
-              ChiakiErrorCode err = chiaki_rpcrypt_init_regist(&rpcrypt, CHIAKI_TARGET_PS5_1, ambassador, pin);
+              memset(&g_last_rpcrypt, 0, sizeof(g_last_rpcrypt));
+              ChiakiErrorCode err = chiaki_rpcrypt_init_regist(&g_last_rpcrypt, CHIAKI_TARGET_PS5_1, ambassador, 0, pin);
               if (err != CHIAKI_ERR_SUCCESS) {
                   return -2;
               }
+              g_has_last_rpcrypt = 1;
 
-              memcpy(out_bright, rpcrypt.bright, 16);
-              memcpy(out_echidna, rpcrypt.echidna, 16);
-              memcpy(out_hmac_key, rpcrypt.hmac_key, 16);
-              memcpy(g_last_hmac_key, rpcrypt.hmac_key, 16);
+              memcpy(out_bright, g_last_rpcrypt.bright, 16);
+              memcpy(out_echidna, ambassador, 16);
+              memset(out_hmac_key, 0, 16);
 
               memset(out_payload, 0x41, 0x1E0);
               memcpy(out_payload + 0x7B, ambassador, 8);
@@ -382,10 +382,10 @@ jobs:
                   return -3;
               }
 
-              chiaki_rpcrypt_hmac(&rpcrypt, out_payload + 0x1C0, (const uint8_t *)record_buf, (size_t)record_len);
+              chiaki_rpcrypt_hmac(&g_last_rpcrypt, out_payload + 0x1C0, (const uint8_t *)record_buf, (size_t)record_len);
 
               err = chiaki_rpcrypt_encrypt(
-                  &rpcrypt,
+                  &g_last_rpcrypt,
                   0,
                   (const uint8_t *)record_buf,
                   out_payload + 0x1E0,
@@ -408,18 +408,10 @@ jobs:
               uint8_t *out_plain,
               size_t max_plain_len
           ) {
-              if (!cipher || cipher_len <= 0x20 || !out_plain) return -1;
+              (void)bright; (void)echidna; (void)hmac_key;
+              if (!cipher || cipher_len <= 0x20 || !out_plain || !g_has_last_rpcrypt) return -1;
 
-              ChiakiRPCrypt rpcrypt;
-              memset(&rpcrypt, 0, sizeof(rpcrypt));
-              rpcrypt.target = CHIAKI_TARGET_PS5_1;
-              memcpy(rpcrypt.bright, bright, 16);
-              memcpy(rpcrypt.echidna, echidna, 16);
-              if (hmac_key) {
-                  memcpy(rpcrypt.hmac_key, hmac_key, 16);
-              } else {
-                  memcpy(rpcrypt.hmac_key, g_last_hmac_key, 16);
-              }
+              ChiakiRPCrypt rpcrypt = g_last_rpcrypt;
 
               size_t enc_len = cipher_len - 0x20;
               if (enc_len >= max_plain_len) enc_len = max_plain_len - 1;
@@ -443,9 +435,7 @@ jobs:
 
               ChiakiRPCrypt rpcrypt;
               memset(&rpcrypt, 0, sizeof(rpcrypt));
-              if (chiaki_rpcrypt_init_auth(&rpcrypt, CHIAKI_TARGET_PS5_1, nonce, rp_key) != CHIAKI_ERR_SUCCESS) {
-                  return -2;
-              }
+              chiaki_rpcrypt_init_auth(&rpcrypt, CHIAKI_TARGET_PS5_1, nonce, rp_key);
               if (chiaki_rpcrypt_encrypt(&rpcrypt, counter, data_in, data_out, data_len) != CHIAKI_ERR_SUCCESS) {
                   return -3;
               }
