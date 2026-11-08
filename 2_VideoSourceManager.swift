@@ -601,9 +601,42 @@ class VideoSourceManager: NSObject, ObservableObject {
         }
     }
 
+    // Bước 1: Gửi gói dò đăng ký "SRC3" tới UDP 9295 của PS5 -> Nhận "RES3" -> Mở TCP 9295 gửi gói 480-byte
     private func performRawSocketChiakiRegistration(ip: String, pin: String, accountIDBase64: String) {
         rawRegistTCPConn?.cancel()
 
+        let host = NWEndpoint.Host(ip)
+        guard let port = NWEndpoint.Port(rawValue: ROIDefaultConfig.registAndCtrlPort) else { return }
+
+        // Gửi gói UDP "SRC3" đánh thức cổng đăng ký 9295 của PS5 trước
+        let udpSearchConn = NWConnection(host: host, port: port, using: .udp)
+        var didStartTCP = false
+
+        let launchTCPRegist = { [weak self] in
+            guard let self = self, !didStartTCP else { return }
+            didStartTCP = true
+            udpSearchConn.cancel()
+            self.sendTCPRegistPayload480(ip: ip, pin: pin, accountIDBase64: accountIDBase64)
+        }
+
+        udpSearchConn.stateUpdateHandler = { state in
+            if case .ready = state {
+                let src3Packet = ChiakiEmbeddedCore.shared.buildRegistSearchPacketPS5()
+                udpSearchConn.send(content: src3Packet, completion: .contentProcessed({ _ in }))
+                udpSearchConn.receiveMessage { _, _, _, _ in
+                    launchTCPRegist()
+                }
+            }
+        }
+        udpSearchConn.start(queue: .global(qos: .userInteractive))
+
+        // Nếu sau 0.6s UDP đã gửi xong thì tiến hành mở TCP 9295
+        DispatchQueue.global(qos: .userInteractive).asyncAfter(deadline: .now() + 0.6) {
+            launchTCPRegist()
+        }
+    }
+
+    private func sendTCPRegistPayload480(ip: String, pin: String, accountIDBase64: String) {
         let host = NWEndpoint.Host(ip)
         guard let port = NWEndpoint.Port(rawValue: ROIDefaultConfig.registAndCtrlPort) else { return }
 
@@ -687,7 +720,6 @@ class VideoSourceManager: NSObject, ObservableObject {
         tcpConn.start(queue: .global(qos: .userInteractive))
     }
 
-
     // Mở phiên điều khiển theo đúng quy trình 2 bước của Chiaki:
     // Bước 1: Gọi /sie/ps5/rp/sess/init lấy RP-Nonce từ PS5
     // Bước 2: Mã hoá RP-Auth & RP-Did bằng RP-Nonce + RP-Key rồi mở /sie/ps5/rp/sess/ctrl
@@ -707,7 +739,7 @@ class VideoSourceManager: NSObject, ObservableObject {
                 initReq += "User-Agent: remoteplay Windows\r\n"
                 initReq += "Connection: close\r\n"
                 initReq += "RP-Auth: \(rawAuthBase64)\r\n"
-                initReq += "RP-Version: 1.0\r\n\r\n"
+                initReq += "RP-Version: 2.0\r\n\r\n"
 
                 initConn.send(content: initReq.data(using: .utf8), completion: .contentProcessed({ _ in
                     initConn.receive(minimumIncompleteLength: 1, maximumLength: 4096) { data, _, _, _ in
@@ -751,7 +783,7 @@ class VideoSourceManager: NSObject, ObservableObject {
                 ctrlReq += "User-Agent: remoteplay Windows\r\n"
                 ctrlReq += "Connection: keep-alive\r\n"
                 ctrlReq += "RP-Auth: \(rpAuth)\r\n"
-                ctrlReq += "RP-Version: 1.0\r\n"
+                ctrlReq += "RP-Version: 2.0\r\n"
                 ctrlReq += "RP-Did: \(rpDid)\r\n"
                 ctrlReq += "RP-ControllerType: 3\r\n"
                 ctrlReq += "RP-ClientType: 11\r\n"
