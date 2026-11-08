@@ -34,16 +34,13 @@ jobs:
           #endif
           EOF
 
-          # Trich xuat nguyen ban ham chiaki_regist_request_payload_format tu regist.c cua chiaki-ng
+          # Trich xuat toan bo hang so static const + ham chiaki_regist_request_payload_format tu regist.c
           python3 - << 'PYEOF'
           with open("Sources/ChiakiNative/upstream/regist.c", "r", encoding="utf-8") as f:
               src = f.read()
 
           idx = src.find("chiaki_regist_request_payload_format")
           if idx != -1:
-              start = src.rfind("ChiakiErrorCode", 0, idx)
-              if start == -1:
-                  start = idx
               brace_open = src.find("{", idx)
               depth = 0
               end = brace_open
@@ -55,7 +52,15 @@ jobs:
                       if depth == 0:
                           end = i + 1
                           break
-              func_code = src[start:end]
+
+              # Lay toan bo phan dau file regist.c (chua request_inner_online_id_fmt, request_inner_account_id_fmt, client_type...) den het ham
+              top_part = src[:end]
+              clean_lines = []
+              for line in top_part.splitlines():
+                  if line.strip().startswith("#include"):
+                      continue
+                  clean_lines.append(line)
+
               with open("Sources/ChiakiNative/ChiakiRegistFormat.c", "w", encoding="utf-8") as out:
                   out.write('#include <chiaki/regist.h>\n')
                   out.write('#include <chiaki/rpcrypt.h>\n')
@@ -64,9 +69,8 @@ jobs:
                   out.write('#include <openssl/hmac.h>\n')
                   out.write('#include <string.h>\n')
                   out.write('#include <stdio.h>\n\n')
-                  out.write(func_code + "\n")
-              print("Extracted chiaki_regist_request_payload_format successfully:")
-              print(func_code)
+                  out.write("\n".join(clean_lines) + "\n")
+              print("Extracted constants + chiaki_regist_request_payload_format successfully!")
           PYEOF
 
       - name: 3. Tao Shim OpenSSL Chuan Bit-Exact (CFB128/CBC/ECB) & Cau noi C-Bridge
@@ -454,8 +458,11 @@ jobs:
 
               uint8_t decoded_aid[16] = {0};
               size_t decoded_len = sizeof(decoded_aid);
-              if (chiaki_base64_decode(account_id_b64, strlen(account_id_b64), decoded_aid, &decoded_len) != CHIAKI_ERR_SUCCESS || decoded_len < 8) {
-                  return -2;
+              if (chiaki_base64_decode(account_id_b64, strlen(account_id_b64) + 1, decoded_aid, &decoded_len) != CHIAKI_ERR_SUCCESS || decoded_len < 8) {
+                  decoded_len = sizeof(decoded_aid);
+                  if (chiaki_base64_decode(account_id_b64, strlen(account_id_b64), decoded_aid, &decoded_len) != CHIAKI_ERR_SUCCESS || decoded_len < 8) {
+                      return -2;
+                  }
               }
 
               ChiakiRegistInfo info;
@@ -645,13 +652,6 @@ jobs:
                   content = content.replace(decrypt_sig, decrypt_hook, 1)
                   modified = True
 
-              # Chuan hoa HTTP Header /sie/ps5/rp/sess/rgst theo dung regist.c cua chiaki-ng
-              old_http = 'var rawHTTP = "POST /sie/ps5/rp/sess/rgst HTTP/1.1\\r\\n"'
-              new_http = 'var rawHTTP = "POST /sie/ps5/rp/sess/rgst HTTP/1.1\\r\\n HTTP/1.1\\r\\n"'
-              if old_http in content and new_http not in content:
-                  content = content.replace(old_http, new_http)
-                  modified = True
-
               if modified:
                   with open(path, "w", encoding="utf-8") as f:
                       f.write(content)
@@ -721,6 +721,7 @@ jobs:
                     - "$(inherited)"
                     - "-Wno-implicit-function-declaration"
                     - "-Wno-strict-prototypes"
+                    - "-Wno-documentation"
                   CODE_SIGN_IDENTITY: ""
                   CODE_SIGNING_REQUIRED: NO
                   CODE_SIGNING_ALLOWED: NO
