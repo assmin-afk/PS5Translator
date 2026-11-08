@@ -1,6 +1,6 @@
 // ============================================================================
 // FILE 2A: 2A_ChiakiCoreAndDecoder.swift (TÁCH TỪ FILE 2 - PHẦN 1/2)
-// PHIÊN BẢN: PS5Translator 1.03 (SỬA TRIỆT ĐỂ LỖI 80108b09 & CE-110039-4)
+// PHIÊN BẢN: PS5Translator 1.04 (SỬA TRIỆT ĐỂ LỖI 80108bff - CHUẨN 579 BYTES CHIAKI)
 // ============================================================================
 
 import Foundation
@@ -22,7 +22,8 @@ struct ROIDefaultConfig {
     static let ddpPort: UInt16 = 9302
     static let registAndCtrlPort: UInt16 = 9295
     static let takionStreamPort: UInt16 = 9296
-    static let rpClientType = "dabfa2ec873de5839bee8d3f4c0239c4282c07c25c6077a2931afcf0adc0d34f"
+    // CHUẨN 56 KÝ TỰ CỦA SONY CHIAKI (Sửa triệt để lỗi 80108bff):
+    static let rpClientType = "dabfa2ec873de5839bee8d3f4c0239c4282c07c25c6077a2931af000"
     static let chiakiRegistPrefaceSize = 480 // 0x1E0 bytes Preface chuẩn Chiaki
 }
 
@@ -61,23 +62,21 @@ final class ChiakiEmbeddedCore {
         0x86, 0x0F, 0x9D, 0x2F, 0x5C, 0x70, 0x10, 0x3C
     ]
 
-    // Kiểm tra và chặn đứng mọi mã Account ID giả (băm từ SHA256 tên user hoặc ASCII)
     func isFakeGeneratedAccountID(_ input: String, username: String) -> Bool {
         let trimmed = input.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines)
         if trimmed.isEmpty { return true }
 
-        // Danh sách các mã băm giả từng sinh ra từ tên tài khoản
         let knownFakeIDs: Set<String> = [
             "TWlIc29pOTM=",
-            "nZKnNYIoZ0w=", // SHA256("miesoi93").prefix(8)
+            "nZKnNYIoZ0w=",
             "bWllc29pOTM="
         ]
         if knownFakeIDs.contains(trimmed) { return true }
 
-        let candidates = [username, "Miesoi93", "miesoi93", "Mie", "mie"]
+        let candidates = [username, "Miesoi93", "miesoi93", "Mie", "mie", "Maivy1125", "maivy1125"]
         for name in candidates {
             let clean = name.trimmingCharacters(in: .whitespacesAndNewlines)
-            if clean.isEmpty { continue }
+            if clean.isEmpty || clean.allSatisfy({ $0.isNumber }) { continue }
             for variant in [clean, clean.lowercased(), clean.uppercased()] {
                 let fakeHash = Data(SHA256.hash(data: Data(variant.utf8)).prefix(8)).base64EncodedString()
                 if trimmed == fakeHash { return true }
@@ -106,12 +105,10 @@ final class ChiakiEmbeddedCore {
             return ("", "", false)
         }
 
-        // 1. Nếu người dùng nhập số Account ID 64-bit (thường từ 15 -> 20 chữ số) hoặc Hex 16 ký tự
         if trimmed.allSatisfy({ $0.isNumber }), let numericID = UInt64(trimmed), numericID > 10_000_000 {
             return (convertUInt64ToBase64LittleEndian(numericID), String(numericID), true)
         }
 
-        // 2. Nếu là chuỗi Base64 giải mã ra đúng 8 bytes
         if let decoded = Data(base64Encoded: trimmed), decoded.count == 8 {
             let uint64Val = decoded.withUnsafeBytes { $0.load(as: UInt64.self) }
             let num = UInt64(littleEndian: uint64Val)
@@ -120,7 +117,6 @@ final class ChiakiEmbeddedCore {
             }
         }
 
-        // 3. Nếu là chuỗi Hex 16 ký tự (8 bytes)
         let cleanHex = trimmed.replacingOccurrences(of: "0x", with: "").replacingOccurrences(of: " ", with: "")
         if cleanHex.count == 16, let hexVal = UInt64(cleanHex, radix: 16), hexVal > 10_000_000 {
             return (convertUInt64ToBase64LittleEndian(hexVal), String(hexVal), true)
@@ -161,7 +157,6 @@ final class ChiakiEmbeddedCore {
                 ?? (dict["username"] as? String)
                 ?? ""
 
-            // Ưu tiên 1: Nếu API trả về sẵn encoded_id / base64_id chuẩn 8-byte Little Endian
             let base64Keys = ["encoded_id", "encodedId", "base64_id", "chiaki_id"]
             for key in base64Keys {
                 if let b64Val = dict[key] as? String {
@@ -172,7 +167,6 @@ final class ChiakiEmbeddedCore {
                 }
             }
 
-            // Ưu tiên 2: Chỉ lấy từ các trường định danh tài khoản PSN chính thức (loại bỏ "id" chung chung)
             let idKeys = ["accountId", "account_id", "user_id", "userId", "npAccountId"]
             for key in idKeys {
                 if let rawVal = dict[key], let num = parseValidPSNUInt64(rawVal) {
@@ -238,7 +232,7 @@ final class ChiakiEmbeddedCore {
         return Data([0x53, 0x52, 0x43, 0x33])
     }
 
-    // MARK: - Đóng gói gói tin đăng ký 587 bytes (480B Preface + 107B Encrypted Payload) chuẩn PS5
+    // MARK: - Đóng gói gói tin đăng ký 579 bytes (480B Preface + 99B Encrypted Payload) chuẩn PS5
     func buildChiakiPS5RegistPayload480(pinString: String, accountIDBase64: String) -> (payload: Data, aesKey: [UInt8], iv: [UInt8]) {
         let pinNumber = UInt32(pinString) ?? 0
         let pinBytes: [UInt8] = [
@@ -261,7 +255,7 @@ final class ChiakiEmbeddedCore {
             aesKey[i] = ambassador[i] ^ ps5Key1[i] ^ pinBytes[i % 4]
         }
 
-        // Đảm bảo chuỗi AccountID Base64 đúng chuẩn 12 ký tự (8 bytes)
+        // Chuỗi Record đúng 99 bytes chuẩn regist.c của Chiaki (480 + 99 = 579 bytes)
         let cleanBase64 = accountIDBase64.trimmingCharacters(in: .whitespacesAndNewlines)
         let recordString = "Client-Type: \(ROIDefaultConfig.rpClientType)\r\nNp-AccountId: \(cleanBase64)\r\n"
         let plainRecordData = Data(recordString.utf8)
@@ -286,7 +280,6 @@ final class ChiakiEmbeddedCore {
         return (fullPayload, aesKey, iv)
     }
 
-    // MARK: - Bộ tạo luồng khoá (Keystream XOR) chuẩn chiaki_rpcrypt_generate_keystream (rpcrypt.c)
     func chiakiRPCryptXOR(data: Data, key: [UInt8], iv: [UInt8], counter: UInt64 = 0) -> Data {
         guard !data.isEmpty else { return data }
         let alignedLen = ((data.count + 15) / 16) * 16
@@ -315,7 +308,6 @@ final class ChiakiEmbeddedCore {
         return Data(outBytes)
     }
 
-    // Giải mã phản hồi ghép đôi từ PS5
     func decryptRegistResponse(cipherData: Data, aesKey: [UInt8], iv: [UInt8]) -> String? {
         guard !cipherData.isEmpty else { return nil }
 
@@ -351,7 +343,7 @@ final class ChiakiEmbeddedCore {
             let block = sub.prefix(alignedLen)
             if let text = runAES128CBCDecrypt(data: block, key: aesKey, iv: iv),
                (text.contains("PS5-RegistKey") || text.contains("RP-RegistKey") || text.contains("RP-Key")) {
-                return text
+                return text.trimmingCharacters(in: CharacterSet(charactersIn: "\0"))
             }
         }
 
@@ -471,10 +463,9 @@ final class ChiakiEmbeddedCore {
         return (encAuth.base64EncodedString(), encDid.base64EncodedString())
     }
 
-    // Chuẩn hoá HTTP Header cho gói đăng ký /sie/ps5/rp/sess/rgst theo đúng regist.c của Chiaki
     func buildRawHTTPRegistRequest(ip: String, payload: Data) -> Data {
         var rawHTTP = "POST /sie/ps5/rp/sess/rgst HTTP/1.1\r\n"
-        rawHTTP += "Host: \(ip)\r\n"
+        rawHTTP += "Host: \(ip):\(ROIDefaultConfig.registAndCtrlPort)\r\n"
         rawHTTP += "User-Agent: remoteplay Windows\r\n"
         rawHTTP += "Connection: close\r\n"
         rawHTTP += "Content-Length: \(payload.count)\r\n"
