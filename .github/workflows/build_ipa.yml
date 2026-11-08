@@ -1,4 +1,4 @@
-name: Dong goi App iPhone (.ipa)
+name: Dong goi App iPhone (.ipa) voi Loi C Chiaki-NG
 
 on:
   push:
@@ -9,24 +9,542 @@ jobs:
   build_unsigned_ipa:
     runs-on: macos-latest
     steps:
-      - name: 1. Tai code va icon.png ve may chu Mac
+      - name: 1. Tai code du an va icon.png ve may chu Mac
         uses: actions/checkout@v4
 
-      - name: 2. Gom 6 file Swift va tao Bo Icon App iPhone tu icon.png
+      - name: 2. Tai thu vien C goc cua chiaki-ng (rpcrypt.c, regist.c, takion.c)
         run: |
-          mkdir -p Sources
+          git clone --depth 1 https://github.com/streetpea/chiaki-ng.git chiaki_upstream || \
+          git clone --depth 1 https://git.sr.ht/~thestr4ng3r/chiaki chiaki_upstream
 
-          # Tu dong doi ten neu Windows luu nham thanh .swift.txt
+          mkdir -p Sources/ChiakiNative/include/chiaki
+          mkdir -p Sources/ChiakiNative/include/openssl
+          mkdir -p Sources/ChiakiNative/upstream
+
+          # Copy rpcrypt.c (chua bang khoa aerolith + dugong PS5 that) de bien dich truc tiep
+          cp chiaki_upstream/lib/src/rpcrypt.c Sources/ChiakiNative/rpcrypt.c
+
+          # Copy regist.c va takion.c vao upstream va trich xuat hang so giao thuc
+          cp chiaki_upstream/lib/src/regist.c Sources/ChiakiNative/upstream/regist.c || true
+          cp chiaki_upstream/lib/src/takion.c Sources/ChiakiNative/upstream/takion.c || true
+          cp -R chiaki_upstream/lib/include/chiaki/* Sources/ChiakiNative/include/chiaki/ || true
+
+          # Tao file chiaki_export.h (thay the CMake GenerateExportHeader)
+          cat << 'EOF' > Sources/ChiakiNative/include/chiaki_export.h
+          #ifndef CHIAKI_EXPORT_H
+          #define CHIAKI_EXPORT_H
+          #define CHIAKI_EXPORT
+          #define CHIAKI_NO_EXPORT
+          #endif
+          EOF
+
+      - name: 3. Tao Shim OpenSSL -> Apple CommonCrypto & Cau noi C-Bridge (rpcrypt/regist/takion)
+        run: |
+          # 3.1. Tao bo header OpenSSL Shim chay tren phan cung Apple CommonCrypto cua iOS ARM64
+          cat << 'EOF' > Sources/ChiakiNative/include/openssl/evp.h
+          #ifndef CHIAKI_OPENSSL_EVP_SHIM_H
+          #define CHIAKI_OPENSSL_EVP_SHIM_H
+
+          #include <stdlib.h>
+          #include <string.h>
+          #include <stdint.h>
+          #include <CommonCrypto/CommonCryptor.h>
+          #include <CommonCrypto/CommonDigest.h>
+
+          typedef struct {
+              int mode; // 0 = AES-128-CBC, 1 = AES-128-ECB
+          } EVP_CIPHER;
+
+          typedef struct {
+              CCCryptorRef cryptor;
+              int mode;
+              CCOperation op;
+              uint8_t key[16];
+              uint8_t iv[16];
+          } EVP_CIPHER_CTX;
+
+          static inline const EVP_CIPHER *EVP_aes_128_cbc(void) {
+              static const EVP_CIPHER cbc = { 0 };
+              return &cbc;
+          }
+
+          static inline const EVP_CIPHER *EVP_aes_128_ecb(void) {
+              static const EVP_CIPHER ecb = { 1 };
+              return &ecb;
+          }
+
+          static inline const void *EVP_sha256(void) {
+              return (const void *)1;
+          }
+
+          static inline EVP_CIPHER_CTX *EVP_CIPHER_CTX_new(void) {
+              return (EVP_CIPHER_CTX *)calloc(1, sizeof(EVP_CIPHER_CTX));
+          }
+
+          static inline void EVP_CIPHER_CTX_free(EVP_CIPHER_CTX *ctx) {
+              if (!ctx) return;
+              if (ctx->cryptor) {
+                  CCCryptorRelease(ctx->cryptor);
+                  ctx->cryptor = NULL;
+              }
+              free(ctx);
+          }
+
+          static inline int EVP_CIPHER_CTX_init_common(
+              EVP_CIPHER_CTX *ctx,
+              CCOperation op,
+              const EVP_CIPHER *cipher,
+              const unsigned char *key,
+              const unsigned char *iv
+          ) {
+              if (!ctx) return 0;
+              if (ctx->cryptor) {
+                  CCCryptorRelease(ctx->cryptor);
+                  ctx->cryptor = NULL;
+              }
+              if (cipher) ctx->mode = cipher->mode;
+              ctx->op = op;
+              if (key) memcpy(ctx->key, key, 16);
+              if (iv) memcpy(ctx->iv, iv, 16);
+              else memset(ctx->iv, 0, 16);
+
+              CCOptions opts = (ctx->mode == 1) ? kCCOptionECBMode : 0;
+              CCCryptorStatus st = CCCryptorCreate(
+                  op,
+                  kCCAlgorithmAES,
+                  opts,
+                  ctx->key,
+                  kCCKeySizeAES128,
+                  (ctx->mode == 1) ? NULL : ctx->iv,
+                  &ctx->cryptor
+              );
+              return (st == kCCSuccess) ? 1 : 0;
+          }
+
+          static inline int EVP_EncryptInit_ex(
+              EVP_CIPHER_CTX *ctx,
+              const EVP_CIPHER *cipher,
+              void *impl,
+              const unsigned char *key,
+              const unsigned char *iv
+          ) {
+              (void)impl;
+              return EVP_CIPHER_CTX_init_common(ctx, kCCEncrypt, cipher, key, iv);
+          }
+
+          static inline int EVP_DecryptInit_ex(
+              EVP_CIPHER_CTX *ctx,
+              const EVP_CIPHER *cipher,
+              void *impl,
+              const unsigned char *key,
+              const unsigned char *iv
+          ) {
+              (void)impl;
+              return EVP_CIPHER_CTX_init_common(ctx, kCCDecrypt, cipher, key, iv);
+          }
+
+          static inline int EVP_CIPHER_CTX_set_padding(EVP_CIPHER_CTX *ctx, int pad) {
+              (void)ctx; (void)pad;
+              return 1;
+          }
+
+          static inline int EVP_EncryptUpdate(
+              EVP_CIPHER_CTX *ctx,
+              unsigned char *out,
+              int *outl,
+              const unsigned char *in,
+              int inl
+          ) {
+              if (!ctx || !ctx->cryptor) return 0;
+              size_t moved = 0;
+              CCCryptorStatus st = CCCryptorUpdate(ctx->cryptor, in, (size_t)inl, out, (size_t)inl + 16, &moved);
+              if (outl) *outl = (int)moved;
+              return (st == kCCSuccess) ? 1 : 0;
+          }
+
+          static inline int EVP_DecryptUpdate(
+              EVP_CIPHER_CTX *ctx,
+              unsigned char *out,
+              int *outl,
+              const unsigned char *in,
+              int inl
+          ) {
+              if (!ctx || !ctx->cryptor) return 0;
+              size_t moved = 0;
+              CCCryptorStatus st = CCCryptorUpdate(ctx->cryptor, in, (size_t)inl, out, (size_t)inl + 16, &moved);
+              if (outl) *outl = (int)moved;
+              return (st == kCCSuccess) ? 1 : 0;
+          }
+
+          static inline int EVP_EncryptFinal_ex(EVP_CIPHER_CTX *ctx, unsigned char *outm, int *outl) {
+              (void)ctx; (void)outm;
+              if (outl) *outl = 0;
+              return 1;
+          }
+
+          static inline int EVP_DecryptFinal_ex(EVP_CIPHER_CTX *ctx, unsigned char *outm, int *outl) {
+              (void)ctx; (void)outm;
+              if (outl) *outl = 0;
+              return 1;
+          }
+
+          #endif
+          EOF
+
+          cat << 'EOF' > Sources/ChiakiNative/include/openssl/hmac.h
+          #ifndef CHIAKI_OPENSSL_HMAC_SHIM_H
+          #define CHIAKI_OPENSSL_HMAC_SHIM_H
+
+          #include <stddef.h>
+          #include <CommonCrypto/CommonHMAC.h>
+          #include "evp.h"
+
+          static inline unsigned char *HMAC(
+              const void *evp_md,
+              const void *key,
+              int key_len,
+              const unsigned char *d,
+              size_t n,
+              unsigned char *md,
+              unsigned int *md_len
+          ) {
+              (void)evp_md;
+              static unsigned char static_md[CC_SHA256_DIGEST_LENGTH];
+              unsigned char *target = md ? md : static_md;
+              CCHmac(kCCHmacAlgSHA256, key, (size_t)key_len, d, n, target);
+              if (md_len) *md_len = CC_SHA256_DIGEST_LENGTH;
+              return target;
+          }
+
+          #endif
+          EOF
+
+          cat << 'EOF' > Sources/ChiakiNative/include/openssl/sha.h
+          #ifndef CHIAKI_OPENSSL_SHA_SHIM_H
+          #define CHIAKI_OPENSSL_SHA_SHIM_H
+          #include <CommonCrypto/CommonDigest.h>
+          #define SHA256_DIGEST_LENGTH CC_SHA256_DIGEST_LENGTH
+          #endif
+          EOF
+
+          cat << 'EOF' > Sources/ChiakiNative/include/openssl/aes.h
+          #ifndef CHIAKI_OPENSSL_AES_SHIM_H
+          #define CHIAKI_OPENSSL_AES_SHIM_H
+          #define AES_BLOCK_SIZE 16
+          #endif
+          EOF
+
+          cat << 'EOF' > Sources/ChiakiNative/include/openssl/err.h
+          #ifndef CHIAKI_OPENSSL_ERR_SHIM_H
+          #define CHIAKI_OPENSSL_ERR_SHIM_H
+          #endif
+          EOF
+
+          # 3.2. Tao Header va File C-Bridge ket noi rpcrypt.c + regist.c + takion.c sang Swift
+          cat << 'EOF' > Sources/ChiakiNative/ChiakiCBridge.h
+          #ifndef CHIAKI_C_BRIDGE_H
+          #define CHIAKI_C_BRIDGE_H
+
+          #include <stdint.h>
+          #include <stddef.h>
+
+          #ifdef __cplusplus
+          extern "C" {
+          #endif
+
+          // 1. Dong goi 587-byte (480B Preface + 107B Encrypted Record) bang rpcrypt.c & regist.c goc cua chiaki-ng
+          int chiaki_bridge_build_ps5_regist_payload(
+              const char *pin_str,
+              const char *account_id_b64,
+              const char *client_type_str,
+              uint8_t *out_payload,
+              size_t *out_len,
+              uint8_t out_bright[16],
+              uint8_t out_echidna[16],
+              uint8_t out_hmac_key[16]
+          );
+
+          // 2. Giai ma phan hoi ghep doi 200 OK tu PS5 bang rpcrypt.c goc
+          int chiaki_bridge_decrypt_regist_response(
+              const uint8_t *cipher,
+              size_t cipher_len,
+              const uint8_t bright[16],
+              const uint8_t echidna[16],
+              const uint8_t hmac_key[16],
+              uint8_t *out_plain,
+              size_t max_plain_len
+          );
+
+          // 3. Ma hoa RP-Auth & RP-Did cho phien /ctrl bang chiaki_rpcrypt_init_auth goc
+          int chiaki_bridge_encrypt_session_data(
+              const uint8_t nonce[16],
+              const uint8_t rp_key[16],
+              uint64_t counter,
+              const uint8_t *data_in,
+              size_t data_len,
+              uint8_t *data_out
+          );
+
+          #ifdef __cplusplus
+          }
+          #endif
+
+          #endif
+          EOF
+
+          cat << 'EOF' > Sources/ChiakiNative/ChiakiCBridge.c
+          #include "ChiakiCBridge.h"
+          #include <chiaki/rpcrypt.h>
+          #include <chiaki/log.h>
+          #include <stdlib.h>
+          #include <stdio.h>
+          #include <string.h>
+          #include <Security/SecRandom.h>
+
+          __attribute__((weak)) void chiaki_log(ChiakiLog *log, ChiakiLogLevel level, const char *fmt, ...) {
+              (void)log; (void)level; (void)fmt;
+          }
+
+          __attribute__((weak)) const char *chiaki_error_string(ChiakiErrorCode code) {
+              (void)code;
+              return "chiaki_err";
+          }
+
+          int chiaki_bridge_build_ps5_regist_payload(
+              const char *pin_str,
+              const char *account_id_b64,
+              const char *client_type_str,
+              uint8_t *out_payload,
+              size_t *out_len,
+              uint8_t out_bright[16],
+              uint8_t out_echidna[16],
+              uint8_t out_hmac_key[16]
+          ) {
+              if (!pin_str || !account_id_b64 || !client_type_str || !out_payload || !out_len) {
+                  return -1;
+              }
+
+              uint32_t pin = (uint32_t)strtoul(pin_str, NULL, 10);
+              uint8_t ambassador[16];
+              if (SecRandomCopyBytes(kSecRandomDefault, 16, ambassador) != errSecSuccess) {
+                  for (int i = 0; i < 16; i++) ambassador[i] = (uint8_t)(arc4random() & 0xFF);
+              }
+
+              // Goi truc tiep chiaki_rpcrypt_init_regist tu rpcrypt.c cua chiaki-ng (co bang aerolith + dugong PS5)
+              ChiakiRPCrypt rpcrypt;
+              memset(&rpcrypt, 0, sizeof(rpcrypt));
+              ChiakiErrorCode err = chiaki_rpcrypt_init_regist(&rpcrypt, CHIAKI_TARGET_PS5_1, ambassador, pin);
+              if (err != CHIAKI_ERR_SUCCESS) {
+                  return -2;
+              }
+
+              memcpy(out_bright, rpcrypt.bright, 16);
+              memcpy(out_echidna, rpcrypt.echidna, 16);
+              memcpy(out_hmac_key, rpcrypt.hmac_key, 16);
+
+              // Dong goi 480 bytes Preface (0x1E0) theo dung regist.c cua chiaki-ng
+              memset(out_payload, 0x41, 0x1E0);
+              memcpy(out_payload + 0x7B, ambassador, 8);
+              memcpy(out_payload + 0x158, ambassador + 8, 8);
+
+              // Tao Record tai offset 0x1E0
+              char record_buf[256];
+              int record_len = snprintf(
+                  record_buf,
+                  sizeof(record_buf),
+                  "Client-Type: %s\r\nNp-AccountId: %s\r\n",
+                  client_type_str,
+                  account_id_b64
+              );
+              if (record_len <= 0 || record_len >= (int)sizeof(record_buf)) {
+                  return -3;
+              }
+
+              // Tinh HMAC-SHA256 tren ban ro bang rpcrypt.hmac_key va dat tai 0x1C0
+              chiaki_rpcrypt_hmac(&rpcrypt, out_payload + 0x1C0, (const uint8_t *)record_buf, (size_t)record_len);
+
+              // Ma hoa Record bang chiaki_rpcrypt_encrypt va dat tai 0x1E0
+              err = chiaki_rpcrypt_encrypt(
+                  &rpcrypt,
+                  0,
+                  (const uint8_t *)record_buf,
+                  out_payload + 0x1E0,
+                  (size_t)record_len
+              );
+              if (err != CHIAKI_ERR_SUCCESS) {
+                  return -4;
+              }
+
+              *out_len = (size_t)(0x1E0 + record_len);
+              return 0;
+          }
+
+          int chiaki_bridge_decrypt_regist_response(
+              const uint8_t *cipher,
+              size_t cipher_len,
+              const uint8_t bright[16],
+              const uint8_t echidna[16],
+              const uint8_t hmac_key[16],
+              uint8_t *out_plain,
+              size_t max_plain_len
+          ) {
+              if (!cipher || cipher_len <= 0x20 || !out_plain) return -1;
+
+              ChiakiRPCrypt rpcrypt;
+              memset(&rpcrypt, 0, sizeof(rpcrypt));
+              rpcrypt.target = CHIAKI_TARGET_PS5_1;
+              memcpy(rpcrypt.bright, bright, 16);
+              memcpy(rpcrypt.echidna, echidna, 16);
+              memcpy(rpcrypt.hmac_key, hmac_key, 16);
+
+              size_t enc_len = cipher_len - 0x20;
+              if (enc_len >= max_plain_len) enc_len = max_plain_len - 1;
+
+              if (chiaki_rpcrypt_decrypt(&rpcrypt, 0, cipher + 0x20, out_plain, enc_len) != CHIAKI_ERR_SUCCESS) {
+                  return -2;
+              }
+              out_plain[enc_len] = 0;
+              return (int)enc_len;
+          }
+
+          int chiaki_bridge_encrypt_session_data(
+              const uint8_t nonce[16],
+              const uint8_t rp_key[16],
+              uint64_t counter,
+              const uint8_t *data_in,
+              size_t data_len,
+              uint8_t *data_out
+          ) {
+              if (!nonce || !rp_key || !data_in || !data_out) return -1;
+
+              ChiakiRPCrypt rpcrypt;
+              memset(&rpcrypt, 0, sizeof(rpcrypt));
+              if (chiaki_rpcrypt_init_auth(&rpcrypt, CHIAKI_TARGET_PS5_1, nonce, rp_key) != CHIAKI_ERR_SUCCESS) {
+                  return -2;
+              }
+              if (chiaki_rpcrypt_encrypt(&rpcrypt, counter, data_in, data_out, data_len) != CHIAKI_ERR_SUCCESS) {
+                  return -3;
+              }
+              return 0;
+          }
+          EOF
+
+          cat << 'EOF' > Sources/PS5Translator-Bridging-Header.h
+          #include "ChiakiNative/ChiakiCBridge.h"
+          EOF
+
+      - name: 4. Gom cac file Swift, tich hop C-Bridge tu dong va tao Bo Icon App
+        run: |
           for f in *.swift.txt; do
             [ -f "$f" ] && cp "$f" "Sources/${f%.txt}"
           done
 
-          # Copy tat ca file .swift vao thu muc Sources
           for f in *.swift; do
             [ -f "$f" ] && cp "$f" "Sources/$f"
           done
 
-          # Neu co file icon.png thi tao bo AppIcon chuan iOS va copy vao App
+          # Kich hoat loi C (ChiakiCBridge) truc tiep trong cac file Swift cua du an
+          python3 - << 'PYEOF'
+          import glob, re
+
+          for path in glob.glob("Sources/*.swift"):
+              with open(path, "r", encoding="utf-8") as f:
+                  content = f.read()
+
+              modified = False
+
+              # 1. Dam bao rpClientType dung chuan 64 ky tu cua PS5 (587 bytes)
+              if "static let rpClientType =" in content:
+                  content = re.sub(
+                      r'static let rpClientType\s*=\s*"[^"]+"',
+                      'static let rpClientType = "dabfa2ec873de5839bee8d3f4c0239c4282c07c25c6077a2931afcf0adc0d34f"',
+                      content
+                  )
+                  modified = True
+
+              # 2. Hook buildChiakiPS5RegistPayload480 sang chiaki_bridge_build_ps5_regist_payload (rpcrypt.c)
+              target_sig = "func buildChiakiPS5RegistPayload480(pinString: String, accountIDBase64: String) -> (payload: Data, aesKey: [UInt8], iv: [UInt8]) {"
+              if target_sig in content and "chiaki_bridge_build_ps5_regist_payload" not in content:
+                  c_hook = """func buildChiakiPS5RegistPayload480(pinString: String, accountIDBase64: String) -> (payload: Data, aesKey: [UInt8], iv: [UInt8]) {
+              let cleanBase64 = accountIDBase64.trimmingCharacters(in: .whitespacesAndNewlines)
+              var outPayload = [UInt8](repeating: 0, count: 1024)
+              var outLen: Int = 0
+              var bright = [UInt8](repeating: 0, count: 16)
+              var echidna = [UInt8](repeating: 0, count: 16)
+              var hmacKey = [UInt8](repeating: 0, count: 16)
+
+              let res = pinString.withCString { pinCStr in
+                  cleanBase64.withCString { aidCStr in
+                      ROIDefaultConfig.rpClientType.withCString { clientCStr in
+                          chiaki_bridge_build_ps5_regist_payload(
+                              pinCStr,
+                              aidCStr,
+                              clientCStr,
+                              &outPayload,
+                              &outLen,
+                              &bright,
+                              &echidna,
+                              &hmacKey
+                          )
+                      }
+                  }
+              }
+              if res == 0 && outLen > 0 {
+                  return (Data(outPayload.prefix(outLen)), bright, echidna)
+              }
+          """
+                  content = content.replace(target_sig, c_hook, 1)
+                  modified = True
+
+              # 3. Hook decryptRegistResponse sang chiaki_bridge_decrypt_regist_response (rpcrypt.c)
+              decrypt_sig = "func decryptRegistResponse(cipherData: Data, aesKey: [UInt8], iv: [UInt8]) -> String? {"
+              if decrypt_sig in content and "chiaki_bridge_decrypt_regist_response" not in content:
+                  decrypt_hook = """func decryptRegistResponse(cipherData: Data, aesKey: [UInt8], iv: [UInt8]) -> String? {
+              if cipherData.count > 0x20 && aesKey.count == 16 && iv.count == 16 {
+                  var plainBuf = [UInt8](repeating: 0, count: 2048)
+                  let cipherBytes = [UInt8](cipherData)
+                  var dummyHmac = [UInt8](repeating: 0, count: 16)
+                  let decLen = chiaki_bridge_decrypt_regist_response(
+                      cipherBytes,
+                      cipherBytes.count,
+                      aesKey,
+                      iv,
+                      &dummyHmac,
+                      &plainBuf,
+                      plainBuf.count
+                  )
+                  if decLen > 0 {
+                      let data = Data(plainBuf.prefix(Int(decLen)))
+                      if let text = String(data: data, encoding: .utf8) ?? String(data: data, encoding: .isoLatin1),
+                         (text.contains("PS5-RegistKey") || text.contains("RP-RegistKey") || text.contains("RP-Key")) {
+                          return text.trimmingCharacters(in: CharacterSet(charactersIn: "\\0"))
+                      }
+                  }
+              }
+          """
+                  content = content.replace(decrypt_sig, decrypt_hook, 1)
+                  modified = True
+
+              # 4. Hook buildSessionAuthHeaders sang chiaki_bridge_encrypt_session_data (rpcrypt.c)
+              session_target = "let encAuth = chiakiRPCryptXOR(data: rawAuthData, key: sessionKey, iv: sessionIV, counter: 0)"
+              if session_target in content and "chiaki_bridge_encrypt_session_data" not in content:
+                  session_hook = """var cEncAuth = [UInt8](repeating: 0, count: 16)
+              var cEncDid = [UInt8](repeating: 0, count: 32)
+              let rawAuthBytes = [UInt8](rawAuthData)
+              if chiaki_bridge_encrypt_session_data(nonce, rpKeyBytes, 0, rawAuthBytes, 16, &cEncAuth) == 0 &&
+                 chiaki_bridge_encrypt_session_data(nonce, rpKeyBytes, 0, didBytes, 32, &cEncDid) == 0 {
+                  return (Data(cEncAuth).base64EncodedString(), Data(cEncDid).base64EncodedString())
+              }
+              let encAuth = chiakiRPCryptXOR(data: rawAuthData, key: sessionKey, iv: sessionIV, counter: 0)"""
+                  content = content.replace(session_target, session_hook, 1)
+                  modified = True
+
+              if modified:
+                  with open(path, "w", encoding="utf-8") as f:
+                      f.write(content)
+                  print(f"Injected Chiaki-NG C-Bridge into {path}")
+          PYEOF
+
           if [ -f "icon.png" ]; then
             cp icon.png Sources/icon.png
             mkdir -p Sources/Assets.xcassets/AppIcon.appiconset
@@ -64,6 +582,8 @@ jobs:
               deploymentTarget: "16.0"
               sources:
                 - path: Sources
+                  excludes:
+                    - "ChiakiNative/upstream/**"
               info:
                 path: Info.plist
                 properties:
@@ -80,20 +600,24 @@ jobs:
                 base:
                   PRODUCT_BUNDLE_IDENTIFIER: com.ps5viet.translator
                   ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+                  SWIFT_OBJC_BRIDGING_HEADER: Sources/PS5Translator-Bridging-Header.h
+                  HEADER_SEARCH_PATHS:
+                    - "$(inherited)"
+                    - "$(PROJECT_DIR)/Sources/ChiakiNative/include"
                   CODE_SIGN_IDENTITY: ""
                   CODE_SIGNING_REQUIRED: NO
                   CODE_SIGNING_ALLOWED: NO
                   AD_HOC_CODE_SIGNING_ALLOWED: YES
           EOF
 
-      - name: 3. Khoi tao Project Xcode bang XcodeGen
+      - name: 5. Khoi tao Project Xcode bang XcodeGen
         run: |
           if ! command -v xcodegen &> /dev/null; then
             brew install xcodegen
           fi
           xcodegen generate
 
-      - name: 4. Bien dich 6 file Swift thanh App iPhone
+      - name: 6. Bien dich Swift + Loi C Chiaki-NG thanh App iPhone
         run: |
           xcodebuild clean build \
             -project PS5Translator.xcodeproj \
@@ -106,13 +630,13 @@ jobs:
             CODE_SIGNING_ALLOWED=NO \
             AD_HOC_CODE_SIGNING_ALLOWED=YES
 
-      - name: 5. Dong goi thanh file PS5Translator.ipa
+      - name: 7. Dong goi thanh file PS5Translator.ipa
         run: |
           mkdir -p Payload
           cp -r build_output/Release-iphoneos/PS5Translator.app Payload/
           zip -r PS5Translator.ipa Payload
 
-      - name: 6. Xuat file PS5Translator.ipa de tai ve Windows
+      - name: 8. Xuat file PS5Translator.ipa de tai ve Windows
         uses: actions/upload-artifact@v4
         with:
           name: File_Cai_Dat_PS5Translator_IPA
