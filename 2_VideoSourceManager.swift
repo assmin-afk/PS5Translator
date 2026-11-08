@@ -1,6 +1,12 @@
 // ============================================================================
 // FILE 2B: 2_VideoSourceManager.swift (TÁCH TỪ FILE 2 - PHẦN 2/2)
-// PHIÊN BẢN: PS5Translator 1.02 (ĐỒNG BỘ PS5-REGISTKEY, SRC3 UDP 9295 & RP-VERSION 1.0)
+// PHIÊN BẢN: PS5Translator 1.02 (ĐỒNG BỘ PS5-REGISTKEY, SRC3 UDP 9295, ĐỘ TRỄ 0.25S & RP-VERSION 1.0)
+// NHIỆM VỤ:
+// 1. Quản lý luồng hình ảnh PS5 Remote Play & trạng thái kết nối thực tế.
+// 2. Tự động trích xuất Account ID 8-byte thật từ Cookie Sony (npsso / OAuth Code),
+//    giải mã JWT trực tiếp và truy vấn chuỗi 5 cổng Profile chính thức của Sony.
+// 3. Căn chỉnh khung ROI, quét tìm máy PS5 qua UDP 9302, ghép đôi mã PIN cổng 9295
+//    (kèm độ trễ 0.25s giữa /init và /ctrl) và mở phiên truyền hình ảnh thời gian thực cổng UDP 9296.
 // ============================================================================
 
 import Foundation
@@ -11,6 +17,9 @@ import Network
 import CryptoKit
 import WebKit
 
+// ============================================================================
+// 3. TRÌNH QUẢN LÝ LUỒNG HÌNH ẢNH & KẾT NỐI CHIAKI PS5 THỰC TẾ
+// ============================================================================
 class VideoSourceManager: NSObject, ObservableObject {
     @Published var currentFullFrame: CGImage?
 
@@ -19,6 +28,7 @@ class VideoSourceManager: NSObject, ObservableObject {
     @Published var isUsingTestSimulator: Bool = false
     @Published var isReceivingRealPS5Video: Bool = false
 
+    // Ghi nhớ vĩnh viễn thông tin tài khoản thật trong UserDefaults
     @Published var psnUsername: String = UserDefaults.standard.string(forKey: "psn_user_v102") ?? "Miesoi93" {
         didSet { UserDefaults.standard.set(psnUsername, forKey: "psn_user_v102") }
     }
@@ -40,6 +50,7 @@ class VideoSourceManager: NSObject, ObservableObject {
     @Published var discoveredPS5HostID: String = UserDefaults.standard.string(forKey: "ps5_hostid_v102") ?? ""
     @Published var statusLog: String = "Sẵn sàng kết nối máy PS5 qua lõi Chiaki."
 
+    // Khoá phiên Chiaki thật (Chỉ lưu khi PS5 trả về HTTP 200 OK)
     @Published var savedRegistKey: String = UserDefaults.standard.string(forKey: "chiaki_real_regist_key_v102") ?? ""
     @Published var savedRPKey: String = UserDefaults.standard.string(forKey: "chiaki_real_rp_key_v102") ?? ""
 
@@ -65,6 +76,7 @@ class VideoSourceManager: NSObject, ObservableObject {
         )
         super.init()
 
+        // 1. Tự động xoá bỏ khoá giả từ bản trước
         UserDefaults.standard.removeObject(forKey: "chiaki_regist_key_v102")
         UserDefaults.standard.removeObject(forKey: "chiaki_rp_key_v102")
 
@@ -81,6 +93,7 @@ class VideoSourceManager: NSObject, ObservableObject {
             statusLog = "✅ Đã ghi nhớ tài khoản thật '\(psnUsername)' (ID: \(psnAccountIDBase64))."
         }
 
+        // 2. Khi giải mã được khung hình video H.264/HEVC thật từ PS5 -> đưa thẳng vào bộ quét OCR
         videoDecoder.onFrameDecoded = { [weak self] decodedCGImage in
             guard let self = self else { return }
             self.isReceivingRealPS5Video = true
@@ -98,6 +111,7 @@ class VideoSourceManager: NSObject, ObservableObject {
         }
     }
 
+    // MARK: - Tự động trích xuất Account ID 8-byte thật từ Cookie đăng nhập Sony (WKWebsiteDataStore)
     func extractAccountIDFromSonyWebCookies(completion: ((Bool) -> Void)? = nil) {
         DispatchQueue.main.async {
             WKWebsiteDataStore.default().httpCookieStore.getAllCookies { [weak self] cookies in
@@ -117,12 +131,14 @@ class VideoSourceManager: NSObject, ObservableObject {
                     HTTPCookieStorage.shared.setCookie(cookie)
                 }
 
+                // Bước 1: Thử gọi thẳng cổng BasicProfile của PlayStation bằng Cookie hiện có
                 self.fetchBasicProfileWithCookies(sonyCookies) { foundDirect in
                     if foundDirect {
                         completion?(true)
                         return
                     }
 
+                    // Bước 2: Dùng Cookie (bao gồm npsso) để lấy OAuth Code ngầm
                     let silentAuthURLStr = "https://ca.account.sony.com/api/authz/v3/oauth/authorize?access_type=offline&client_id=09515159-7237-4370-9b40-3806e67c0891&redirect_uri=com.scee.psxandroid.scecompcall%3A%2F%2Fredirect&response_type=code&scope=psn:mobile.v2.core%20psn:clientapp&prompt=none"
                     guard let url = URL(string: silentAuthURLStr) else {
                         completion?(false)
@@ -180,6 +196,7 @@ class VideoSourceManager: NSObject, ObservableObject {
         }.resume()
     }
 
+    // Đổi OAuth Code sang Token (có token_format=jwt) và quét chuỗi 5 cổng của Sony
     func exchangeSonyCodeForRealAccountID(code: String, completion: ((Bool) -> Void)? = nil) {
         guard let tokenURL = URL(string: "https://ca.account.sony.com/api/authz/v3/oauth/token") else {
             completion?(false)
@@ -200,6 +217,7 @@ class VideoSourceManager: NSObject, ObservableObject {
                 return
             }
 
+            // Tầng 1: Quét trực tiếp JSON trả về từ cổng Token
             if let directFound = ChiakiEmbeddedCore.shared.extractAccountIDFromJSONData(data) {
                 DispatchQueue.main.async {
                     let user = directFound.onlineID.isEmpty ? self.psnUsername : directFound.onlineID
@@ -215,6 +233,7 @@ class VideoSourceManager: NSObject, ObservableObject {
                 return
             }
 
+            // Tầng 2: Giải mã trực tiếp chuỗi JWT access_token / id_token
             if let jwtFound = ChiakiEmbeddedCore.shared.extractAccountIDFromJWT(accessToken) {
                 DispatchQueue.main.async {
                     let user = jwtFound.onlineID.isEmpty ? self.psnUsername : jwtFound.onlineID
@@ -233,6 +252,7 @@ class VideoSourceManager: NSObject, ObservableObject {
                 return
             }
 
+            // Tầng 3 -> 6: Truy vấn chuỗi 5 cổng Profile & Introspection chính thức của Sony
             self.fetchPSNAccountIDMultiEndpoint(accessToken: accessToken) { onlineID, base64ID, numericID in
                 DispatchQueue.main.async {
                     let user = onlineID.isEmpty ? self.psnUsername : onlineID
@@ -288,6 +308,7 @@ class VideoSourceManager: NSObject, ObservableObject {
         tryEndpoint(at: 0)
     }
 
+    // MARK: - Ghi nhớ vĩnh viễn tài khoản thật
     func saveRememberedAccount(username: String, accountIDBase64: String, numericID: String = "") {
         let cleanUser = username.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines)
         if !cleanUser.isEmpty {
@@ -330,6 +351,7 @@ class VideoSourceManager: NSObject, ObservableObject {
         statusLog = "Đã xoá tài khoản cũ. Hãy bấm 'Đăng nhập Sony' hoặc 'Tự lấy ID' để lấy mã 8-byte thật."
     }
 
+    // MARK: - Tra cứu Account ID 8-byte thật từ Cookie Sony + Đa nguồn Public Lookup
     func lookupAccountIDByPSNUsername() {
         let targetUser = psnUsername.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines)
         guard !targetUser.isEmpty else {
@@ -373,6 +395,7 @@ class VideoSourceManager: NSObject, ObservableObject {
         }
     }
 
+    // MARK: - 1. Quản lý & Căn chỉnh khung ROI
     func getNormalizedROIRect(for mode: ROIMode) -> CGRect {
         switch mode {
         case .fullScreen:
@@ -446,6 +469,7 @@ class VideoSourceManager: NSObject, ObservableObject {
         return fullImage.cropping(to: targetRect.integral)
     }
 
+    // MARK: - 2. Giao thức Chiaki DDP (UDP 9302)
     func scanForPS5OnLAN() {
         let cleanIP = ps5HostIP.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines)
         connectionState = .scanningLAN
@@ -524,6 +548,7 @@ class VideoSourceManager: NSObject, ObservableObject {
         return nil
     }
 
+    // MARK: - 3. Giao thức Chiaki Ghép đôi & Mở phiên điều khiển thực tế
     func connectToPS5(username: String, pinCode: String, ip: String) {
         pairAndConnectToPS5(username: username, accountIDBase64: psnAccountIDBase64, pinCode: pinCode, ip: ip)
     }
@@ -648,7 +673,7 @@ class VideoSourceManager: NSObject, ObservableObject {
                                     iv: iv
                                 ) ?? ""
 
-                                // ĐÃ SỬA: Đọc cả PS5-RegistKey (chuẩn PS5) và RP-RegistKey
+                                // Đọc cả PS5-RegistKey (chuẩn PS5) và RP-RegistKey
                                 let regKey = self.extractHeader(from: decryptedBody, key: "PS5-RegistKey")
                                     ?? self.extractHeader(from: decryptedBody, key: "RP-RegistKey")
                                     ?? self.extractHeader(from: headerStr, key: "PS5-RegistKey")
@@ -691,6 +716,7 @@ class VideoSourceManager: NSObject, ObservableObject {
     }
 
     // Bước 2: Gọi /sie/ps5/rp/sess/init với RP-RegistKey & RP-Version: 1.0 để lấy RP-Nonce
+    // Sau khi đóng initConn, chờ 250ms (0.25s) rồi mới mở /sie/ps5/rp/sess/ctrl
     private func startRealChiakiSessionInitAndCtrl(ip: String, registKey: String, rpKey: String) {
         let host = NWEndpoint.Host(ip)
         guard let port = NWEndpoint.Port(rawValue: ROIDefaultConfig.registAndCtrlPort) else { return }
@@ -723,7 +749,8 @@ class VideoSourceManager: NSObject, ObservableObject {
                             serverNonceBase64: serverNonce
                         )
 
-                        DispatchQueue.main.async {
+                        // Chờ 0.25s (250ms) sau khi đóng kết nối /init để PS5 giải phóng socket trước khi mở /ctrl
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
                             self.openPersistentCtrlChannel(
                                 ip: ip,
                                 rpAuth: authHeaders.rpAuth,
@@ -785,6 +812,7 @@ class VideoSourceManager: NSObject, ObservableObject {
         conn.start(queue: .global(qos: .userInitiated))
     }
 
+    // MARK: - Bắt tay 4 bước Takion V12 trên cổng UDP 9296 (INIT -> INIT_ACK -> COOKIE_ECHO -> COOKIE_ACK -> BIG)
     private func openTakionVideoUDPStream(ip: String) {
         takionStreamConn?.cancel()
         let host = NWEndpoint.Host(ip)
@@ -813,17 +841,21 @@ class VideoSourceManager: NSObject, ObservableObject {
             if let data = data, !data.isEmpty {
                 let firstByte = data[0]
 
+                // Bước 2: Nhận gói INIT_ACK (0x01) từ PS5 -> Phản hồi ngay gói COOKIE_ECHO (0x02)
                 if firstByte == 0x01,
                    let parsed = ChiakiEmbeddedCore.shared.parseTakionInitAckAndBuildCookieEcho(packet: data) {
                     currentRemoteTag = parsed.remoteTag
                     self.takionStreamConn?.send(content: parsed.cookieEchoPacket, completion: .contentProcessed({ _ in }))
-                } else if firstByte == 0x03 {
+                }
+                // Bước 3: Nhận gói COOKIE_ACK (0x03) từ PS5 -> Gửi gói BIG Payload (0x04) yêu cầu phát luồng hình ảnh
+                else if firstByte == 0x03 {
                     let bigPacket = ChiakiEmbeddedCore.shared.buildTakionV12BigStreamRequestPacket(remoteTag: currentRemoteTag, tsn: 1)
                     self.takionStreamConn?.send(content: bigPacket, completion: .contentProcessed({ _ in }))
                     DispatchQueue.main.async {
                         self.statusLog = "✅ Đã hoàn tất bắt tay Takion v12! Đang giải mã luồng hình ảnh PS5 thời gian thực..."
                     }
                 }
+                // Bước 4: Đưa toàn bộ gói dữ liệu AV / NAL vào bộ giải mã phần cứng VideoToolbox
                 self.videoDecoder.feedTakionUDPPacket(data)
 
                 DispatchQueue.main.async {
@@ -848,6 +880,7 @@ class VideoSourceManager: NSObject, ObservableObject {
         statusLog = "Đã ngắt kết nối PS5."
     }
 
+    // MARK: - 4. Luồng kết xuất màn hình
     func startPS5RemoteStreamLoop() {
         timer?.invalidate()
         timer = Timer.scheduledTimer(withTimeInterval: 1.0 / 5.0, repeats: true) { [weak self] _ in
