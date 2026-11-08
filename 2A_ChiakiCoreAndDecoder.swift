@@ -1,6 +1,9 @@
 // ============================================================================
 // FILE 2A: 2A_ChiakiCoreAndDecoder.swift (TÁCH TỪ FILE 2 - PHẦN 1/2)
-// PHIÊN BẢN: PS5Translator 1.04 (SỬA TRIỆT ĐỂ LỖI 80108bff - CHUẨN 579 BYTES CHIAKI)
+// PHIÊN BẢN: PS5Translator 1.05
+// NHIỆM VỤ:
+// 1. Khôi phục chuẩn gói đăng ký 587-byte (Client-Type 64 ký tự) & C-Bridge Hook.
+// 2. Bộ giải mã phần cứng VideoToolbox H.264/HEVC & ReplayKit Live Frame Receiver.
 // ============================================================================
 
 import Foundation
@@ -13,6 +16,7 @@ import CommonCrypto
 import WebKit
 import VideoToolbox
 import CoreMedia
+import ReplayKit
 
 struct ROIDefaultConfig {
     static let fullScreenRect = CGRect(x: 0.02, y: 0.04, width: 0.96, height: 0.92)
@@ -22,8 +26,8 @@ struct ROIDefaultConfig {
     static let ddpPort: UInt16 = 9302
     static let registAndCtrlPort: UInt16 = 9295
     static let takionStreamPort: UInt16 = 9296
-    // CHUẨN 56 KÝ TỰ CỦA SONY CHIAKI (Sửa triệt để lỗi 80108bff):
-    static let rpClientType = "dabfa2ec873de5839bee8d3f4c0239c4282c07c25c6077a2931af000"
+    // BẮT BUỘC DÙNG ĐÚNG CHUẨN 64 KÝ TỰ (GÓI 587 BYTES) ĐỂ KHÔNG BỊ LỖI 80108b09:
+    static let rpClientType = "dabfa2ec873de5839bee8d3f4c0239c4282c07c25c6077a2931afcf0adc0d34f"
     static let chiakiRegistPrefaceSize = 480 // 0x1E0 bytes Preface chuẩn Chiaki
 }
 
@@ -48,7 +52,6 @@ enum PS5ConnectionState: Equatable {
 final class ChiakiEmbeddedCore {
     static let shared = ChiakiEmbeddedCore()
 
-    // Bảng khoá PS5 gốc từ mã nguồn Chiaki (rpcrypt.c)
     private let ps5Key0: [UInt8] = [
         0x09, 0x37, 0x9F, 0x7D, 0x48, 0x43, 0x4A, 0xC2,
         0x50, 0xB8, 0x6C, 0x98, 0x7E, 0xE8, 0xC9, 0x77
@@ -227,12 +230,11 @@ final class ChiakiEmbeddedCore {
         return nil
     }
 
-    // MARK: - Gói dò tìm đăng ký UDP 9295 ("SRC3" 4 bytes cho PS5)
     func buildRegistSearchPacketPS5() -> Data {
-        return Data([0x53, 0x52, 0x43, 0x33])
+        return Data([0x53, 0x52, 0x43, 0x33]) // "SRC3"
     }
 
-    // MARK: - Đóng gói gói tin đăng ký 579 bytes (480B Preface + 99B Encrypted Payload) chuẩn PS5
+    // Đóng gói gói tin 587 bytes (480B Preface + 107B Encrypted Record)
     func buildChiakiPS5RegistPayload480(pinString: String, accountIDBase64: String) -> (payload: Data, aesKey: [UInt8], iv: [UInt8]) {
         let pinNumber = UInt32(pinString) ?? 0
         let pinBytes: [UInt8] = [
@@ -252,10 +254,13 @@ final class ChiakiEmbeddedCore {
 
         for i in 0..<16 {
             iv[i] = ambassador[(i + 8) % 16] ^ ps5Key0[i]
-            aesKey[i] = ambassador[i] ^ ps5Key1[i] ^ pinBytes[i % 4]
+            aesKey[i] = ambassador[i] ^ ps5Key1[i]
+        }
+        // Chỉ XOR 4 byte mã PIN vào 4 byte đầu của khoá theo chuẩn uint32_t pin
+        for i in 0..<4 {
+            aesKey[i] ^= pinBytes[i]
         }
 
-        // Chuỗi Record đúng 99 bytes chuẩn regist.c của Chiaki (480 + 99 = 579 bytes)
         let cleanBase64 = accountIDBase64.trimmingCharacters(in: .whitespacesAndNewlines)
         let recordString = "Client-Type: \(ROIDefaultConfig.rpClientType)\r\nNp-AccountId: \(cleanBase64)\r\n"
         let plainRecordData = Data(recordString.utf8)
@@ -343,7 +348,7 @@ final class ChiakiEmbeddedCore {
             let block = sub.prefix(alignedLen)
             if let text = runAES128CBCDecrypt(data: block, key: aesKey, iv: iv),
                (text.contains("PS5-RegistKey") || text.contains("RP-RegistKey") || text.contains("RP-Key")) {
-                return text.trimmingCharacters(in: CharacterSet(charactersIn: "\0"))
+                return text
             }
         }
 
@@ -560,7 +565,7 @@ final class ChiakiEmbeddedCore {
 }
 
 // ============================================================================
-// 2. BỘ GIẢI MÃ VIDEO PHẦN CỨNG CHIAKI (VIDEOTOOLBOX H.264 & HEVC H.265 DECODER)
+// 2. BỘ GIẢI MÃ VIDEO PHẦN CỨNG & THU HÌNH REPLAYKIT TRỰC TIẾP TRÊN IPHONE
 // ============================================================================
 final class ChiakiHardwareVideoDecoder {
     private var formatDesc: CMVideoFormatDescription?
@@ -570,7 +575,19 @@ final class ChiakiHardwareVideoDecoder {
     private var ppsData: Data?
     private var isHEVCStream: Bool = false
     private var reassemblyBuffer = Data()
+    private let ciContext = CIContext(options: nil)
     var onFrameDecoded: ((CGImage) -> Void)?
+
+    // Hỗ trợ chuyển đổi trực tiếp CMSampleBuffer từ ReplayKit / PS Remote Play PiP sang CGImage cho OCR
+    func decodeReplayKitSampleBuffer(_ sampleBuffer: CMSampleBuffer) {
+        guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
+        let ciImage = CIImage(cvPixelBuffer: pixelBuffer)
+        if let cgImage = ciContext.createCGImage(ciImage, from: ciImage.extent) {
+            DispatchQueue.main.async {
+                self.onFrameDecoded?(cgImage)
+            }
+        }
+    }
 
     func feedTakionUDPPacket(_ data: Data) {
         guard data.count > 12 else { return }
@@ -773,12 +790,11 @@ final class ChiakiHardwareVideoDecoder {
             flags: [._EnableAsynchronousDecompression],
             infoFlagsOut: &infoFlags
         ) { [weak self] status, _, imageBuffer, _, _ in
-            guard status == noErr, let pixelBuffer = imageBuffer else { return }
+            guard let self = self, status == noErr, let pixelBuffer = imageBuffer else { return }
             let ciImage = CIImage(cvPixelBuffer: pixelBuffer)
-            let context = CIContext(options: nil)
-            if let cgImage = context.createCGImage(ciImage, from: ciImage.extent) {
+            if let cgImage = self.ciContext.createCGImage(ciImage, from: ciImage.extent) {
                 DispatchQueue.main.async {
-                    self?.onFrameDecoded?(cgImage)
+                    self.onFrameDecoded?(cgImage)
                 }
             }
         }
