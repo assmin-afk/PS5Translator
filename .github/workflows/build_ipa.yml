@@ -21,15 +21,11 @@ jobs:
           mkdir -p Sources/ChiakiNative/include/openssl
           mkdir -p Sources/ChiakiNative/upstream
 
-          # Copy rpcrypt.c (chua bang khoa aerolith + dugong PS5 that) de bien dich truc tiep
           cp chiaki_upstream/lib/src/rpcrypt.c Sources/ChiakiNative/rpcrypt.c
-
-          # Copy regist.c va takion.c vao upstream va trich xuat hang so giao thuc
           cp chiaki_upstream/lib/src/regist.c Sources/ChiakiNative/upstream/regist.c || true
           cp chiaki_upstream/lib/src/takion.c Sources/ChiakiNative/upstream/takion.c || true
           cp -R chiaki_upstream/lib/include/chiaki/* Sources/ChiakiNative/include/chiaki/ || true
 
-          # Tao file chiaki_export.h (thay the CMake GenerateExportHeader)
           cat << 'EOF' > Sources/ChiakiNative/include/chiaki_export.h
           #ifndef CHIAKI_EXPORT_H
           #define CHIAKI_EXPORT_H
@@ -40,7 +36,6 @@ jobs:
 
       - name: 3. Tao Shim OpenSSL -> Apple CommonCrypto & Cau noi C-Bridge (rpcrypt/regist/takion)
         run: |
-          # 3.1. Tao bo header OpenSSL Shim chay tren phan cung Apple CommonCrypto cua iOS ARM64
           cat << 'EOF' > Sources/ChiakiNative/include/openssl/evp.h
           #ifndef CHIAKI_OPENSSL_EVP_SHIM_H
           #define CHIAKI_OPENSSL_EVP_SHIM_H
@@ -240,7 +235,6 @@ jobs:
           #endif
           EOF
 
-          # 3.2. Tao Header va File C-Bridge ket noi rpcrypt.c + regist.c + takion.c sang Swift
           cat << 'EOF' > Sources/ChiakiNative/ChiakiCBridge.h
           #ifndef CHIAKI_C_BRIDGE_H
           #define CHIAKI_C_BRIDGE_H
@@ -252,7 +246,6 @@ jobs:
           extern "C" {
           #endif
 
-          // 1. Dong goi 587-byte (480B Preface + 107B Encrypted Record) bang rpcrypt.c & regist.c goc cua chiaki-ng
           int chiaki_bridge_build_ps5_regist_payload(
               const char *pin_str,
               const char *account_id_b64,
@@ -264,7 +257,6 @@ jobs:
               uint8_t out_hmac_key[16]
           );
 
-          // 2. Giai ma phan hoi ghep doi 200 OK tu PS5 bang rpcrypt.c goc
           int chiaki_bridge_decrypt_regist_response(
               const uint8_t *cipher,
               size_t cipher_len,
@@ -275,7 +267,6 @@ jobs:
               size_t max_plain_len
           );
 
-          // 3. Ma hoa RP-Auth & RP-Did cho phien /ctrl bang chiaki_rpcrypt_init_auth goc
           int chiaki_bridge_encrypt_session_data(
               const uint8_t nonce[16],
               const uint8_t rp_key[16],
@@ -300,6 +291,9 @@ jobs:
           #include <stdio.h>
           #include <string.h>
           #include <Security/SecRandom.h>
+
+          // Luu hmac_key dong cua lan ghep doi gan nhat de giai ma phan hoi 200 OK
+          static uint8_t g_last_hmac_key[16] = {0};
 
           __attribute__((weak)) void chiaki_log(ChiakiLog *log, ChiakiLogLevel level, const char *fmt, ...) {
               (void)log; (void)level; (void)fmt;
@@ -330,7 +324,6 @@ jobs:
                   for (int i = 0; i < 16; i++) ambassador[i] = (uint8_t)(arc4random() & 0xFF);
               }
 
-              // Goi truc tiep chiaki_rpcrypt_init_regist tu rpcrypt.c cua chiaki-ng (co bang aerolith + dugong PS5)
               ChiakiRPCrypt rpcrypt;
               memset(&rpcrypt, 0, sizeof(rpcrypt));
               ChiakiErrorCode err = chiaki_rpcrypt_init_regist(&rpcrypt, CHIAKI_TARGET_PS5_1, ambassador, pin);
@@ -341,13 +334,12 @@ jobs:
               memcpy(out_bright, rpcrypt.bright, 16);
               memcpy(out_echidna, rpcrypt.echidna, 16);
               memcpy(out_hmac_key, rpcrypt.hmac_key, 16);
+              memcpy(g_last_hmac_key, rpcrypt.hmac_key, 16);
 
-              // Dong goi 480 bytes Preface (0x1E0) theo dung regist.c cua chiaki-ng
               memset(out_payload, 0x41, 0x1E0);
               memcpy(out_payload + 0x7B, ambassador, 8);
               memcpy(out_payload + 0x158, ambassador + 8, 8);
 
-              // Tao Record tai offset 0x1E0
               char record_buf[256];
               int record_len = snprintf(
                   record_buf,
@@ -360,10 +352,8 @@ jobs:
                   return -3;
               }
 
-              // Tinh HMAC-SHA256 tren ban ro bang rpcrypt.hmac_key va dat tai 0x1C0
               chiaki_rpcrypt_hmac(&rpcrypt, out_payload + 0x1C0, (const uint8_t *)record_buf, (size_t)record_len);
 
-              // Ma hoa Record bang chiaki_rpcrypt_encrypt va dat tai 0x1E0
               err = chiaki_rpcrypt_encrypt(
                   &rpcrypt,
                   0,
@@ -395,7 +385,11 @@ jobs:
               rpcrypt.target = CHIAKI_TARGET_PS5_1;
               memcpy(rpcrypt.bright, bright, 16);
               memcpy(rpcrypt.echidna, echidna, 16);
-              memcpy(rpcrypt.hmac_key, hmac_key, 16);
+              if (hmac_key) {
+                  memcpy(rpcrypt.hmac_key, hmac_key, 16);
+              } else {
+                  memcpy(rpcrypt.hmac_key, g_last_hmac_key, 16);
+              }
 
               size_t enc_len = cipher_len - 0x20;
               if (enc_len >= max_plain_len) enc_len = max_plain_len - 1;
@@ -433,7 +427,7 @@ jobs:
           #include "ChiakiNative/ChiakiCBridge.h"
           EOF
 
-      - name: 4. Gom cac file Swift, tich hop C-Bridge tu dong va tao Bo Icon App
+      - name: 4. Gom cac file Swift, chong trung lap va tich hop C-Bridge tu dong
         run: |
           for f in *.swift.txt; do
             [ -f "$f" ] && cp "$f" "Sources/${f%.txt}"
@@ -443,17 +437,30 @@ jobs:
             [ -f "$f" ] && cp "$f" "Sources/$f"
           done
 
-          # Kich hoat loi C (ChiakiCBridge) truc tiep trong cac file Swift cua du an
+          # Tu dong loai bo cac file trung lap (neu repo co ca ban gop cu va ban tach 2A/6B)
           python3 - << 'PYEOF'
-          import glob, re
+          import glob, os, re
 
+          # 1. Neu co ca 2A_ChiakiCoreAndDecoder.swift va 2_VideoSourceManager.swift chua ChiakiEmbeddedCore -> chi giu ChiakiEmbeddedCore o 2A
+          files = sorted(glob.glob("Sources/*.swift"))
+          seen_main = False
+          for p in files:
+              with open(p, "r", encoding="utf-8") as f:
+                  txt = f.read()
+              if "@main" in txt:
+                  if seen_main:
+                      print(f"Removing duplicate @main file: {p}")
+                      os.remove(p)
+                      continue
+                  seen_main = True
+
+          # 2. Kich hoat C-Bridge trong cac file Swift con lai
           for path in glob.glob("Sources/*.swift"):
               with open(path, "r", encoding="utf-8") as f:
                   content = f.read()
 
               modified = False
 
-              # 1. Dam bao rpClientType dung chuan 64 ky tu cua PS5 (587 bytes)
               if "static let rpClientType =" in content:
                   content = re.sub(
                       r'static let rpClientType\s*=\s*"[^"]+"',
@@ -462,7 +469,6 @@ jobs:
                   )
                   modified = True
 
-              # 2. Hook buildChiakiPS5RegistPayload480 sang chiaki_bridge_build_ps5_regist_payload (rpcrypt.c)
               target_sig = "func buildChiakiPS5RegistPayload480(pinString: String, accountIDBase64: String) -> (payload: Data, aesKey: [UInt8], iv: [UInt8]) {"
               if target_sig in content and "chiaki_bridge_build_ps5_regist_payload" not in content:
                   c_hook = """func buildChiakiPS5RegistPayload480(pinString: String, accountIDBase64: String) -> (payload: Data, aesKey: [UInt8], iv: [UInt8]) {
@@ -490,26 +496,26 @@ jobs:
                   }
               }
               if res == 0 && outLen > 0 {
+                  self.lastRegistHmacKey = hmacKey
                   return (Data(outPayload.prefix(outLen)), bright, echidna)
               }
           """
                   content = content.replace(target_sig, c_hook, 1)
                   modified = True
 
-              # 3. Hook decryptRegistResponse sang chiaki_bridge_decrypt_regist_response (rpcrypt.c)
               decrypt_sig = "func decryptRegistResponse(cipherData: Data, aesKey: [UInt8], iv: [UInt8]) -> String? {"
               if decrypt_sig in content and "chiaki_bridge_decrypt_regist_response" not in content:
                   decrypt_hook = """func decryptRegistResponse(cipherData: Data, aesKey: [UInt8], iv: [UInt8]) -> String? {
               if cipherData.count > 0x20 && aesKey.count == 16 && iv.count == 16 {
                   var plainBuf = [UInt8](repeating: 0, count: 2048)
                   let cipherBytes = [UInt8](cipherData)
-                  var dummyHmac = [UInt8](repeating: 0, count: 16)
+                  let hmacArg = self.lastRegistHmacKey.count == 16 ? self.lastRegistHmacKey : [UInt8](repeating: 0, count: 16)
                   let decLen = chiaki_bridge_decrypt_regist_response(
                       cipherBytes,
                       cipherBytes.count,
                       aesKey,
                       iv,
-                      &dummyHmac,
+                      hmacArg,
                       &plainBuf,
                       plainBuf.count
                   )
@@ -525,14 +531,13 @@ jobs:
                   content = content.replace(decrypt_sig, decrypt_hook, 1)
                   modified = True
 
-              # 4. Hook buildSessionAuthHeaders sang chiaki_bridge_encrypt_session_data (rpcrypt.c)
               session_target = "let encAuth = chiakiRPCryptXOR(data: rawAuthData, key: sessionKey, iv: sessionIV, counter: 0)"
               if session_target in content and "chiaki_bridge_encrypt_session_data" not in content:
                   session_hook = """var cEncAuth = [UInt8](repeating: 0, count: 16)
               var cEncDid = [UInt8](repeating: 0, count: 32)
               let rawAuthBytes = [UInt8](rawAuthData)
               if chiaki_bridge_encrypt_session_data(nonce, rpKeyBytes, 0, rawAuthBytes, 16, &cEncAuth) == 0 &&
-                 chiaki_bridge_encrypt_session_data(nonce, rpKeyBytes, 0, didBytes, 32, &cEncDid) == 0 {
+                 chiaki_bridge_encrypt_session_data(nonce, rpKeyBytes, 1, didBytes, 32, &cEncDid) == 0 {
                   return (Data(cEncAuth).base64EncodedString(), Data(cEncDid).base64EncodedString())
               }
               let encAuth = chiakiRPCryptXOR(data: rawAuthData, key: sessionKey, iv: sessionIV, counter: 0)"""
