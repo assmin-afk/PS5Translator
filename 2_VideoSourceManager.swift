@@ -1,12 +1,12 @@
 // ============================================================================
 // FILE 2B: 2_VideoSourceManager.swift (TÁCH TỪ FILE 2 - PHẦN 2/2)
-// PHIÊN BẢN: PS5Translator 1.02 (ĐỒNG BỘ PS5-REGISTKEY, SRC3 UDP 9295, ĐỘ TRỄ 0.25S & RP-VERSION 1.0)
+// PHIÊN BẢN: PS5Translator 1.02 (BIND CỔNG UDP 9295 NHẬN RES3, PS5-REGISTKEY, ĐỘ TRỄ 0.25S & RP-VERSION 1.0)
 // NHIỆM VỤ:
 // 1. Quản lý luồng hình ảnh PS5 Remote Play & trạng thái kết nối thực tế.
 // 2. Tự động trích xuất Account ID 8-byte thật từ Cookie Sony (npsso / OAuth Code),
 //    giải mã JWT trực tiếp và truy vấn chuỗi 5 cổng Profile chính thức của Sony.
-// 3. Căn chỉnh khung ROI, quét tìm máy PS5 qua UDP 9302, ghép đôi mã PIN cổng 9295
-//    (kèm độ trễ 0.25s giữa /init và /ctrl) và mở phiên truyền hình ảnh thời gian thực cổng UDP 9296.
+// 3. Căn chỉnh khung ROI, quét tìm máy PS5 qua UDP 9302, bind cổng UDP 9295 gửi SRC3 / nhận RES3,
+//    ghép đôi mã PIN cổng TCP 9295 (kèm độ trễ 0.25s giữa /init và /ctrl) và mở luồng UDP 9296.
 // ============================================================================
 
 import Foundation
@@ -593,7 +593,7 @@ class VideoSourceManager: NSObject, ObservableObject {
         }
     }
 
-    // Bước 1: Gửi gói dò đăng ký "SRC3" tới UDP 9295 của PS5 -> Nhận "RES3" -> Mở TCP 9295 gửi gói 587-byte
+    // Bước 1: Bind đúng cổng UDP 9295 trên iPhone -> Gửi "SRC3" tới PS5:9295 -> Nhận "RES3" -> Mở TCP 9295 gửi gói 587-byte
     private func performRawSocketChiakiRegistration(ip: String, pin: String, accountIDBase64: String) {
         rawRegistTCPConn?.cancel()
 
@@ -602,6 +602,9 @@ class VideoSourceManager: NSObject, ObservableObject {
 
         let udpParams = NWParameters.udp
         udpParams.allowLocalEndpointReuse = true
+        // BẮT BUỘC bind cổng nguồn UDP 9295 trên iPhone để nhận gói RES3 từ PS5
+        udpParams.requiredLocalEndpoint = NWEndpoint.hostPort(host: "0.0.0.0", port: port)
+
         let udpSearchConn = NWConnection(host: host, port: port, using: udpParams)
         var didStartTCP = false
 
@@ -609,21 +612,28 @@ class VideoSourceManager: NSObject, ObservableObject {
             guard let self = self, !didStartTCP else { return }
             didStartTCP = true
             udpSearchConn.cancel()
-            self.sendTCPRegistPayload(ip: ip, pin: pin, accountIDBase64: accountIDBase64)
+            DispatchQueue.global(qos: .userInteractive).asyncAfter(deadline: .now() + 0.08) {
+                self.sendTCPRegistPayload(ip: ip, pin: pin, accountIDBase64: accountIDBase64)
+            }
         }
 
         udpSearchConn.stateUpdateHandler = { state in
-            if case .ready = state {
+            switch state {
+            case .ready:
                 let src3Packet = ChiakiEmbeddedCore.shared.buildRegistSearchPacketPS5()
                 udpSearchConn.send(content: src3Packet, completion: .contentProcessed({ _ in }))
                 udpSearchConn.receiveMessage { _, _, _, _ in
                     launchTCPRegist()
                 }
+            case .failed:
+                launchTCPRegist()
+            default:
+                break
             }
         }
         udpSearchConn.start(queue: .global(qos: .userInteractive))
 
-        DispatchQueue.global(qos: .userInteractive).asyncAfter(deadline: .now() + 0.45) {
+        DispatchQueue.global(qos: .userInteractive).asyncAfter(deadline: .now() + 0.5) {
             launchTCPRegist()
         }
     }
