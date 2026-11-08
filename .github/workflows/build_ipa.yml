@@ -34,7 +34,7 @@ jobs:
           #endif
           EOF
 
-      - name: 3. Tao Shim OpenSSL -> Apple CommonCrypto & Cau noi C-Bridge (rpcrypt/regist/takion)
+      - name: 3. Tao Shim OpenSSL -> Apple CommonCrypto (CBC + ECB + CFB128) & Cau noi C-Bridge
         run: |
           cat << 'EOF' > Sources/ChiakiNative/include/openssl/evp.h
           #ifndef CHIAKI_OPENSSL_EVP_SHIM_H
@@ -47,7 +47,7 @@ jobs:
           #include <CommonCrypto/CommonDigest.h>
 
           typedef struct {
-              int mode; // 0 = AES-128-CBC, 1 = AES-128-ECB
+              int mode; // 0 = AES-128-CBC, 1 = AES-128-ECB, 2 = AES-128-CFB128
           } EVP_CIPHER;
 
           typedef struct {
@@ -56,6 +56,7 @@ jobs:
               CCOperation op;
               uint8_t key[16];
               uint8_t iv[16];
+              int has_key;
           } EVP_CIPHER_CTX;
 
           static inline const EVP_CIPHER *EVP_aes_128_cbc(void) {
@@ -66,6 +67,15 @@ jobs:
           static inline const EVP_CIPHER *EVP_aes_128_ecb(void) {
               static const EVP_CIPHER ecb = { 1 };
               return &ecb;
+          }
+
+          static inline const EVP_CIPHER *EVP_aes_128_cfb128(void) {
+              static const EVP_CIPHER cfb = { 2 };
+              return &cfb;
+          }
+
+          static inline const EVP_CIPHER *EVP_aes_128_cfb(void) {
+              return EVP_aes_128_cfb128();
           }
 
           static inline const void *EVP_sha256(void) {
@@ -99,18 +109,39 @@ jobs:
               }
               if (cipher) ctx->mode = cipher->mode;
               ctx->op = op;
-              if (key) memcpy(ctx->key, key, 16);
-              if (iv) memcpy(ctx->iv, iv, 16);
-              else memset(ctx->iv, 0, 16);
+              if (key) {
+                  memcpy(ctx->key, key, 16);
+                  ctx->has_key = 1;
+              }
+              if (iv) {
+                  memcpy(ctx->iv, iv, 16);
+              } else if (!key) {
+                  memset(ctx->iv, 0, 16);
+              }
 
-              CCOptions opts = (ctx->mode == 1) ? kCCOptionECBMode : 0;
-              CCCryptorStatus st = CCCryptorCreate(
+              if (!ctx->has_key) {
+                  return 1;
+              }
+
+              CCMode cc_mode = kCCModeCBC;
+              if (ctx->mode == 1) {
+                  cc_mode = kCCModeECB;
+              } else if (ctx->mode == 2) {
+                  cc_mode = kCCModeCFB;
+              }
+
+              CCCryptorStatus st = CCCryptorCreateWithMode(
                   op,
+                  cc_mode,
                   kCCAlgorithmAES,
-                  opts,
+                  ccNoPadding,
+                  (ctx->mode == 1) ? NULL : ctx->iv,
                   ctx->key,
                   kCCKeySizeAES128,
-                  (ctx->mode == 1) ? NULL : ctx->iv,
+                  NULL,
+                  0,
+                  0,
+                  0,
                   &ctx->cryptor
               );
               return (st == kCCSuccess) ? 1 : 0;
@@ -457,12 +488,10 @@ jobs:
 
               modified = False
 
-              # 1. Tu dong sua stopCapture(completionHandler: nil) -> stopCapture { _ in } neu con sot
               if "stopCapture(completionHandler: nil)" in content:
                   content = content.replace("stopCapture(completionHandler: nil)", "stopCapture { _ in }")
                   modified = True
 
-              # 2. Dam bao rpClientType dung chuan 64 ky tu
               if "static let rpClientType =" in content:
                   content = re.sub(
                       r'static let rpClientType\s*=\s*"[^"]+"',
@@ -471,86 +500,9 @@ jobs:
                   )
                   modified = True
 
-              # 3. Neu file 2A chua co C-Bridge thi chen trong khoi do { ... } de KHONG BAO GIO trung ten bien cleanBase64
-              target_sig = "func buildChiakiPS5RegistPayload480(pinString: String, accountIDBase64: String) -> (payload: Data, aesKey: [UInt8], iv: [UInt8]) {"
-              if target_sig in content and "chiaki_bridge_build_ps5_regist_payload" not in content:
-                  c_hook = """func buildChiakiPS5RegistPayload480(pinString: String, accountIDBase64: String) -> (payload: Data, aesKey: [UInt8], iv: [UInt8]) {
-              do {
-                  let cBridgeB64 = accountIDBase64.trimmingCharacters(in: .whitespacesAndNewlines)
-                  var outPayload = [UInt8](repeating: 0, count: 1024)
-                  var outLen: Int = 0
-                  var bright = [UInt8](repeating: 0, count: 16)
-                  var echidna = [UInt8](repeating: 0, count: 16)
-                  var hmacKey = [UInt8](repeating: 0, count: 16)
-
-                  let res = pinString.withCString { pinCStr in
-                      cBridgeB64.withCString { aidCStr in
-                          ROIDefaultConfig.rpClientType.withCString { clientCStr in
-                              chiaki_bridge_build_ps5_regist_payload(
-                                  pinCStr,
-                                  aidCStr,
-                                  clientCStr,
-                                  &outPayload,
-                                  &outLen,
-                                  &bright,
-                                  &echidna,
-                                  &hmacKey
-                              )
-                          }
-                      }
-                  }
-                  if res == 0 && outLen > 0 {
-                      return (Data(outPayload.prefix(outLen)), bright, echidna)
-                  }
-              }
-          """
-                  content = content.replace(target_sig, c_hook, 1)
-                  modified = True
-
-              decrypt_sig = "func decryptRegistResponse(cipherData: Data, aesKey: [UInt8], iv: [UInt8]) -> String? {"
-              if decrypt_sig in content and "chiaki_bridge_decrypt_regist_response" not in content:
-                  decrypt_hook = """func decryptRegistResponse(cipherData: Data, aesKey: [UInt8], iv: [UInt8]) -> String? {
-              if cipherData.count > 0x20 && aesKey.count == 16 && iv.count == 16 {
-                  var plainBuf = [UInt8](repeating: 0, count: 2048)
-                  let cipherBytes = [UInt8](cipherData)
-                  let decLen = chiaki_bridge_decrypt_regist_response(
-                      cipherBytes,
-                      cipherBytes.count,
-                      aesKey,
-                      iv,
-                      nil,
-                      &plainBuf,
-                      plainBuf.count
-                  )
-                  if decLen > 0 {
-                      let data = Data(plainBuf.prefix(Int(decLen)))
-                      if let text = String(data: data, encoding: .utf8) ?? String(data: data, encoding: .isoLatin1),
-                         (text.contains("PS5-RegistKey") || text.contains("RP-RegistKey") || text.contains("RP-Key")) {
-                          return text.trimmingCharacters(in: CharacterSet(charactersIn: "\\0"))
-                      }
-                  }
-              }
-          """
-                  content = content.replace(decrypt_sig, decrypt_hook, 1)
-                  modified = True
-
-              session_target = "let encAuth = chiakiRPCryptXOR(data: rawAuthData, key: sessionKey, iv: sessionIV, counter: 0)"
-              if session_target in content and "chiaki_bridge_encrypt_session_data" not in content:
-                  session_hook = """var cEncAuth = [UInt8](repeating: 0, count: 16)
-              var cEncDid = [UInt8](repeating: 0, count: 32)
-              let rawAuthBytes = [UInt8](rawAuthData)
-              if chiaki_bridge_encrypt_session_data(nonce, rpKeyBytes, 0, rawAuthBytes, 16, &cEncAuth) == 0 &&
-                 chiaki_bridge_encrypt_session_data(nonce, rpKeyBytes, 1, didBytes, 32, &cEncDid) == 0 {
-                  return (Data(cEncAuth).base64EncodedString(), Data(cEncDid).base64EncodedString())
-              }
-              let encAuth = chiakiRPCryptXOR(data: rawAuthData, key: sessionKey, iv: sessionIV, counter: 0)"""
-                  content = content.replace(session_target, session_hook, 1)
-                  modified = True
-
               if modified:
                   with open(path, "w", encoding="utf-8") as f:
                       f.write(content)
-                  print(f"Verified and patched {path}")
           PYEOF
 
           if [ -f "icon.png" ]; then
@@ -612,6 +564,10 @@ jobs:
                   HEADER_SEARCH_PATHS:
                     - "$(inherited)"
                     - "$(PROJECT_DIR)/Sources/ChiakiNative/include"
+                  OTHER_CFLAGS:
+                    - "$(inherited)"
+                    - "-Wno-implicit-function-declaration"
+                    - "-Wno-strict-prototypes"
                   CODE_SIGN_IDENTITY: ""
                   CODE_SIGNING_REQUIRED: NO
                   CODE_SIGNING_ALLOWED: NO
