@@ -1,6 +1,6 @@
 // ============================================================================
 // FILE 2A: 2A_ChiakiCoreAndDecoder.swift (TÁCH TỪ FILE 2 - PHẦN 1/2)
-// PHIÊN BẢN: PS5Translator 1.06 (ĐỒNG BỘ C-BRIDGE CHIAKI-NG & REPLAYKIT STREAM)
+// PHIÊN BẢN: PS5Translator 1.07 (GỌI TRỰC TIẾP C-BRIDGE CHIAKI-NG & FIX REDECLARATION)
 // ============================================================================
 
 import Foundation
@@ -62,7 +62,7 @@ final class ChiakiEmbeddedCore {
         0x86, 0x0F, 0x9D, 0x2F, 0x5C, 0x70, 0x10, 0x3C
     ]
 
-    // Lưu lại hmacKey động sinh từ C-Bridge của lần ghép đôi gần nhất
+    // Lưu hmacKey động sinh từ rpcrypt.c của lần ghép đôi gần nhất
     private var lastRegistHmacKey: [UInt8] = []
 
     func isFakeGeneratedAccountID(_ input: String, username: String) -> Bool {
@@ -234,8 +234,40 @@ final class ChiakiEmbeddedCore {
         return Data([0x53, 0x52, 0x43, 0x33]) // "SRC3"
     }
 
-    // Đóng gói gói tin 587 bytes (Sẽ được build_ipa.yml tự động móc nối sang rpcrypt.c của chiaki-ng)
+    // MARK: - Đóng gói gói tin 587 bytes bằng thư viện C gốc của chiaki-ng (rpcrypt.c)
     func buildChiakiPS5RegistPayload480(pinString: String, accountIDBase64: String) -> (payload: Data, aesKey: [UInt8], iv: [UInt8]) {
+        let trimmedAccountB64 = accountIDBase64.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        // 1. Gọi trực tiếp hàm C chiaki_bridge_build_ps5_regist_payload (tích hợp bảng aerolith & dugong PS5)
+        var outPayload = [UInt8](repeating: 0, count: 1024)
+        var outLen: Int = 0
+        var bright = [UInt8](repeating: 0, count: 16)
+        var echidna = [UInt8](repeating: 0, count: 16)
+        var hmacKey = [UInt8](repeating: 0, count: 16)
+
+        let cResult = pinString.withCString { pinCStr in
+            trimmedAccountB64.withCString { aidCStr in
+                ROIDefaultConfig.rpClientType.withCString { clientCStr in
+                    chiaki_bridge_build_ps5_regist_payload(
+                        pinCStr,
+                        aidCStr,
+                        clientCStr,
+                        &outPayload,
+                        &outLen,
+                        &bright,
+                        &echidna,
+                        &hmacKey
+                    )
+                }
+            }
+        }
+
+        if cResult == 0 && outLen > 0 {
+            self.lastRegistHmacKey = hmacKey
+            return (Data(outPayload.prefix(outLen)), bright, echidna)
+        }
+
+        // 2. Nhánh dự phòng Swift thuần nếu C-Bridge trả về mã lỗi
         let pinNumber = UInt32(pinString) ?? 0
         let pinBytes: [UInt8] = [
             UInt8((pinNumber >> 24) & 0xFF),
@@ -260,8 +292,7 @@ final class ChiakiEmbeddedCore {
             aesKey[i] ^= pinBytes[i]
         }
 
-        let cleanBase64 = accountIDBase64.trimmingCharacters(in: .whitespacesAndNewlines)
-        let recordString = "Client-Type: \(ROIDefaultConfig.rpClientType)\r\nNp-AccountId: \(cleanBase64)\r\n"
+        let recordString = "Client-Type: \(ROIDefaultConfig.rpClientType)\r\nNp-AccountId: \(trimmedAccountB64)\r\n"
         let plainRecordData = Data(recordString.utf8)
 
         let hmacSymKey = SymmetricKey(data: Data(ps5HmacKey))
@@ -312,11 +343,34 @@ final class ChiakiEmbeddedCore {
         return Data(outBytes)
     }
 
-    // Giải mã phản hồi 200 OK từ PS5 (Ưu tiên offset 0x20 chuẩn regist.c của Chiaki)
+    // MARK: - Giải mã phản hồi 200 OK từ PS5 bằng C-Bridge (rpcrypt.c)
     func decryptRegistResponse(cipherData: Data, aesKey: [UInt8], iv: [UInt8]) -> String? {
         guard !cipherData.isEmpty else { return nil }
 
-        // Trong regist.c của chiaki-ng, 32 bytes đầu (0x00..<0x20) là HMAC, phần mã hoá nằm từ 0x20 trở đi
+        // 1. Giải mã trực tiếp bằng hàm C chiaki_bridge_decrypt_regist_response (tại offset 0x20 chuẩn regist.c)
+        if cipherData.count > 0x20 && aesKey.count == 16 && iv.count == 16 {
+            var plainBuf = [UInt8](repeating: 0, count: 2048)
+            let cipherBytes = [UInt8](cipherData)
+            let hmacArg = self.lastRegistHmacKey.count == 16 ? self.lastRegistHmacKey : [UInt8](repeating: 0, count: 16)
+            let decLen = chiaki_bridge_decrypt_regist_response(
+                cipherBytes,
+                cipherBytes.count,
+                aesKey,
+                iv,
+                hmacArg,
+                &plainBuf,
+                plainBuf.count
+            )
+            if decLen > 0 {
+                let data = Data(plainBuf.prefix(Int(decLen)))
+                if let text = String(data: data, encoding: .utf8) ?? String(data: data, encoding: .isoLatin1),
+                   (text.contains("PS5-RegistKey") || text.contains("RP-RegistKey") || text.contains("RP-Key")) {
+                    return text.trimmingCharacters(in: CharacterSet(charactersIn: "\0"))
+                }
+            }
+        }
+
+        // 2. Nhánh dự phòng quét đa offset
         let candidateOffsets = [0x20, 0x00, 0x10, 0x30]
 
         for offset in candidateOffsets where cipherData.count > offset + 16 {
@@ -424,7 +478,6 @@ final class ChiakiEmbeddedCore {
         return rawStr.trimmingCharacters(in: CharacterSet(charactersIn: "\0"))
     }
 
-    // Chuyển đổi RegistKey (có thể là chuỗi Hex 16 ký tự hoặc ASCII) sang đúng mảng 16 bytes chuẩn Chiaki
     func parseRegistKeyTo16Bytes(_ registKey: String) -> Data {
         let clean = registKey.trimmingCharacters(in: .whitespacesAndNewlines)
         var bytes = [UInt8](repeating: 0, count: 16)
@@ -458,6 +511,17 @@ final class ChiakiEmbeddedCore {
         }
 
         let nonce = [UInt8](nonceData)
+
+        // 1. Mã hoá RP-Auth & RP-Did trực tiếp bằng chiaki_rpcrypt_init_auth trong C-Bridge
+        var cEncAuth = [UInt8](repeating: 0, count: 16)
+        var cEncDid = [UInt8](repeating: 0, count: 32)
+        let rawAuthBytes = [UInt8](rawAuthData)
+        if chiaki_bridge_encrypt_session_data(nonce, rpKeyBytes, 0, rawAuthBytes, 16, &cEncAuth) == 0 &&
+           chiaki_bridge_encrypt_session_data(nonce, rpKeyBytes, 1, didBytes, 32, &cEncDid) == 0 {
+            return (Data(cEncAuth).base64EncodedString(), Data(cEncDid).base64EncodedString())
+        }
+
+        // 2. Nhánh dự phòng
         var sessionKey = [UInt8](repeating: 0, count: 16)
         var sessionIV = [UInt8](repeating: 0, count: 16)
 
