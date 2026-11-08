@@ -1,6 +1,6 @@
 // ============================================================================
 // FILE 2A: 2A_ChiakiCoreAndDecoder.swift (TÁCH TỪ FILE 2 - PHẦN 1/2)
-// PHIÊN BẢN: PS5Translator 1.02 (CHUẨN HOÁ RPCRYPT PS5 587-BYTE CFB & RP-VERSION 1.0)
+// PHIÊN BẢN: PS5Translator 1.02 (HOÀN THIỆN KHOÁ 16-BYTE AMBASSADOR/BRIGHT & CFB 587B)
 // ============================================================================
 
 import Foundation
@@ -22,7 +22,6 @@ struct ROIDefaultConfig {
     static let ddpPort: UInt16 = 9302
     static let registAndCtrlPort: UInt16 = 9295
     static let takionStreamPort: UInt16 = 9296
-    // ĐÃ SỬA ĐÚNG 64 KÝ TỰ HEX CHUẨN CỦA SONY REMOTE PLAY (Không bị cụt đuôi '000')
     static let rpClientType = "dabfa2ec873de5839bee8d3f4c0239c4282c07c25c6077a2931afcf0adc0d34f"
     static let chiakiRegistPrefaceSize = 480 // 0x1E0 bytes Preface chuẩn Chiaki
 }
@@ -223,6 +222,7 @@ final class ChiakiEmbeddedCore {
     }
 
     // MARK: - Đóng gói gói tin đăng ký 587 bytes (480B Preface + 107B Encrypted Payload) chuẩn PS5
+    // ĐÃ SỬA LỖI 80108b09 / CE-110039-4: Ghi đủ 16 bytes ambassador (0x7B..<0x8B) và 16 bytes bright (0x158..<0x168)
     func buildChiakiPS5RegistPayload480(pinString: String, accountIDBase64: String) -> (payload: Data, aesKey: [UInt8], iv: [UInt8]) {
         let pinNumber = UInt32(pinString) ?? 0
         let pinBytes: [UInt8] = [
@@ -232,31 +232,30 @@ final class ChiakiEmbeddedCore {
             UInt8(pinNumber & 0xFF)
         ]
 
-        // Tạo 2 khối ngẫu nhiên 8-byte: ambassador (8B) và bright (8B)
-        var ambassador = [UInt8](repeating: 0, count: 8)
-        var bright = [UInt8](repeating: 0, count: 8)
-        for i in 0..<8 {
-            ambassador[i] = UInt8.random(in: 0...255)
-            bright[i] = UInt8.random(in: 0...255)
+        // Sinh 16 bytes nonce ngẫu nhiên chuẩn rpcrypt.c
+        var nonce = [UInt8](repeating: 0, count: 16)
+        for i in 0..<16 {
+            nonce[i] = UInt8.random(in: 0...255)
         }
 
-        // Khôi phục iv (16B) và aesKey (16B) theo đúng chuẩn rpcrypt.c của Chiaki / ModernCryptoStrategy:
+        // Tính đủ 16 bytes cho ambassador, bright, iv và aesKey theo đúng bảng khoá PS5 của Chiaki:
+        var ambassador = [UInt8](repeating: 0, count: 16)
+        var bright = [UInt8](repeating: 0, count: 16)
         var iv = [UInt8](repeating: 0, count: 16)
         var aesKey = [UInt8](repeating: 0, count: 16)
 
-        for i in 0..<8 {
-            iv[i] = ambassador[i] ^ ps5Key0[i]
-            iv[i + 8] = bright[i] ^ ps5Key0[i + 8]
-        }
         for i in 0..<16 {
-            aesKey[i] = iv[i] ^ ps5Key1[i] ^ pinBytes[i % 4]
+            ambassador[i] = nonce[i] ^ ps5Key0[i]
+            bright[i] = nonce[i] ^ ps5Key1[i]
+            iv[i] = nonce[i] ^ ps5Key0[(i + 8) % 16]
+            aesKey[i] = (nonce[i] ^ ps5Key1[(i + 8) % 16]) ^ pinBytes[i % 4]
         }
 
         // Chuỗi Record 107 bytes chuẩn PS5:
         let recordString = "Client-Type: \(ROIDefaultConfig.rpClientType)\r\nNp-AccountId: \(accountIDBase64)\r\n"
         let plainRecordData = Data(recordString.utf8)
 
-        // Mã hoá Record bằng AES-128-CFB (hoặc CBC fallback) không padding, giữ nguyên độ dài 107 bytes
+        // Mã hoá Record 107 bytes bằng AES-128-CFB128
         let encryptedRecord = aes128CFBEncryptOrDecrypt(
             operation: CCOperation(kCCEncrypt),
             data: plainRecordData,
@@ -269,11 +268,11 @@ final class ChiakiEmbeddedCore {
         let hmac = Array(HMAC<SHA256>.authenticationCode(for: encryptedRecord, using: hmacSymKey))
 
         // Tạo khung Preface 480 bytes (0x1E0) lấp đầy bằng 'A' (0x41):
-        // - Offset 0x7B (123): ghi 8 bytes ambassador
-        // - Offset 0x158 (344): ghi 8 bytes bright
-        // - Offset 0x1C0 (448): ghi 32 bytes HMAC-SHA256
+        // - Offset 0x7B (123..<139): ghi ĐỦ 16 bytes ambassador
+        // - Offset 0x158 (344..<360): ghi ĐỦ 16 bytes bright
+        // - Offset 0x1C0 (448..<480): ghi ĐỦ 32 bytes HMAC-SHA256
         var preface = [UInt8](repeating: 0x41, count: ROIDefaultConfig.chiakiRegistPrefaceSize)
-        for i in 0..<8 {
+        for i in 0..<16 {
             preface[0x7B + i] = ambassador[i]
             preface[0x158 + i] = bright[i]
         }
@@ -288,11 +287,10 @@ final class ChiakiEmbeddedCore {
         return (fullPayload, aesKey, iv)
     }
 
-    // Giải mã phản hồi ghép đôi từ PS5 (Thử cả AES-128-CFB chuẩn PS5 và AES-128-CBC tại mọi offset)
+    // Giải mã phản hồi ghép đôi 172 bytes từ PS5
     func decryptRegistResponse(cipherData: Data, aesKey: [UInt8], iv: [UInt8]) -> String? {
         guard !cipherData.isEmpty else { return nil }
 
-        // 1. Giải mã trực tiếp bằng AES-128-CFB (Chuẩn phản hồi 172 bytes của PS5)
         let candidateOffsets = [0x00, 0x10, 0x20, 0x30]
         for offset in candidateOffsets where cipherData.count > offset + 16 {
             let sub = cipherData.subdata(in: offset..<cipherData.count)
@@ -308,7 +306,6 @@ final class ChiakiEmbeddedCore {
             }
         }
 
-        // 2. Fallback: Giải mã bằng AES-128-CBC
         for offset in candidateOffsets where cipherData.count > offset + 16 {
             let sub = cipherData.subdata(in: offset..<cipherData.count)
             let alignedLen = (sub.count / 16) * 16
@@ -323,7 +320,6 @@ final class ChiakiEmbeddedCore {
         return nil
     }
 
-    // Bộ mã hoá / giải mã dòng AES-128-CFB chuẩn xác theo OpenSSL / Chiaki rpcrypt
     private func aes128CFBEncryptOrDecrypt(operation: CCOperation, data: Data, key: [UInt8], iv: [UInt8]) -> Data? {
         guard !data.isEmpty, key.count == kCCKeySizeAES128, iv.count == kCCBlockSizeAES128 else { return nil }
         var cryptor: CCCryptorRef?
@@ -399,7 +395,6 @@ final class ChiakiEmbeddedCore {
         var didBytes = [UInt8](repeating: 0, count: 32)
         let prefix: [UInt8] = [0x00, 0x18, 0x00, 0x00, 0x00, 0x09, 0x00, 0x40, 0x00, 0x80]
         for i in 0..<prefix.count { didBytes[i] = prefix[i] }
-        for i in prefix.count..<26 { didBytes[i] = UInt8.random(in: 1...254) }
 
         guard let nonceStr = serverNonceBase64?.trimmingCharacters(in: .whitespacesAndNewlines),
               let nonceData = Data(base64Encoded: nonceStr), nonceData.count == 16 else {
@@ -442,7 +437,6 @@ final class ChiakiEmbeddedCore {
         return (encAuth.base64EncodedString(), encDid.base64EncodedString())
     }
 
-    // ĐÃ SỬA DỨT ĐIỂM LỖI 80108b11: Đường dẫn /sie/ps5/rp/sess/rgst bắt buộc dùng RP-Version: 1.0
     func buildRawHTTPRegistRequest(ip: String, payload: Data) -> Data {
         var rawHTTP = "POST /sie/ps5/rp/sess/rgst HTTP/1.1\r\n"
         rawHTTP += "Host: \(ip):\(ROIDefaultConfig.registAndCtrlPort)\r\n"
