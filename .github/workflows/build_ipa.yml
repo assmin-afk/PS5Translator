@@ -34,7 +34,7 @@ jobs:
           #endif
           EOF
 
-          # Chi trich xuat cac bien static const va ham chiaki_regist_request_payload_format (khong lay cac ham thread khac)
+          # Chi trich xuat cac bien static const (co dau '=') va ham chiaki_regist_request_payload_format
           python3 - << 'PYEOF'
           import re
 
@@ -59,9 +59,9 @@ jobs:
                           break
 
               func_code = src[start:end]
-              # Chi lay cac khai bao #define va static const nam truoc ham
+              # Chi lay cac khai bao #define va bien static const (co dau '=' truoc '{' hoac ';', khong lay ham)
               defines = re.findall(r'^\s*#define\s+.*$', src[:start], flags=re.MULTILINE)
-              static_consts = re.findall(r'static\s+const\s+[\s\S]*?;', src[:start])
+              static_consts = re.findall(r'static\s+const\s+[^{;=]+=\s*[\s\S]*?;', src[:start])
 
               with open("Sources/ChiakiNative/ChiakiRegistFormat.c", "w", encoding="utf-8") as out:
                   out.write('#include <chiaki/regist.h>\n')
@@ -77,7 +77,7 @@ jobs:
                   for sc in static_consts:
                       out.write(sc + "\n\n")
                   out.write(func_code + "\n")
-              print("Extracted static consts and chiaki_regist_request_payload_format cleanly!")
+              print("Extracted static const variables and chiaki_regist_request_payload_format cleanly!")
           PYEOF
 
       - name: 3. Tao Shim OpenSSL Chuan Bit-Exact (CFB128/CBC/ECB) & Cau noi C-Bridge (9 tham so)
