@@ -1107,7 +1107,7 @@ struct SonyOAuthWebView: UIViewRepresentable {
             }
 
             // Bước B: Kiểm tra Cookie npsso trong WKWebsiteDataStore để kích hoạt OAuth ngầm nếu trang không tự redirect
-            WKWebsiteDataStore.default().httpCookieStore.getAllCookies { [weak self] cookies in
+            webView.configuration.websiteDataStore.httpCookieStore.getAllCookies { [weak self] cookies in
                 guard let self = self, !self.didExtractSuccess else { return }
                 let sonyCookies = cookies.filter {
                     $0.domain.contains("sony.com") || $0.domain.contains("playstation.net") || $0.domain.contains("playstation.com")
