@@ -1,6 +1,6 @@
 // ============================================================================
 // FILE 6B: 6B_TranslatorViewsAndModals.swift (TÁCH TỪ FILE 6 - PHẦN 2/2)
-// PHIÊN BẢN: PS5Translator 1.03 (ĐỒNG BỘ WKWEBSITEDATASTORE.DEFAULT & SỬA LỖI 80108b09)
+// PHIÊN BẢN: PS5Translator 1.07 (ĐỒNG BỘ COOKIE DEFAULT & NÚT REPLAYKIT LIVE)
 // ============================================================================
 
 import SwiftUI
@@ -691,7 +691,7 @@ struct PS5ConnectionWizardView: View {
                             .clipShape(Circle())
 
                         VStack(alignment: .leading, spacing: 4) {
-                            Text("Lõi Chiaki PS5 Remote Play")
+                            Text("Lõi C Chiaki-NG PS5 Remote Play")
                                 .font(.headline)
                                 .foregroundColor(.white)
                             Text(coord.videoMgr.statusLog)
@@ -755,7 +755,7 @@ struct PS5ConnectionWizardView: View {
                             .foregroundColor(.gray)
 
                         HStack {
-                            TextField("Online ID tài khoản PSN (VD: Miesoi93)", text: $coord.videoMgr.psnUsername)
+                            TextField("Online ID tài khoản PSN (VD: Maivy1125)", text: $coord.videoMgr.psnUsername)
                                 .padding(10)
                                 .background(Color.black.opacity(0.35))
                                 .cornerRadius(8)
@@ -863,6 +863,24 @@ struct PS5ConnectionWizardView: View {
                         .padding(.vertical, 14)
                         .background(psBlue)
                         .foregroundColor(.white)
+                        .cornerRadius(12)
+                    }
+
+                    // Nút dự phòng: Thu hình trực tiếp ReplayKit / PS Remote Play PiP ngay trên iPhone
+                    Button(action: {
+                        coord.videoMgr.toggleReplayKitDirectCapture()
+                    }) {
+                        HStack {
+                            Spacer()
+                            Image(systemName: coord.videoMgr.isReplayKitCapturing ? "stop.circle.fill" : "record.circle.fill")
+                                .font(.title3)
+                            Text(coord.videoMgr.isReplayKitCapturing ? "DỪNG THU HÌNH TRỰC TIẾP REPLAYKIT" : "THU HÌNH TRỰC TIẾP (REPLAYKIT / PIP)")
+                                .font(.system(size: 13, weight: .bold))
+                            Spacer()
+                        }
+                        .padding(.vertical, 12)
+                        .background(coord.videoMgr.isReplayKitCapturing ? Color.orange.opacity(0.3) : Color.cyan.opacity(0.22))
+                        .foregroundColor(coord.videoMgr.isReplayKitCapturing ? .orange : .cyan)
                         .cornerRadius(12)
                     }
 
@@ -987,7 +1005,6 @@ struct SonyOAuthWebView: UIViewRepresentable {
     }
 
     func makeUIView(context: Context) -> WKWebView {
-        // SỬA LỖI QUAN TRỌNG: Bắt buộc dùng WKWebsiteDataStore.default() để đồng bộ Cookie với VideoSourceManager
         let config = WKWebViewConfiguration()
         config.websiteDataStore = WKWebsiteDataStore.default()
         let webView = WKWebView(frame: .zero, configuration: config)
