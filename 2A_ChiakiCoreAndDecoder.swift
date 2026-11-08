@@ -79,7 +79,7 @@ final class ChiakiEmbeddedCore {
     func isFakeGeneratedAccountID(_ input: String, username: String) -> Bool {
         let trimmed = input.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines)
         if trimmed.isEmpty { return true }
-        if trimmed == "nZKnNYIoZ0w=" || trimmed == "TWlIc29pOTM=" { return true }
+        if trimmed == "TWlIc29pOTM=" { return true } // TWlIc29pOTM= is base64 of Miesoi93
 
         let cleanUser = (username.isEmpty ? "Miesoi93" : username).trimmingCharacters(in: CharacterSet.whitespacesAndNewlines).lowercased()
         let fakeHash = Data(SHA256.hash(data: Data(cleanUser.utf8)).prefix(8)).base64EncodedString()
