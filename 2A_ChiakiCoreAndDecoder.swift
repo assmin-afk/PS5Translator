@@ -1,17 +1,6 @@
 // ============================================================================
 // FILE 2A: 2A_ChiakiCoreAndDecoder.swift (TÁCH TỪ FILE 2 - PHẦN 1/2)
-// PHIÊN BẢN: PS5Translator 1.02 (HOÀN THIỆN BẮT TAY CHIAKI RP-NONCE & TAKION V12)
-// NHIỆM VỤ:
-// 1. Cấu hình vùng quét mặc định (ROIDefaultConfig, ROIMode, PS5ConnectionState).
-// 2. Lõi mã hoá Chiaki (ChiakiEmbeddedCore):
-//    - Giải mã trực tiếp JWT Token của Sony và quét đệ quy mọi cấu trúc JSON để lấy
-//      đúng số Account ID 64-bit -> chuyển sang mã 8-byte Little-Endian Base64.
-//    - Đóng gói 480-byte AES-128-CBC + HMAC-SHA256 chuẩn Chiaki, giải mã đa offset phản hồi PS5.
-//    - Mã hoá RP-Auth & RP-Did bằng RP-Nonce + RP-Key cho phiên /sie/ps5/rp/sess/ctrl.
-//    - Bắt tay 4 bước Takion V12 (INIT -> INIT_ACK -> COOKIE_ECHO -> BIG Payload).
-// 3. Bộ giải mã phần cứng VideoToolbox (ChiakiHardwareVideoDecoder): Ghép mảnh UDP và
-//    giải mã cả H.264 lẫn HEVC (H.265) từ cổng UDP 9296 của PS5 thành CGImage.
-// 4. Bộ bắt Redirect OAuth ngầm (SilentOAuthRedirectCatcher).
+// PHIÊN BẢN: PS5Translator 1.02 (CHUẨN HOÁ RPCRYPT PS5, SRC3 UDP 9295 & RP-VERSION 2.0)
 // ============================================================================
 
 import Foundation
@@ -25,9 +14,6 @@ import WebKit
 import VideoToolbox
 import CoreMedia
 
-// ============================================================================
-// THÔNG SỐ CẤU HÌNH KHUNG QUÉT MẶC ĐỊNH & CỔNG CHIAKI (Đặt ở đầu file)
-// ============================================================================
 struct ROIDefaultConfig {
     static let fullScreenRect = CGRect(x: 0.02, y: 0.04, width: 0.96, height: 0.92)
     static let dialogueDefaultRect = CGRect(x: 0.10, y: 0.68, width: 0.80, height: 0.24)
@@ -75,11 +61,10 @@ final class ChiakiEmbeddedCore {
         0x86, 0x0F, 0x9D, 0x2F, 0x5C, 0x70, 0x10, 0x3C
     ]
 
-    // Kiểm tra xem chuỗi Base64 có phải là mã băm giả (như nZKnNYIoZ0w= hoặc TWlIc29pOTM=) hay không
     func isFakeGeneratedAccountID(_ input: String, username: String) -> Bool {
         let trimmed = input.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines)
         if trimmed.isEmpty { return true }
-        if trimmed == "TWlIc29pOTM=" { return true } // TWlIc29pOTM= is base64 of Miesoi93
+        if trimmed == "TWlIc29pOTM=" { return true }
 
         let cleanUser = (username.isEmpty ? "Miesoi93" : username).trimmingCharacters(in: CharacterSet.whitespacesAndNewlines).lowercased()
         let fakeHash = Data(SHA256.hash(data: Data(cleanUser.utf8)).prefix(8)).base64EncodedString()
@@ -92,25 +77,26 @@ final class ChiakiEmbeddedCore {
         return false
     }
 
-    // Chuyển số Account ID 64-bit sang chuỗi Base64 8-byte Little-Endian chuẩn Chiaki
     func convertUInt64ToBase64LittleEndian(_ numericID: UInt64) -> String {
         var le = numericID.littleEndian
         return Data(bytes: &le, count: 8).base64EncodedString()
     }
 
-    // Chuẩn hoá Account ID sang đúng 8-byte Little-Endian Base64 chuẩn Chiaki
     func normalizeAccountIDTo8Bytes(input: String, fallbackUsername: String) -> (base64: String, numericString: String, isValidRealID: Bool) {
-        let trimmed = input.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines)
+        var trimmed = input.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines)
+        // Sửa lỗi dư dấu '==' (13 ký tự) nếu người dùng copy từ công cụ bên ngoài
+        while trimmed.hasSuffix("==") && trimmed.count > 12 {
+            trimmed.removeLast()
+        }
+
         if isFakeGeneratedAccountID(trimmed, username: fallbackUsername) {
             return ("", "", false)
         }
 
-        // 1. Nếu là dãy số 64-bit của Sony (10 - 20 chữ số)
         if trimmed.allSatisfy({ $0.isNumber }), let numericID = UInt64(trimmed), numericID > 1000000 {
             return (convertUInt64ToBase64LittleEndian(numericID), String(numericID), true)
         }
 
-        // 2. Nếu là chuỗi Base64 giải mã ra đúng 8 bytes thật
         if let decoded = Data(base64Encoded: trimmed), decoded.count == 8 {
             let uint64Val = decoded.withUnsafeBytes { $0.load(as: UInt64.self) }
             let num = UInt64(littleEndian: uint64Val)
@@ -119,7 +105,6 @@ final class ChiakiEmbeddedCore {
             }
         }
 
-        // 3. Nếu là chuỗi Hex 16 ký tự (VD: từ PSNTools / script Chiaki)
         let cleanHex = trimmed.replacingOccurrences(of: "0x", with: "").replacingOccurrences(of: " ", with: "")
         if cleanHex.count == 16, let hexVal = UInt64(cleanHex, radix: 16), hexVal > 1000000 {
             return (convertUInt64ToBase64LittleEndian(hexVal), String(hexVal), true)
@@ -128,7 +113,6 @@ final class ChiakiEmbeddedCore {
         return ("", "", false)
     }
 
-    // MARK: - Giải mã trực tiếp JWT Token của Sony hoặc JSON bất kỳ để lấy Account ID 8-byte
     func extractAccountIDFromJWT(_ jwtString: String) -> (onlineID: String, base64ID: String, numericID: String)? {
         let segments = jwtString.components(separatedBy: ".")
         guard segments.count >= 2 else { return nil }
@@ -219,15 +203,9 @@ final class ChiakiEmbeddedCore {
     }
 
     private func parseValidPSNUInt64(_ raw: Any) -> UInt64? {
-        if let uintVal = raw as? UInt64, uintVal > 1000000 {
-            return uintVal
-        }
-        if let intVal = raw as? Int64, intVal > 1000000 {
-            return UInt64(intVal)
-        }
-        if let intVal = raw as? Int, intVal > 1000000 {
-            return UInt64(intVal)
-        }
+        if let uintVal = raw as? UInt64, uintVal > 1000000 { return uintVal }
+        if let intVal = raw as? Int64, intVal > 1000000 { return UInt64(intVal) }
+        if let intVal = raw as? Int, intVal > 1000000 { return UInt64(intVal) }
         if let numObj = raw as? NSNumber {
             let uVal = numObj.uint64Value
             if uVal > 1000000 { return uVal }
@@ -239,10 +217,15 @@ final class ChiakiEmbeddedCore {
         return nil
     }
 
-    // MARK: - Đóng gói gói tin đăng ký 480 bytes (0x1E0) chuẩn xác 100% theo Chiaki (regist.c & rpcrypt.c)
+    // MARK: - Gói dò tìm đăng ký UDP 9295 (SRC3 cho PS5) bắt buộc trước khi mở TCP 9295
+    func buildRegistSearchPacketPS5() -> Data {
+        // "SRC3" (4 bytes) + 0x00
+        return Data([0x53, 0x52, 0x43, 0x33])
+    }
+
+    // MARK: - Đóng gói gói tin đăng ký 480 bytes (0x1E0) chuẩn xác theo Chiaki (regist.c & rpcrypt.c)
     func buildChiakiPS5RegistPayload480(pinString: String, accountIDBase64: String) -> (payload: Data, aesKey: [UInt8], iv: [UInt8]) {
         let pinNumber = UInt32(pinString) ?? 0
-        // Mã PIN 8 chữ số xếp theo thứ tự Big-Endian 4 bytes chuẩn Chiaki
         let pinBytes: [UInt8] = [
             UInt8((pinNumber >> 24) & 0xFF),
             UInt8((pinNumber >> 16) & 0xFF),
@@ -255,26 +238,34 @@ final class ChiakiEmbeddedCore {
             nonce[i] = UInt8.random(in: 0...255)
         }
 
-        // Tạo ambassador (16B), bright (16B), aesKey (16B) và iv (16B) khớp tuyệt đối với chiaki_rpcrypt_init_regist_ps5
+        // Công thức rpcrypt.c chuẩn cho PS5:
+        // ambassador[i] = nonce[i] ^ ps5Key0[i]
+        // bright[i]     = nonce[i] ^ ps5Key1[i]
+        // iv[i]         = nonce[i] ^ ps5Key0[(i + 8) % 16]
+        // aesKey[i]     = nonce[i] ^ ps5Key1[(i + 8) % 16] ^ pinBytes[i % 4]
         var ambassador = [UInt8](repeating: 0, count: 16)
         var bright = [UInt8](repeating: 0, count: 16)
         var aesKey = [UInt8](repeating: 0, count: 16)
         var iv = [UInt8](repeating: 0, count: 16)
 
         for i in 0..<16 {
-            ambassador[i] = nonce[i] ^ 0x41
+            ambassador[i] = nonce[i] ^ ps5Key0[i]
             bright[i] = nonce[i] ^ ps5Key1[i]
-            aesKey[i] = nonce[i] ^ ps5Key0[i] ^ pinBytes[i % 4]
-            iv[i] = nonce[i]
+            iv[i] = nonce[i] ^ ps5Key0[(i + 8) % 16]
+            aesKey[i] = nonce[i] ^ ps5Key1[(i + 8) % 16] ^ pinBytes[i % 4]
         }
 
-        // Khung dữ liệu nội bộ 384 bytes (0x180) BẮT BUỘC lấp đầy bằng 'A' (0x41) để PS5 không dừng đọc ở byte 0
-        var innerBuffer = [UInt8](repeating: 0x41, count: 384)
+        // Khung dữ liệu nội bộ 384 bytes (0x180):
+        // 56 bytes đầu (tương ứng offset 0x10..<0x48 trong gói 480B) điền 'A' (0x41)
+        // Từ offset 56 (0x48) ghi Header chuẩn và phần dư phía sau điền 0x00
+        var innerBuffer = [UInt8](repeating: 0x00, count: 384)
+        for i in 0..<56 {
+            innerBuffer[i] = 0x41
+        }
+
         var innerHeaders = "Client-Type: \(ROIDefaultConfig.rpClientType)\r\n"
         innerHeaders += "Np-AccountId: \(accountIDBase64)\r\n\r\n"
         let headerBytes = Array(innerHeaders.utf8)
-
-        // Offset 0x48 (72) trong toàn bộ gói 480B = Offset 56 (72 - 16) trong vùng mã hoá 384B
         let innerOffset = 56
         for i in 0..<min(headerBytes.count, 384 - innerOffset) {
             innerBuffer[innerOffset + i] = headerBytes[i]
@@ -283,16 +274,16 @@ final class ChiakiEmbeddedCore {
         let plainData = Data(innerBuffer)
         let encryptedBody = aes128CBCEncryptNoPadding(data: plainData, key: aesKey, iv: iv) ?? plainData
 
-        // HMAC-SHA256 tính bằng khoá bright theo đúng cấu trúc xác thực PS5
-        let hmacSymKey = SymmetricKey(data: Data(bright))
+        // BẮT BUỘC dùng ps5HmacKey (16B) để ký HMAC-SHA256
+        let hmacSymKey = SymmetricKey(data: Data(ps5HmacKey))
         let hmac = HMAC<SHA256>.authenticationCode(for: encryptedBody, using: hmacSymKey)
 
-        // Cấu trúc 480 bytes (0x1E0):
+        // Cấu trúc chuẩn 480 bytes (0x1E0) của Chiaki:
         // [0x00..<0x10]: ambassador (16B)
         // [0x10..<0x190]: encryptedBody (384B)
         // [0x190..<0x1B0]: hmac (32B)
         // [0x1B0..<0x1C0]: bright (16B)
-        // [0x1C0..<0x1E0]: padding 'A' 0x41 (32B)
+        // [0x1C0..<0x1E0]: 'A' (0x41) (32B)
         var fullPayload = Data(capacity: ROIDefaultConfig.chiakiRegistPayloadSize)
         fullPayload.append(contentsOf: ambassador)
         fullPayload.append(encryptedBody.prefix(384))
@@ -303,7 +294,6 @@ final class ChiakiEmbeddedCore {
         return (fullPayload, aesKey, iv)
     }
 
-    // Giải mã phản hồi ghép đôi từ PS5 (Quét qua tất cả các offset chuẩn của PS5 Firmware: 0x20, 0x10, 0x00, 0x30)
     func decryptRegistResponse(cipherData: Data, aesKey: [UInt8], iv: [UInt8]) -> String? {
         let candidateOffsets = [0x20, 0x10, 0x00, 0x30]
         for offset in candidateOffsets {
@@ -349,7 +339,6 @@ final class ChiakiEmbeddedCore {
         return rawStr.trimmingCharacters(in: CharacterSet(charactersIn: "\0"))
     }
 
-    // Mã hoá RP-Auth & RP-Did bằng RP-Nonce (nhận từ /sie/ps5/rp/sess/init) + RP-Key để mở /sie/ps5/rp/sess/ctrl
     func buildSessionAuthHeaders(registKey: String, rpKeyBase64: String, serverNonceBase64: String?) -> (rpAuth: String, rpDid: String) {
         let paddedRegist = registKey.padding(toLength: 16, withPad: "\0", startingAt: 0)
         let rawAuthData = Data(paddedRegist.utf8.prefix(16))
@@ -396,25 +385,24 @@ final class ChiakiEmbeddedCore {
         return (encAuth.base64EncodedString(), encDid.base64EncodedString())
     }
 
+    // ĐÃ SỬA: Bắt buộc dùng RP-Version: 2.0 cho PS5 (RP-Version: 1.0 là PS4 cũ gây lỗi 80108bff)
     func buildRawHTTPRegistRequest(ip: String, payload: Data) -> Data {
         var rawHTTP = "POST /sie/ps5/rp/sess/rgst HTTP/1.1\r\n"
         rawHTTP += "Host: \(ip):\(ROIDefaultConfig.registAndCtrlPort)\r\n"
         rawHTTP += "User-Agent: remoteplay Windows\r\n"
         rawHTTP += "Connection: close\r\n"
         rawHTTP += "Content-Length: \(payload.count)\r\n"
-        rawHTTP += "RP-Version: 1.0\r\n\r\n"
+        rawHTTP += "RP-Version: 2.0\r\n\r\n"
 
         var packet = Data(rawHTTP.utf8)
         packet.append(payload)
         return packet
     }
 
-    // MARK: - Giao thức bắt tay 4 bước Takion V12 trên cổng UDP 9296
-    // Bước 1: Gửi gói INIT (Type = 0x00)
     func buildTakionV12InitPacket(initTag: UInt32) -> Data {
         var packet = Data()
-        packet.append(0x00) // Type = INIT
-        packet.append(0x00) // Flags
+        packet.append(0x00)
+        packet.append(0x00)
         var tagZero: UInt32 = 0
         packet.append(Data(bytes: &tagZero, count: 4))
         var tagBE = initTag.bigEndian
@@ -430,20 +418,18 @@ final class ChiakiEmbeddedCore {
         return packet
     }
 
-    // Bước 2: Đọc gói INIT_ACK (Type = 0x01) từ PS5 -> tạo gói COOKIE_ECHO (Type = 0x02)
     func parseTakionInitAckAndBuildCookieEcho(packet: Data) -> (cookieEchoPacket: Data, remoteTag: UInt32)? {
         let bytes = [UInt8](packet)
         guard bytes.count >= 22, bytes[0] == 0x01 else { return nil }
 
-        // Lấy initiateTag (remoteTag) của PS5 tại offset 6..10 (hoặc 8..12 tuỳ cấu trúc header)
-        let remoteTag: UInt32 = packet.subdata(in: 6..<10).withUnsafeBytes {
-            UInt32(bigEndian: $0.load(as: UInt32.self))
-        }
+        let remoteTag: UInt32 = (UInt32(bytes[6]) << 24)
+            | (UInt32(bytes[7]) << 16)
+            | (UInt32(bytes[8]) << 8)
+            | UInt32(bytes[9])
 
-        // Phần Cookie nằm từ offset 22 đến hết gói INIT_ACK
         let cookiePayload = packet.subdata(in: 22..<packet.count)
         var echo = Data()
-        echo.append(0x02) // Type = COOKIE_ECHO
+        echo.append(0x02)
         echo.append(0x00)
         var remoteTagBE = remoteTag.bigEndian
         echo.append(Data(bytes: &remoteTagBE, count: 4))
@@ -451,11 +437,10 @@ final class ChiakiEmbeddedCore {
         return (echo, remoteTag)
     }
 
-    // Bước 3: Sau khi nhận COOKIE_ACK (Type = 0x03) -> Gửi gói BIG Payload (Type = 0x04) yêu cầu mở luồng video
     func buildTakionV12BigStreamRequestPacket(remoteTag: UInt32, tsn: UInt32 = 1) -> Data {
         var packet = Data()
-        packet.append(0x04) // Type = DATA / CONTROL
-        packet.append(0x03) // Flags = Beginning + Ending
+        packet.append(0x04)
+        packet.append(0x03)
         var remoteTagBE = remoteTag.bigEndian
         packet.append(Data(bytes: &remoteTagBE, count: 4))
         var tsnBE = tsn.bigEndian
@@ -464,7 +449,6 @@ final class ChiakiEmbeddedCore {
         var streamSeq: UInt16 = UInt16(0).bigEndian
         packet.append(Data(bytes: &streamID, count: 2))
         packet.append(Data(bytes: &streamSeq, count: 2))
-        // Takion Protobuf BIG Payload (Yêu cầu luồng 720p 60fps H.264/HEVC)
         let protoBig: [UInt8] = [0x08, 0x01, 0x12, 0x0C, 0x08, 0x0C, 0x10, 0x80, 0x0A, 0x18, 0xD0, 0x05, 0x20, 0x3C]
         packet.append(contentsOf: protoBig)
         return packet
@@ -515,7 +499,6 @@ final class ChiakiHardwareVideoDecoder {
         guard data.count > 12 else { return }
         let bytes = [UInt8](data)
 
-        // Ghép mảnh các gói video Takion (Type 0x01 / 0x06 hoặc gói RTP/AV > 64 bytes)
         if bytes[0] == 0x01 || bytes[0] == 0x06 || data.count > 64 {
             let payloadStart = min(12, data.count - 4)
             reassemblyBuffer.append(data.subdata(in: payloadStart..<data.count))
@@ -557,7 +540,6 @@ final class ChiakiHardwareVideoDecoder {
     private func processNALUnit(_ nal: Data) {
         guard let firstByte = nal.first else { return }
 
-        // 1. Kiểm tra định dạng HEVC (H.265) chuẩn PS5: (firstByte >> 1) & 0x3F
         let hevcType = (firstByte >> 1) & 0x3F
         if hevcType == 32 {
             isHEVCStream = true
@@ -577,7 +559,6 @@ final class ChiakiHardwareVideoDecoder {
             return
         }
 
-        // 2. Kiểm tra định dạng H.264 (AVC): firstByte & 0x1F
         let nalType = firstByte & 0x1F
         if nalType == 7 {
             isHEVCStream = false
@@ -727,7 +708,6 @@ final class ChiakiHardwareVideoDecoder {
     }
 }
 
-// Bộ bắt Redirect OAuth ngầm từ Cookie Sony đã đăng nhập
 final class SilentOAuthRedirectCatcher: NSObject, URLSessionTaskDelegate {
     private let onCodeCaptured: (String?) -> Void
     private var didFinish = false
