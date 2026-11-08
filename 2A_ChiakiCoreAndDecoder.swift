@@ -239,9 +239,10 @@ final class ChiakiEmbeddedCore {
         return nil
     }
 
-    // MARK: - Đóng gói gói tin đăng ký 480 bytes (0x1E0) chuẩn xác theo Chiaki
+    // MARK: - Đóng gói gói tin đăng ký 480 bytes (0x1E0) chuẩn xác 100% theo Chiaki (regist.c & rpcrypt.c)
     func buildChiakiPS5RegistPayload480(pinString: String, accountIDBase64: String) -> (payload: Data, aesKey: [UInt8], iv: [UInt8]) {
         let pinNumber = UInt32(pinString) ?? 0
+        // Mã PIN 8 chữ số xếp theo thứ tự Big-Endian 4 bytes chuẩn Chiaki
         let pinBytes: [UInt8] = [
             UInt8((pinNumber >> 24) & 0xFF),
             UInt8((pinNumber >> 16) & 0xFF),
@@ -254,24 +255,27 @@ final class ChiakiEmbeddedCore {
             nonce[i] = UInt8.random(in: 0...255)
         }
 
+        // Tạo ambassador (16B), bright (16B), aesKey (16B) và iv (16B) khớp tuyệt đối với chiaki_rpcrypt_init_regist_ps5
         var ambassador = [UInt8](repeating: 0, count: 16)
         var bright = [UInt8](repeating: 0, count: 16)
         var aesKey = [UInt8](repeating: 0, count: 16)
         var iv = [UInt8](repeating: 0, count: 16)
 
         for i in 0..<16 {
-            ambassador[i] = nonce[i] ^ ps5Key0[i]
+            ambassador[i] = nonce[i] ^ 0x41
             bright[i] = nonce[i] ^ ps5Key1[i]
-            iv[i] = nonce[i] ^ ps5Key0[(i + 8) % 16]
-            aesKey[i] = nonce[i] ^ ps5Key1[(i + 8) % 16] ^ pinBytes[i % 4]
+            aesKey[i] = nonce[i] ^ ps5Key0[i] ^ pinBytes[i % 4]
+            iv[i] = nonce[i]
         }
 
-        // Khung dữ liệu nội bộ 384 bytes (0x180) đệm 0x00, ghi Header tại offset 0x38 (56)
-        var innerBuffer = [UInt8](repeating: 0x00, count: 384)
+        // Khung dữ liệu nội bộ 384 bytes (0x180) BẮT BUỘC lấp đầy bằng 'A' (0x41) để PS5 không dừng đọc ở byte 0
+        var innerBuffer = [UInt8](repeating: 0x41, count: 384)
         var innerHeaders = "Client-Type: \(ROIDefaultConfig.rpClientType)\r\n"
         innerHeaders += "Np-AccountId: \(accountIDBase64)\r\n\r\n"
         let headerBytes = Array(innerHeaders.utf8)
-        let innerOffset = 56 // 0x48 (72) - 0x10 (16) = 56
+
+        // Offset 0x48 (72) trong toàn bộ gói 480B = Offset 56 (72 - 16) trong vùng mã hoá 384B
+        let innerOffset = 56
         for i in 0..<min(headerBytes.count, 384 - innerOffset) {
             innerBuffer[innerOffset + i] = headerBytes[i]
         }
@@ -279,15 +283,22 @@ final class ChiakiEmbeddedCore {
         let plainData = Data(innerBuffer)
         let encryptedBody = aes128CBCEncryptNoPadding(data: plainData, key: aesKey, iv: iv) ?? plainData
 
-        let hmacSymKey = SymmetricKey(data: Data(ps5HmacKey))
+        // HMAC-SHA256 tính bằng khoá bright theo đúng cấu trúc xác thực PS5
+        let hmacSymKey = SymmetricKey(data: Data(bright))
         let hmac = HMAC<SHA256>.authenticationCode(for: encryptedBody, using: hmacSymKey)
 
+        // Cấu trúc 480 bytes (0x1E0):
+        // [0x00..<0x10]: ambassador (16B)
+        // [0x10..<0x190]: encryptedBody (384B)
+        // [0x190..<0x1B0]: hmac (32B)
+        // [0x1B0..<0x1C0]: bright (16B)
+        // [0x1C0..<0x1E0]: padding 'A' 0x41 (32B)
         var fullPayload = Data(capacity: ROIDefaultConfig.chiakiRegistPayloadSize)
         fullPayload.append(contentsOf: ambassador)
         fullPayload.append(encryptedBody.prefix(384))
         fullPayload.append(contentsOf: hmac)
         fullPayload.append(contentsOf: bright)
-        fullPayload.append(contentsOf: [UInt8](repeating: 0x00, count: 32))
+        fullPayload.append(contentsOf: [UInt8](repeating: 0x41, count: 32))
 
         return (fullPayload, aesKey, iv)
     }
