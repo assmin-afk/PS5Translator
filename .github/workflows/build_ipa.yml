@@ -84,7 +84,7 @@ jobs:
               print("Extracted static consts and chiaki_regist_request_payload_format cleanly!")
           PYEOF
 
-      - name: 3. Tao Shim OpenSSL Chuan Bit-Exact (CFB128/CBC/ECB) & Cau noi C-Bridge (psn_online_id = NULL)
+      - name: 3. Tao Shim OpenSSL Chuan Bit-Exact (CFB128/CBC/ECB) & Cau noi C-Bridge (9 tham so)
         run: |
           cat << 'EOF' > Sources/ChiakiNative/include/openssl/evp.h
           #ifndef CHIAKI_OPENSSL_EVP_SHIM_H
@@ -703,29 +703,16 @@ jobs:
                   modified = True
 
               # Tu dong nang cap parseRegistKeyTo16Bytes de ho tro PS5-RegistKey dang Hex 32 ky tu
-              old_parse_reg = """    func parseRegistKeyTo16Bytes(_ registKey: String) -> Data {
-        let clean = registKey.trimmingCharacters(in: .whitespacesAndNewlines)
-        var bytes = [UInt8](repeating: 0, count: 16)
-        let utf8 = Array(clean.utf8)
-        for i in 0..<min(16, utf8.count) {
-            bytes[i] = utf8[i]
-        }
-        return Data(bytes)
-    }"""
-              new_parse_reg = """    func parseRegistKeyTo16Bytes(_ registKey: String) -> Data {
-        let clean = registKey.trimmingCharacters(in: .whitespacesAndNewlines)
-        if clean.count == 32, let hexBytes = Self.hexStringToBytes(clean), hexBytes.count == 16 {
-            return Data(hexBytes)
-        }
-        var bytes = [UInt8](repeating: 0, count: 16)
-        let utf8 = Array(clean.utf8)
-        for i in 0..<min(16, utf8.count) {
-            bytes[i] = utf8[i]
-        }
-        return Data(bytes)
-    }"""
-              if old_parse_reg in content:
-                  content = content.replace(old_parse_reg, new_parse_reg, 1)
+              old_parse_sig = "func parseRegistKeyTo16Bytes(_ registKey: String) -> Data {"
+              if old_parse_sig in content and "Self.hexStringToBytes(clean)" not in content:
+                  new_parse_hook = (
+                      "func parseRegistKeyTo16Bytes(_ registKey: String) -> Data {\n"
+                      "        let cleanHexCheck = registKey.trimmingCharacters(in: .whitespacesAndNewlines)\n"
+                      "        if cleanHexCheck.count == 32, let hb = Self.hexStringToBytes(cleanHexCheck), hb.count == 16 {\n"
+                      "            return Data(hb)\n"
+                      "        }"
+                  )
+                  content = content.replace(old_parse_sig, new_parse_hook, 1)
                   modified = True
 
               # Tu dong sua receive(minimumIncompleteLength: 1, ...) trong sendTCPRegistPayload thanh gom du goi TCP
@@ -843,3 +830,4 @@ jobs:
         with:
           name: File_Cai_Dat_PS5Translator_IPA
           path: PS5Translator.ipa
+
