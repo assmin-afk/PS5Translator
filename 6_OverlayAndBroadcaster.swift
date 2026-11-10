@@ -458,8 +458,19 @@ class TVWebSocketServer: ObservableObject {
             guard let port = NWEndpoint.Port(rawValue: AppConfig.webSocketPort) else { return }
             listener = try NWListener(using: params, on: port)
             listener?.newConnectionHandler = { [weak self] conn in
-                self?.connections.append(conn)
-                DispatchQueue.main.async { self?.connectedCount = self?.connections.count ?? 0 }
+                guard let self = self else { return }
+                self.connections.append(conn)
+                DispatchQueue.main.async { self.connectedCount = self.connections.count }
+                conn.stateUpdateHandler = { [weak self, weak conn] state in
+                    guard let self = self, let c = conn else { return }
+                    switch state {
+                    case .cancelled, .failed:
+                        self.connections.removeAll { $0 === c }
+                        DispatchQueue.main.async { self.connectedCount = self.connections.count }
+                    default:
+                        break
+                    }
+                }
                 conn.start(queue: .main)
             }
             listener?.start(queue: .main)
@@ -467,7 +478,16 @@ class TVWebSocketServer: ObservableObject {
     }
 
     func broadcast(boxes: [TranslatedBox]) {
-        let payload = TVPayload(status: boxes.isEmpty ? "clear" : "show", boxes: boxes)
+        let texts = boxes.map { box in
+            TVTextItem(
+                text: box.text,
+                x: box.x * 100.0,
+                y: box.y * 100.0,
+                width: box.w * 100.0,
+                height: box.h * 100.0
+            )
+        }
+        let payload = TVPayload(status: boxes.isEmpty ? "clear" : "show", boxes: boxes, texts: texts)
         guard let data = try? JSONEncoder().encode(payload) else { return }
         let metadata = NWProtocolWebSocket.Metadata(opcode: .text)
         let context = NWConnection.ContentContext(identifier: "ws", metadata: [metadata])
