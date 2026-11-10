@@ -55,8 +55,6 @@ class VideoSourceManager: NSObject, ObservableObject {
     private var receivedPacketsCount: Int = 0
     private var currentTakionRemoteTag: UInt32 = 0
     private var takionHeartbeatTimer: Timer?
-    private var currentTakionRemoteTag: UInt32 = 0
-    private var takionHeartbeatTimer: Timer?
 
     override init() {
         self.customDialogueRect = VideoSourceManager.loadSavedRect(
@@ -544,7 +542,7 @@ class VideoSourceManager: NSObject, ObservableObject {
 
         var parsed = ChiakiEmbeddedCore.shared.normalizeAccountIDTo8Bytes(input: accountIDBase64, fallbackUsername: username)
         if !parsed.isValidRealID {
-            parsed = ChiakiEmbeddedCore.shared.normalizeAccountIDTo8Bytes(input: username, fallbackUsername: targetUser)
+            parsed = ChiakiEmbeddedCore.shared.normalizeAccountIDTo8Bytes(input: username, fallbackUsername: username)
         }
 
         guard parsed.isValidRealID else {
