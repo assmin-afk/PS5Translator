@@ -84,7 +84,7 @@ jobs:
               print("Extracted static consts and chiaki_regist_request_payload_format cleanly!")
           PYEOF
 
-      - name: 3. Tao Shim OpenSSL Chuan Bit-Exact (CFB128/CBC/ECB) & Cau noi C-Bridge (9 tham so)
+      - name: 3. Tao Shim OpenSSL Chuan Bit-Exact (CFB128/CBC/ECB) & Cau noi C-Bridge (psn_online_id = NULL)
         run: |
           cat << 'EOF' > Sources/ChiakiNative/include/openssl/evp.h
           #ifndef CHIAKI_OPENSSL_EVP_SHIM_H
@@ -512,7 +512,7 @@ jobs:
               size_t buf_size = 1024;
 
               // QUAN TRONG: Tham so thu 6 (psn_online_id) BAT BUOC phai la NULL tren PS5
-              // de chiaki_regist_request_payload_format dung Np-AccountId (decoded_aid) thay vi Np-OnlineId (gay loi 80108b02 / CE-110032-7)
+              // de chiaki_regist_request_payload_format dung Np-AccountId (decoded_aid) thay vi Np-OnlineId (gay loi 80108bff / 80108b02)
               ChiakiErrorCode err = chiaki_regist_request_payload_format(
                   CHIAKI_TARGET_PS5_1,
                   ambassador,
@@ -715,13 +715,6 @@ jobs:
                   content = content.replace(old_parse_sig, new_parse_hook, 1)
                   modified = True
 
-              # Tu dong sua receive(minimumIncompleteLength: 1, ...) trong sendTCPRegistPayload thanh gom du goi TCP
-              old_recv = 'tcpConn.receive(minimumIncompleteLength: 1, maximumLength: 8192) { data, _, _, _ in'
-              new_recv = 'tcpConn.receive(minimumIncompleteLength: 64, maximumLength: 8192) { data, _, _, _ in'
-              if old_recv in content:
-                  content = content.replace(old_recv, new_recv, 1)
-                  modified = True
-
               if modified:
                   with open(path, "w", encoding="utf-8") as f:
                       f.write(content)
@@ -830,4 +823,3 @@ jobs:
         with:
           name: File_Cai_Dat_PS5Translator_IPA
           path: PS5Translator.ipa
-
