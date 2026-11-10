@@ -1,6 +1,6 @@
 // ============================================================================
 // FILE 2A: 2A_ChiakiCoreAndDecoder.swift (TÁCH TỪ FILE 2 - PHẦN 1/2)
-// PHIÊN BẢN: PS5Translator 1.07 (GỌI TRỰC TIẾP C-BRIDGE CHIAKI-NG & FIX REDECLARATION)
+// PHIÊN BẢN: PS5Translator 1.08 (CHUẨN HOÁ C-BRIDGE CHIAKI-NG & HEX REGISTKEY)
 // ============================================================================
 
 import Foundation
@@ -234,7 +234,7 @@ final class ChiakiEmbeddedCore {
         return Data([0x53, 0x52, 0x43, 0x33]) // "SRC3"
     }
 
-    // MARK: - Đóng gói gói tin 587 bytes bằng thư viện C gốc của chiaki-ng (rpcrypt.c)
+    // MARK: - Đóng gói gói tin 587 bytes bằng thư viện C gốc của chiaki-ng (rpcrypt.c & regist.c)
     func buildChiakiPS5RegistPayload480(pinString: String, accountIDBase64: String) -> (payload: Data, aesKey: [UInt8], iv: [UInt8]) {
         let trimmedAccountB64 = accountIDBase64.trimmingCharacters(in: .whitespacesAndNewlines)
 
@@ -347,8 +347,8 @@ final class ChiakiEmbeddedCore {
     func decryptRegistResponse(cipherData: Data, aesKey: [UInt8], iv: [UInt8]) -> String? {
         guard !cipherData.isEmpty else { return nil }
 
-        // 1. Giải mã trực tiếp bằng hàm C chiaki_bridge_decrypt_regist_response (tại offset 0x20 chuẩn regist.c)
-        if cipherData.count > 0x20 && aesKey.count == 16 && iv.count == 16 {
+        // 1. Giải mã trực tiếp bằng hàm C chiaki_bridge_decrypt_regist_response (quét đa offset 0x20, 0x00, 0x10)
+        if cipherData.count >= 16 && aesKey.count == 16 && iv.count == 16 {
             var plainBuf = [UInt8](repeating: 0, count: 2048)
             let cipherBytes = [UInt8](cipherData)
             let hmacArg = self.lastRegistHmacKey.count == 16 ? self.lastRegistHmacKey : [UInt8](repeating: 0, count: 16)
@@ -478,8 +478,12 @@ final class ChiakiEmbeddedCore {
         return rawStr.trimmingCharacters(in: CharacterSet(charactersIn: "\0"))
     }
 
+    // ĐÃ SỬA: Hỗ trợ giải mã PS5-RegistKey dạng Hex 32 ký tự sang đúng 16 bytes nhị phân chuẩn
     func parseRegistKeyTo16Bytes(_ registKey: String) -> Data {
         let clean = registKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        if clean.count == 32, let hexBytes = Self.hexStringToBytes(clean), hexBytes.count == 16 {
+            return Data(hexBytes)
+        }
         var bytes = [UInt8](repeating: 0, count: 16)
         let utf8 = Array(clean.utf8)
         for i in 0..<min(16, utf8.count) {
