@@ -1,6 +1,6 @@
 // ============================================================================
 // FILE 6B: 6B_TranslatorViewsAndModals.swift (TÁCH TỪ FILE 6 - PHẦN 2/2)
-// PHIÊN BẢN: PS5Translator 1.07 (ĐỒNG BỘ COOKIE DEFAULT & NÚT REPLAYKIT LIVE)
+// PHIÊN BẢN: PS5Translator 1.09 (CHIAKI REMOTE PLAY HOÀN CHỈNH)
 // ============================================================================
 
 import SwiftUI
@@ -69,7 +69,7 @@ struct MainTranslatorView: View {
                             .frame(width: 7, height: 7)
                         Text(coord.videoMgr.isConnectedToPS5
                              ? "Chiaki Live: \(coord.videoMgr.ps5HostIP)"
-                             : (coord.videoMgr.isAccountRemembered ? "Đã nhớ TK: \(coord.videoMgr.psnUsername)" : "Chưa nối PS5"))
+                             : (coord.videoMgr.isAccountRemembered && !coord.videoMgr.psnUsername.isEmpty ? "Đã nhớ TK: \(coord.videoMgr.psnUsername)" : "Chưa nối PS5"))
                             .font(.system(size: 11, weight: .medium))
                             .foregroundColor(.white.opacity(0.85))
                     }
@@ -371,7 +371,7 @@ struct MainTranslatorView: View {
                         VStack(alignment: .leading, spacing: 2) {
                             Text("Liên kết máy PS5")
                                 .font(.system(size: 13, weight: .bold))
-                            Text(coord.videoMgr.isAccountRemembered ? "Đã nhớ: \(coord.videoMgr.psnUsername)" : "Lõi Chiaki & Mã PIN")
+                            Text(coord.videoMgr.isAccountRemembered && !coord.videoMgr.psnUsername.isEmpty ? "Đã nhớ: \(coord.videoMgr.psnUsername)" : "Lõi Chiaki & Mã PIN")
                                 .font(.system(size: 10))
                                 .foregroundColor(.white.opacity(0.8))
                         }
@@ -866,23 +866,7 @@ struct PS5ConnectionWizardView: View {
                         .cornerRadius(12)
                     }
 
-                    // Nút dự phòng: Thu hình trực tiếp ReplayKit / PS Remote Play PiP ngay trên iPhone
-                    Button(action: {
-                        coord.videoMgr.toggleReplayKitDirectCapture()
-                    }) {
-                        HStack {
-                            Spacer()
-                            Image(systemName: coord.videoMgr.isReplayKitCapturing ? "stop.circle.fill" : "record.circle.fill")
-                                .font(.title3)
-                            Text(coord.videoMgr.isReplayKitCapturing ? "DỪNG THU HÌNH TRỰC TIẾP REPLAYKIT" : "THU HÌNH TRỰC TIẾP (REPLAYKIT / PIP)")
-                                .font(.system(size: 13, weight: .bold))
-                            Spacer()
-                        }
-                        .padding(.vertical, 12)
-                        .background(coord.videoMgr.isReplayKitCapturing ? Color.orange.opacity(0.3) : Color.cyan.opacity(0.22))
-                        .foregroundColor(coord.videoMgr.isReplayKitCapturing ? .orange : .cyan)
-                        .cornerRadius(12)
-                    }
+
 
                     if coord.videoMgr.isConnectedToPS5 {
                         Button(action: {
