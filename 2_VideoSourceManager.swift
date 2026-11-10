@@ -1,6 +1,6 @@
 // ============================================================================
 // FILE 2B: 2_VideoSourceManager.swift (TÁCH TỪ FILE 2 - PHẦN 2/2)
-// PHIÊN BẢN: PS5Translator 1.07 (CHUẨN 587-BYTE C-BRIDGE & FIX STOPCAPTURE)
+// PHIÊN BẢN: PS5Translator 1.08 (CHUẨN HOÁ UDP SRC3/RES3 & GOM ĐỦ GÓI TCP 9295)
 // ============================================================================
 
 import Foundation
@@ -615,22 +615,14 @@ class VideoSourceManager: NSObject, ObservableObject {
         }
     }
 
+    // ĐÃ SỬA: Chỉ gửi duy nhất 1 luồng UDP SRC3 chuẩn trên cổng 9295 (fallback sang cổng động nếu bận)
+    // để không làm PS5 huỷ phiên chờ mã PIN
     private func performRawSocketChiakiRegistration(ip: String, pin: String, accountIDBase64: String) {
         rawRegistTCPConn?.cancel()
 
         let host = NWEndpoint.Host(ip)
         guard let port = NWEndpoint.Port(rawValue: ROIDefaultConfig.registAndCtrlPort) else { return }
         let src3Packet = ChiakiEmbeddedCore.shared.buildRegistSearchPacketPS5()
-
-        let fastUDP = NWConnection(host: host, port: port, using: .udp)
-        fastUDP.stateUpdateHandler = { state in
-            if case .ready = state {
-                fastUDP.send(content: src3Packet, completion: .contentProcessed({ _ in
-                    fastUDP.cancel()
-                }))
-            }
-        }
-        fastUDP.start(queue: .global(qos: .userInteractive))
 
         let udpParams = NWParameters.udp
         udpParams.allowLocalEndpointReuse = true
@@ -643,7 +635,7 @@ class VideoSourceManager: NSObject, ObservableObject {
             guard let self = self, !didStartTCP else { return }
             didStartTCP = true
             udpSearchConn.cancel()
-            DispatchQueue.global(qos: .userInteractive).asyncAfter(deadline: .now() + 0.12) {
+            DispatchQueue.global(qos: .userInteractive).asyncAfter(deadline: .now() + 0.08) {
                 self.sendTCPRegistPayload(ip: ip, pin: pin, accountIDBase64: accountIDBase64)
             }
         }
@@ -656,15 +648,73 @@ class VideoSourceManager: NSObject, ObservableObject {
                     launchTCPRegist()
                 }
             case .failed:
-                launchTCPRegist()
+                // Nếu cổng UDP 9295 đang bận trên iOS, gửi SRC3 qua socket UDP tiêu chuẩn
+                let fallbackUDP = NWConnection(host: host, port: port, using: .udp)
+                fallbackUDP.stateUpdateHandler = { fbState in
+                    if case .ready = fbState {
+                        fallbackUDP.send(content: src3Packet, completion: .contentProcessed({ _ in
+                            fallbackUDP.cancel()
+                            launchTCPRegist()
+                        }))
+                    } else if case .failed = fbState {
+                        fallbackUDP.cancel()
+                        launchTCPRegist()
+                    }
+                }
+                fallbackUDP.start(queue: .global(qos: .userInteractive))
             default:
                 break
             }
         }
         udpSearchConn.start(queue: .global(qos: .userInteractive))
 
-        DispatchQueue.global(qos: .userInteractive).asyncAfter(deadline: .now() + 0.35) {
+        DispatchQueue.global(qos: .userInteractive).asyncAfter(deadline: .now() + 0.30) {
             launchTCPRegist()
+        }
+    }
+
+    // ĐÃ SỬA: Gom đủ toàn bộ các mảnh gói tin TCP phản hồi từ PS5 trước khi giải mã
+    private func receiveFullHTTPResponse(
+        from conn: NWConnection,
+        accumulated: Data = Data(),
+        completion: @escaping (Data) -> Void
+    ) {
+        conn.receive(minimumIncompleteLength: 1, maximumLength: 8192) { [weak self] chunk, _, isComplete, error in
+            guard let self = self else {
+                completion(accumulated)
+                return
+            }
+            var buffer = accumulated
+            if let chunk = chunk, !chunk.isEmpty {
+                buffer.append(chunk)
+            }
+
+            let separator = Data("\r\n\r\n".utf8)
+            if let range = buffer.range(of: separator) {
+                let headerData = buffer.subdata(in: 0..<range.lowerBound)
+                let bodyCount = buffer.count - range.upperBound
+                let headerStr = String(data: headerData, encoding: .utf8) ?? ""
+
+                if let clStr = self.extractHeader(from: headerStr, key: "Content-Length"),
+                   let expectedLen = Int(clStr) {
+                    if bodyCount >= expectedLen {
+                        completion(buffer)
+                        return
+                    }
+                } else if !headerStr.contains("200 OK") && !headerStr.contains("200 Ok") {
+                    completion(buffer)
+                    return
+                } else if bodyCount >= 96 {
+                    completion(buffer)
+                    return
+                }
+            }
+
+            if isComplete || error != nil {
+                completion(buffer)
+            } else {
+                self.receiveFullHTTPResponse(from: conn, accumulated: buffer, completion: completion)
+            }
         }
     }
 
@@ -687,13 +737,13 @@ class VideoSourceManager: NSObject, ObservableObject {
             switch state {
             case .ready:
                 tcpConn.send(content: rawHTTPPacket, completion: .contentProcessed({ _ in
-                    tcpConn.receive(minimumIncompleteLength: 1, maximumLength: 8192) { data, _, _, _ in
+                    self.receiveFullHTTPResponse(from: tcpConn) { data in
                         guard !didComplete else { return }
                         didComplete = true
                         tcpConn.cancel()
 
                         DispatchQueue.main.async {
-                            guard let data = data, !data.isEmpty else {
+                            guard !data.isEmpty else {
                                 self.isConnectedToPS5 = false
                                 self.connectionState = .error(message: "PS5 đóng kết nối cổng 9295")
                                 self.statusLog = "❌ Máy PS5 (\(ip)) không phản hồi gói ghép đôi. Hãy kiểm tra PS5 đang mở màn hình đếm ngược mã PIN 8 chữ số."
@@ -723,7 +773,7 @@ class VideoSourceManager: NSObject, ObservableObject {
                                     ?? ""
 
                                 guard !regKey.isEmpty && !rpKey.isEmpty else {
-                                    self.statusLog = "⚠️ PS5 trả về 200 OK nhưng chưa giải mã được RP-Key. Đang thử lại..."
+                                    self.statusLog = "⚠️ PS5 trả về 200 OK nhưng chưa giải mã được RP-Key (Body: \(bodyData.count)B). Đang thử lại..."
                                     return
                                 }
 
@@ -780,9 +830,9 @@ class VideoSourceManager: NSObject, ObservableObject {
                 initReq += "RP-Version: 1.0\r\n\r\n"
 
                 initConn.send(content: initReq.data(using: .utf8), completion: .contentProcessed({ _ in
-                    initConn.receive(minimumIncompleteLength: 1, maximumLength: 4096) { data, _, _, _ in
+                    self.receiveFullHTTPResponse(from: initConn) { data in
                         initConn.cancel()
-                        let initRespStr = data != nil ? (String(data: data!, encoding: .utf8) ?? "") : ""
+                        let initRespStr = String(data: data, encoding: .utf8) ?? ""
                         let serverNonce = self.extractHeader(from: initRespStr, key: "RP-Nonce")
 
                         let authHeaders = ChiakiEmbeddedCore.shared.buildSessionAuthHeaders(
@@ -912,7 +962,6 @@ class VideoSourceManager: NSObject, ObservableObject {
         takionStreamConn?.cancel()
         udpDiscoveryConn?.cancel()
         if isReplayKitCapturing {
-            // SỬA LỖI DÒNG 915: Dùng trailing closure chuẩn ReplayKit iOS SDK
             RPScreenRecorder.shared().stopCapture { _ in }
             isReplayKitCapturing = false
         }
