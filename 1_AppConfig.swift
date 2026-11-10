@@ -105,9 +105,18 @@ struct TranslatedBox: Codable, Identifiable, Equatable {
     var isAITranslated: Bool = false
 }
 
+struct TVTextItem: Codable {
+    let text: String
+    let x: Double
+    let y: Double
+    let width: Double
+    let height: Double
+}
+
 struct TVPayload: Codable {
     let status: String
     let boxes: [TranslatedBox]
+    let texts: [TVTextItem]
 }
 
 struct RawOCRResult {
