@@ -1,6 +1,6 @@
 // ============================================================================
-// FILE 2B: 2_VideoSourceManager.swift (TÁCH TỪ FILE 2 - PHẦN 2/2)
-// PHIÊN BẢN: PS5Translator 1.08 (CHUẨN HOÁ UDP SRC3/RES3 & GOM ĐỦ GÓI TCP 9295)
+// FILE 2B: 2_VideoSourceManager.swift (T CH T? FILE 2 - PH?N 2/2)
+// PHI N B?N: PS5Translator 1.08 (CHU?N HO  UDP SRC3/RES3 & GOM  ? G I TCP 9295)
 // ============================================================================
 
 import Foundation
@@ -10,7 +10,6 @@ import Combine
 import Network
 import CryptoKit
 import WebKit
-import ReplayKit
 
 class VideoSourceManager: NSObject, ObservableObject {
     @Published var currentFullFrame: CGImage?
@@ -19,15 +18,14 @@ class VideoSourceManager: NSObject, ObservableObject {
     @Published var isConnectedToPS5: Bool = false
     @Published var isUsingTestSimulator: Bool = false
     @Published var isReceivingRealPS5Video: Bool = false
-    @Published var isReplayKitCapturing: Bool = false
 
-    @Published var psnUsername: String = UserDefaults.standard.string(forKey: "psn_user_v102") ?? "Maivy1125" {
+    @Published var psnUsername: String = UserDefaults.standard.string(forKey: "psn_user_v102") ?? "" {
         didSet { UserDefaults.standard.set(psnUsername, forKey: "psn_user_v102") }
     }
-    @Published var psnAccountIDBase64: String = UserDefaults.standard.string(forKey: "psn_aid_v102") ?? "Jpiw1lMmkmw=" {
+    @Published var psnAccountIDBase64: String = UserDefaults.standard.string(forKey: "psn_aid_v102") ?? "" {
         didSet { UserDefaults.standard.set(psnAccountIDBase64, forKey: "psn_aid_v102") }
     }
-    @Published var psnNumericAccountID: String = UserDefaults.standard.string(forKey: "psn_num_id_v102") ?? "7823357644222011430" {
+    @Published var psnNumericAccountID: String = UserDefaults.standard.string(forKey: "psn_num_id_v102") ?? "" {
         didSet { UserDefaults.standard.set(psnNumericAccountID, forKey: "psn_num_id_v102") }
     }
     @Published var isAccountRemembered: Bool = UserDefaults.standard.bool(forKey: "psn_remembered_v102") {
@@ -40,7 +38,7 @@ class VideoSourceManager: NSObject, ObservableObject {
     }
     @Published var discoveredPS5Name: String = UserDefaults.standard.string(forKey: "ps5_name_v102") ?? "PS5 Console"
     @Published var discoveredPS5HostID: String = UserDefaults.standard.string(forKey: "ps5_hostid_v102") ?? ""
-    @Published var statusLog: String = "Sẵn sàng kết nối máy PS5 qua lõi C Chiaki-NG."
+    @Published var statusLog: String = "S?n s ng k?t n?i m y PS5 qua l i C Chiaki-NG."
 
     @Published var savedRegistKey: String = UserDefaults.standard.string(forKey: "chiaki_real_regist_key_v102") ?? ""
     @Published var savedRPKey: String = UserDefaults.standard.string(forKey: "chiaki_real_rp_key_v102") ?? ""
@@ -55,6 +53,10 @@ class VideoSourceManager: NSObject, ObservableObject {
     private var takionStreamConn: NWConnection?
     private let videoDecoder = ChiakiHardwareVideoDecoder()
     private var receivedPacketsCount: Int = 0
+    private var currentTakionRemoteTag: UInt32 = 0
+    private var takionHeartbeatTimer: Timer?
+    private var currentTakionRemoteTag: UInt32 = 0
+    private var takionHeartbeatTimer: Timer?
 
     override init() {
         self.customDialogueRect = VideoSourceManager.loadSavedRect(
@@ -75,12 +77,11 @@ class VideoSourceManager: NSObject, ObservableObject {
             psnAccountIDBase64 = checkNorm.base64
             psnNumericAccountID = checkNorm.numericString
             isAccountRemembered = true
-            statusLog = "✅ Đã ghi nhớ tài khoản '\(psnUsername)' (ID 8-byte: \(psnAccountIDBase64) • Số ID: \(psnNumericAccountID))."
+            statusLog = "?    ghi nh? t i kho?n '\(psnUsername)' (ID 8-byte: \(psnAccountIDBase64)   S? ID: \(psnNumericAccountID))."
         } else {
-            psnAccountIDBase64 = "Jpiw1lMmkmw="
-            psnNumericAccountID = "7823357644222011430"
-            psnUsername = "Maivy1125"
-            isAccountRemembered = true
+            psnAccountIDBase64 = ""
+            psnNumericAccountID = ""
+            isAccountRemembered = false
         }
 
         videoDecoder.onFrameDecoded = { [weak self] decodedCGImage in
@@ -97,44 +98,6 @@ class VideoSourceManager: NSObject, ObservableObject {
         }
     }
 
-    // MARK: - Chế độ thu hình trực tiếp ReplayKit (Dùng khi chạy kèm PS Remote Play PiP)
-    func toggleReplayKitDirectCapture() {
-        let recorder = RPScreenRecorder.shared()
-        if isReplayKitCapturing {
-            recorder.stopCapture { [weak self] _ in
-                DispatchQueue.main.async {
-                    self?.isReplayKitCapturing = false
-                    self?.isReceivingRealPS5Video = false
-                    self?.statusLog = "Đã dừng thu hình trực tiếp ReplayKit."
-                }
-            }
-            return
-        }
-
-        guard recorder.isAvailable else {
-            statusLog = "⚠️ Thiết bị hiện chưa sẵn sàng phát ReplayKit."
-            return
-        }
-
-        recorder.isMicrophoneEnabled = false
-        recorder.startCapture(handler: { [weak self] sampleBuffer, sampleType, _ in
-            guard let self = self, sampleType == .video else { return }
-            self.videoDecoder.decodeReplayKitSampleBuffer(sampleBuffer)
-        }, completionHandler: { [weak self] error in
-            DispatchQueue.main.async {
-                guard let self = self else { return }
-                if let error = error {
-                    self.isReplayKitCapturing = false
-                    self.statusLog = "⚠️ Không thể bật ReplayKit: \(error.localizedDescription)"
-                } else {
-                    self.isReplayKitCapturing = true
-                    self.isConnectedToPS5 = true
-                    self.connectionState = .connected(hostName: "Live Stream (iPhone)")
-                    self.statusLog = "✅ Đang thu hình trực tiếp & quét phụ đề thời gian thực!"
-                }
-            }
-        })
-    }
 
     func extractAccountIDFromSonyWebCookies(completion: ((Bool) -> Void)? = nil) {
         DispatchQueue.main.async {
@@ -337,7 +300,7 @@ class VideoSourceManager: NSObject, ObservableObject {
             fallbackUsername: self.psnUsername
         )
         guard norm.isValidRealID else {
-            self.statusLog = "⚠️ Mã Account ID chưa phải mã 8-byte thật từ Sony. Hãy bấm 'Đăng nhập Sony' để lấy mã chính xác."
+            self.statusLog = "?? M  Account ID chua ph?i m  8-byte th?t t? Sony. H y b?m ' ang nh?p Sony' d? l?y m  ch nh x c."
             return
         }
 
@@ -349,9 +312,8 @@ class VideoSourceManager: NSObject, ObservableObject {
         UserDefaults.standard.set(self.psnAccountIDBase64, forKey: "psn_aid_v102")
         UserDefaults.standard.set(self.psnNumericAccountID, forKey: "psn_num_id_v102")
         UserDefaults.standard.set(true, forKey: "psn_remembered_v102")
-        UserDefaults.standard.synchronize()
 
-        self.statusLog = "✅ Đã lưu TK '\(self.psnUsername)' • Số ID Sony: \(self.psnNumericAccountID) • Mã 8-byte: \(self.psnAccountIDBase64)"
+        self.statusLog = "?    luu TK '\(self.psnUsername)'   S? ID Sony: \(self.psnNumericAccountID)   M  8-byte: \(self.psnAccountIDBase64)"
     }
 
     func clearRememberedAccount() {
@@ -373,23 +335,23 @@ class VideoSourceManager: NSObject, ObservableObject {
                 WKWebsiteDataStore.default().httpCookieStore.delete(cookie, completionHandler: nil)
             }
         }
-        statusLog = "Đã xoá tài khoản & Cookie cũ. Hãy bấm 'Đăng nhập Sony' để lấy đúng Account ID của tài khoản đang mở trên PS5."
+        statusLog = "   xo  t i kho?n & Cookie cu. H y b?m ' ang nh?p Sony' d? l?y d ng Account ID c?a t i kho?n dang m? tr n PS5."
     }
 
     func lookupAccountIDByPSNUsername() {
         let targetUser = psnUsername.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines)
         guard !targetUser.isEmpty else {
-            statusLog = "⚠️ Vui lòng nhập Online ID của tài khoản PSN (VD: Maivy1125) trước."
+            statusLog = "?? Vui l ng nh?p Online ID c?a t i kho?n PSN (VD: Maivy1125) tru?c."
             return
         }
 
-        let directCheck = ChiakiEmbeddedCore.shared.normalizeAccountIDTo8Bytes(input: targetUser, fallbackUsername: "Maivy1125")
+        let directCheck = ChiakiEmbeddedCore.shared.normalizeAccountIDTo8Bytes(input: targetUser, fallbackUsername: targetUser)
         if directCheck.isValidRealID {
-            saveRememberedAccount(username: "Maivy1125", accountIDBase64: directCheck.base64, numericID: directCheck.numericString)
+            saveRememberedAccount(username: targetUser, accountIDBase64: directCheck.base64, numericID: directCheck.numericString)
             return
         }
 
-        statusLog = "Đang tra cứu mã Account ID 8-byte thật của Online ID '\(targetUser)'..."
+        statusLog = " ang tra c?u m  Account ID 8-byte th?t c?a Online ID '\(targetUser)'..."
 
         guard let encodedUser = targetUser.addingPercentEncoding(withAllowedCharacters: CharacterSet.urlQueryAllowed),
               let url = URL(string: "https://psn.flipscreen.games/search.php?username=\(encodedUser)") else {
@@ -413,7 +375,7 @@ class VideoSourceManager: NSObject, ObservableObject {
                 guard let self = self else { return }
                 if !ok {
                     DispatchQueue.main.async {
-                        self.statusLog = "⚠️ Không tìm thấy Online ID '\(targetUser)' công khai. Hãy bấm nút 'Đăng nhập Sony' màu xanh bên dưới để lấy chính xác Account ID 8-byte!"
+                        self.statusLog = "?? Kh ng t m th?y Online ID '\(targetUser)' c ng khai. H y b?m n t ' ang nh?p Sony' m u xanh b n du?i d? l?y ch nh x c Account ID 8-byte!"
                     }
                 }
             }
@@ -496,7 +458,7 @@ class VideoSourceManager: NSObject, ObservableObject {
     func scanForPS5OnLAN() {
         let cleanIP = ps5HostIP.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines)
         connectionState = .scanningLAN
-        statusLog = "Chiaki DDP: Đang dò máy PS5 tại \(cleanIP):9302..."
+        statusLog = "Chiaki DDP:  ang d  m y PS5 t?i \(cleanIP):9302..."
 
         let host = NWEndpoint.Host(cleanIP.isEmpty ? "255.255.255.255" : cleanIP)
         guard let port = NWEndpoint.Port(rawValue: ROIDefaultConfig.ddpPort) else { return }
@@ -523,9 +485,9 @@ class VideoSourceManager: NSObject, ObservableObject {
                         UserDefaults.standard.set(hostId, forKey: "ps5_hostid_v102")
 
                         if text.contains("200 Ok") {
-                            self.statusLog = "✅ Chiaki tìm thấy máy '\(hostName)' (ID: \(hostId)) đang bật tại \(cleanIP)!"
+                            self.statusLog = "? Chiaki t m th?y m y '\(hostName)' (ID: \(hostId)) dang b?t t?i \(cleanIP)!"
                         } else if text.contains("620 Server Standby") {
-                            self.statusLog = "Máy PS5 '\(hostName)' đang ở Chế độ nghỉ. Đang gửi lệnh WAKEUP..."
+                            self.statusLog = "M y PS5 '\(hostName)' dang ? Ch? d? ngh?.  ang g?i l?nh WAKEUP..."
                             self.sendChiakiWakeupPacket(ip: cleanIP)
                         }
                         if !self.isConnectedToPS5 {
@@ -582,13 +544,13 @@ class VideoSourceManager: NSObject, ObservableObject {
 
         var parsed = ChiakiEmbeddedCore.shared.normalizeAccountIDTo8Bytes(input: accountIDBase64, fallbackUsername: username)
         if !parsed.isValidRealID {
-            parsed = ChiakiEmbeddedCore.shared.normalizeAccountIDTo8Bytes(input: username, fallbackUsername: "Maivy1125")
+            parsed = ChiakiEmbeddedCore.shared.normalizeAccountIDTo8Bytes(input: username, fallbackUsername: targetUser)
         }
 
         guard parsed.isValidRealID else {
             self.isConnectedToPS5 = false
-            self.connectionState = .error(message: "Chưa có Account ID 8-byte thật")
-            self.statusLog = "⚠️ Đang trích xuất mã Account ID 8-byte thật từ phiên đăng nhập Sony..."
+            self.connectionState = .error(message: "Chua c  Account ID 8-byte th?t")
+            self.statusLog = "??  ang tr ch xu?t m  Account ID 8-byte th?t t? phi n dang nh?p Sony..."
             self.extractAccountIDFromSonyWebCookies { [weak self] ok in
                 guard let self = self else { return }
                 if ok && cleanPIN.count == 8 {
@@ -602,21 +564,21 @@ class VideoSourceManager: NSObject, ObservableObject {
 
         if cleanPIN.count == 8 {
             connectionState = .pairingPIN
-            statusLog = "Chiaki-NG Core: Đang gửi gói ghép đôi 587-byte chuẩn PS5 (PIN: \(cleanPIN), ID: \(parsed.base64)) tới \(cleanIP):9295..."
+            statusLog = "Chiaki-NG Core:  ang g?i g i gh p d i 587-byte chu?n PS5 (PIN: \(cleanPIN), ID: \(parsed.base64)) t?i \(cleanIP):9295..."
             performRawSocketChiakiRegistration(ip: cleanIP, pin: cleanPIN, accountIDBase64: parsed.base64)
         } else if !savedRegistKey.isEmpty && !savedRPKey.isEmpty {
             connectionState = .connectingStream
-            statusLog = "Chiaki-NG Core: Đang mở phiên Remote Play đã lưu với PS5 (\(cleanIP))..."
+            statusLog = "Chiaki-NG Core:  ang m? phi n Remote Play d  luu v?i PS5 (\(cleanIP))..."
             startRealChiakiSessionInitAndCtrl(ip: cleanIP, registKey: savedRegistKey, rpKey: savedRPKey)
         } else {
             self.isConnectedToPS5 = false
-            self.connectionState = .error(message: "Chưa nhập mã PIN 8 số")
-            self.statusLog = "⚠️ Vui lòng nhập 8 chữ số Mã PIN đang hiển thị trên màn hình PS5."
+            self.connectionState = .error(message: "Chua nh?p m  PIN 8 s?")
+            self.statusLog = "?? Vui l ng nh?p 8 ch? s? M  PIN dang hi?n th? tr n m n h nh PS5."
         }
     }
 
-    // ĐÃ SỬA: Chỉ gửi duy nhất 1 luồng UDP SRC3 chuẩn trên cổng 9295 (fallback sang cổng động nếu bận)
-    // để không làm PS5 huỷ phiên chờ mã PIN
+    //    S?A: Ch? g?i duy nh?t 1 lu?ng UDP SRC3 chu?n tr n c?ng 9295 (fallback sang c?ng d?ng n?u b?n)
+    // d? kh ng l m PS5 hu? phi n ch? m  PIN
     private func performRawSocketChiakiRegistration(ip: String, pin: String, accountIDBase64: String) {
         rawRegistTCPConn?.cancel()
 
@@ -648,7 +610,7 @@ class VideoSourceManager: NSObject, ObservableObject {
                     launchTCPRegist()
                 }
             case .failed:
-                // Nếu cổng UDP 9295 đang bận trên iOS, gửi SRC3 qua socket UDP tiêu chuẩn
+                // N?u c?ng UDP 9295 dang b?n tr n iOS, g?i SRC3 qua socket UDP ti u chu?n
                 let fallbackUDP = NWConnection(host: host, port: port, using: .udp)
                 fallbackUDP.stateUpdateHandler = { fbState in
                     if case .ready = fbState {
@@ -673,7 +635,7 @@ class VideoSourceManager: NSObject, ObservableObject {
         }
     }
 
-    // ĐÃ SỬA: Gom đủ toàn bộ các mảnh gói tin TCP phản hồi từ PS5 trước khi giải mã
+    //    S?A: Gom d? to n b? c c m?nh g i tin TCP ph?n h?i t? PS5 tru?c khi gi?i m 
     private func receiveFullHTTPResponse(
         from conn: NWConnection,
         accumulated: Data = Data(),
@@ -745,8 +707,8 @@ class VideoSourceManager: NSObject, ObservableObject {
                         DispatchQueue.main.async {
                             guard !data.isEmpty else {
                                 self.isConnectedToPS5 = false
-                                self.connectionState = .error(message: "PS5 đóng kết nối cổng 9295")
-                                self.statusLog = "❌ Máy PS5 (\(ip)) không phản hồi gói ghép đôi. Hãy kiểm tra PS5 đang mở màn hình đếm ngược mã PIN 8 chữ số."
+                                self.connectionState = .error(message: "PS5 d ng k?t n?i c?ng 9295")
+                                self.statusLog = "? M y PS5 (\(ip)) kh ng ph?n h?i g i gh p d i. H y ki?m tra PS5 dang m? m n h nh d?m ngu?c m  PIN 8 ch? s?."
                                 return
                             }
 
@@ -773,7 +735,7 @@ class VideoSourceManager: NSObject, ObservableObject {
                                     ?? ""
 
                                 guard !regKey.isEmpty && !rpKey.isEmpty else {
-                                    self.statusLog = "⚠️ PS5 trả về 200 OK nhưng chưa giải mã được RP-Key (Body: \(bodyData.count)B). Đang thử lại..."
+                                    self.statusLog = "?? PS5 tr? v? 200 OK nhung chua gi?i m  du?c RP-Key (Body: \(bodyData.count)B).  ang th? l?i..."
                                     return
                                 }
 
@@ -781,16 +743,15 @@ class VideoSourceManager: NSObject, ObservableObject {
                                 self.savedRPKey = rpKey
                                 UserDefaults.standard.set(regKey, forKey: "chiaki_real_regist_key_v102")
                                 UserDefaults.standard.set(rpKey, forKey: "chiaki_real_rp_key_v102")
-                                UserDefaults.standard.synchronize()
-
+                        
                                 self.psnPinCode = ""
-                                self.statusLog = "✅ Ghép đôi PIN thành công (HTTP 200 OK - RegistKey: \(regKey))! Đang mở phiên điều khiển PS5..."
+                                self.statusLog = "? Gh p d i PIN th nh c ng (HTTP 200 OK - RegistKey: \(regKey))!  ang m? phi n di?u khi?n PS5..."
                                 self.startRealChiakiSessionInitAndCtrl(ip: ip, registKey: regKey, rpKey: rpKey)
                             } else {
                                 let reasonCode = self.extractHeader(from: headerStr, key: "RP-Application-Reason") ?? "HTTP 403"
                                 self.isConnectedToPS5 = false
-                                self.connectionState = .error(message: "PS5 từ chối (\(reasonCode))")
-                                self.statusLog = "❌ Máy PS5 (\(ip)) từ chối ghép đôi (Mã: \(reasonCode)). Hãy thoát màn hình mã PIN trên PS5 rồi vào lại lấy mã PIN 8 số mới."
+                                self.connectionState = .error(message: "PS5 t? ch?i (\(reasonCode))")
+                                self.statusLog = "? M y PS5 (\(ip)) t? ch?i gh p d i (M : \(reasonCode)). H y tho t m n h nh m  PIN tr n PS5 r?i v o l?i l?y m  PIN 8 s? m?i."
                             }
                         }
                     }
@@ -801,7 +762,7 @@ class VideoSourceManager: NSObject, ObservableObject {
                 DispatchQueue.main.async {
                     self.isConnectedToPS5 = false
                     self.connectionState = .error(message: err.localizedDescription)
-                    self.statusLog = "❌ Không kết nối được cổng 9295 của PS5 (\(ip)): \(err.localizedDescription)"
+                    self.statusLog = "? Kh ng k?t n?i du?c c?ng 9295 c?a PS5 (\(ip)): \(err.localizedDescription)"
                 }
             default:
                 break
@@ -888,13 +849,13 @@ class VideoSourceManager: NSObject, ObservableObject {
                                 self.isUsingTestSimulator = false
                                 let hostTitle = self.discoveredPS5Name.isEmpty ? "PS5 Console" : self.discoveredPS5Name
                                 self.connectionState = .connected(hostName: "\(hostTitle) (\(ip))")
-                                self.statusLog = "✅ Đã kết nối Remote Play với \(hostTitle) (\(ip))! Đang bắt tay Takion v12 nhận hình ảnh cổng UDP 9296..."
+                                self.statusLog = "?    k?t n?i Remote Play v?i \(hostTitle) (\(ip))!  ang b?t tay Takion v12 nh?n h nh ?nh c?ng UDP 9296..."
                                 self.openTakionVideoUDPStream(ip: ip)
                             } else {
                                 let reason = self.extractHeader(from: resp, key: "RP-Application-Reason") ?? "HTTP Error"
                                 self.isConnectedToPS5 = false
-                                self.connectionState = .error(message: "Phiên điều khiển từ chối (\(reason))")
-                                self.statusLog = "⚠️ PS5 từ chối mở phiên điều khiển (Mã: \(reason)). Hãy nhập mã PIN 8 chữ số mới trên TV để liên kết lại."
+                                self.connectionState = .error(message: "Phi n di?u khi?n t? ch?i (\(reason))")
+                                self.statusLog = "?? PS5 t? ch?i m? phi n di?u khi?n (M : \(reason)). H y nh?p m  PIN 8 ch? s? m?i tr n TV d? li n k?t l?i."
                             }
                         }
                     }
@@ -903,41 +864,53 @@ class VideoSourceManager: NSObject, ObservableObject {
         }
         conn.start(queue: .global(qos: .userInitiated))
     }
-
     private func openTakionVideoUDPStream(ip: String) {
         takionStreamConn?.cancel()
+        takionHeartbeatTimer?.invalidate()
         let host = NWEndpoint.Host(ip)
         guard let port = NWEndpoint.Port(rawValue: ROIDefaultConfig.takionStreamPort) else { return }
 
         let conn = NWConnection(host: host, port: port, using: .udp)
         takionStreamConn = conn
         let localInitTag = UInt32.random(in: 0x10000000...0xFFFFFFFE)
+        self.currentTakionRemoteTag = localInitTag
 
         conn.stateUpdateHandler = { [weak self] state in
             guard let self = self else { return }
             if case .ready = state {
                 let initPacket = ChiakiEmbeddedCore.shared.buildTakionV12InitPacket(initTag: localInitTag)
                 conn.send(content: initPacket, completion: .contentProcessed({ _ in }))
-                self.receiveTakionVideoPackets(remoteTag: localInitTag)
+                self.startTakionHeartbeat(conn: conn)
+                self.receiveTakionVideoPackets()
             }
         }
         conn.start(queue: .global(qos: .userInteractive))
     }
 
-    private func receiveTakionVideoPackets(remoteTag: UInt32) {
+    private func startTakionHeartbeat(conn: NWConnection) {
+        takionHeartbeatTimer?.invalidate()
+        DispatchQueue.main.async { [weak self] in
+            self?.takionHeartbeatTimer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
+                guard let self = self, self.isConnectedToPS5 else { return }
+                let heartbeat = Data([0x00, 0x00, 0x00, 0x00])
+                conn.send(content: heartbeat, completion: .contentProcessed({ _ in }))
+            }
+        }
+    }
+
+    private func receiveTakionVideoPackets() {
         takionStreamConn?.receiveMessage { [weak self] data, _, _, error in
             guard let self = self else { return }
-            var currentRemoteTag = remoteTag
 
             if let data = data, !data.isEmpty {
                 let firstByte = data[0]
 
                 if firstByte == 0x01,
                    let parsed = ChiakiEmbeddedCore.shared.parseTakionInitAckAndBuildCookieEcho(packet: data) {
-                    currentRemoteTag = parsed.remoteTag
+                    self.currentTakionRemoteTag = parsed.remoteTag
                     self.takionStreamConn?.send(content: parsed.cookieEchoPacket, completion: .contentProcessed({ _ in }))
                 } else if firstByte == 0x03 {
-                    let bigPacket = ChiakiEmbeddedCore.shared.buildTakionV12BigStreamRequestPacket(remoteTag: currentRemoteTag, tsn: 1)
+                    let bigPacket = ChiakiEmbeddedCore.shared.buildTakionV12BigStreamRequestPacket(remoteTag: self.currentTakionRemoteTag, tsn: 1)
                     self.takionStreamConn?.send(content: bigPacket, completion: .contentProcessed({ _ in }))
                     DispatchQueue.main.async {
                         self.statusLog = "✅ Đã hoàn tất bắt tay Takion v12! Đang giải mã luồng hình ảnh PS5 thời gian thực..."
@@ -951,24 +924,21 @@ class VideoSourceManager: NSObject, ObservableObject {
             }
 
             if error == nil && self.isConnectedToPS5 {
-                self.receiveTakionVideoPackets(remoteTag: currentRemoteTag)
+                self.receiveTakionVideoPackets()
             }
         }
     }
-
     func disconnectPS5() {
         rawRegistTCPConn?.cancel()
         ctrlSessionTCPConn?.cancel()
         takionStreamConn?.cancel()
         udpDiscoveryConn?.cancel()
-        if isReplayKitCapturing {
-            RPScreenRecorder.shared().stopCapture { _ in }
-            isReplayKitCapturing = false
-        }
+        takionHeartbeatTimer?.invalidate()
+        takionHeartbeatTimer = nil
         isConnectedToPS5 = false
         isReceivingRealPS5Video = false
         connectionState = .disconnected
-        statusLog = "Đã ngắt kết nối PS5."
+        statusLog = "   ng?t k?t n?i PS5."
     }
 
     func startPS5RemoteStreamLoop() {
