@@ -116,7 +116,7 @@ struct TVTextItem: Codable {
 struct TVPayload: Codable {
     let status: String
     let boxes: [TranslatedBox]
-    let texts: [TVTextItem]
+    var texts: [TVTextItem] = []
 }
 
 struct RawOCRResult {

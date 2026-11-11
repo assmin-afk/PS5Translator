@@ -1,6 +1,6 @@
 // ============================================================================
 // FILE 2A: 2A_ChiakiCoreAndDecoder.swift (TÁCH TỪ FILE 2 - PHẦN 1/2)
-// PHIÊN BẢN: PS5Translator 1.09 (THUẦN SWIFT CHIAKI CORE - KHÔNG PHỤ THUỘC C-BRIDGE)
+// PHIÊN BẢN: PS5Translator 1.08 (CHUẨN HOÁ C-BRIDGE CHIAKI-NG & HEX REGISTKEY)
 // ============================================================================
 
 import Foundation
@@ -237,7 +237,36 @@ final class ChiakiEmbeddedCore {
     func buildChiakiPS5RegistPayload480(pinString: String, accountIDBase64: String) -> (payload: Data, aesKey: [UInt8], iv: [UInt8]) {
         let trimmedAccountB64 = accountIDBase64.trimmingCharacters(in: .whitespacesAndNewlines)
 
-// Nhánh mã hoá chuẩn Swift thuần cho PS5
+        // 1. Gọi trực tiếp hàm C chiaki_bridge_build_ps5_regist_payload (tích hợp bảng aerolith & dugong PS5)
+        var outPayload = [UInt8](repeating: 0, count: 1024)
+        var outLen: Int = 0
+        var bright = [UInt8](repeating: 0, count: 16)
+        var echidna = [UInt8](repeating: 0, count: 16)
+        var hmacKey = [UInt8](repeating: 0, count: 16)
+
+        let cResult = pinString.withCString { pinCStr in
+            trimmedAccountB64.withCString { aidCStr in
+                ROIDefaultConfig.rpClientType.withCString { clientCStr in
+                    chiaki_bridge_build_ps5_regist_payload(
+                        pinCStr,
+                        aidCStr,
+                        clientCStr,
+                        &outPayload,
+                        &outLen,
+                        &bright,
+                        &echidna,
+                        &hmacKey
+                    )
+                }
+            }
+        }
+
+        if cResult == 0 && outLen > 0 {
+            self.lastRegistHmacKey = hmacKey
+            return (Data(outPayload.prefix(outLen)), bright, echidna)
+        }
+
+        // 2. Nhánh dự phòng Swift thuần nếu C-Bridge trả về mã lỗi
         let pinNumber = UInt32(pinString) ?? 0
         let pinBytes: [UInt8] = [
             UInt8((pinNumber >> 24) & 0xFF),
@@ -317,7 +346,30 @@ final class ChiakiEmbeddedCore {
     func decryptRegistResponse(cipherData: Data, aesKey: [UInt8], iv: [UInt8]) -> String? {
         guard !cipherData.isEmpty else { return nil }
 
-// Giải mã phản hồi từ PS5 bằng thuật toán quét đa offset
+        // 1. Giải mã trực tiếp bằng hàm C chiaki_bridge_decrypt_regist_response (quét đa offset 0x20, 0x00, 0x10)
+        if cipherData.count >= 16 && aesKey.count == 16 && iv.count == 16 {
+            var plainBuf = [UInt8](repeating: 0, count: 2048)
+            let cipherBytes = [UInt8](cipherData)
+            let hmacArg = self.lastRegistHmacKey.count == 16 ? self.lastRegistHmacKey : [UInt8](repeating: 0, count: 16)
+            let decLen = chiaki_bridge_decrypt_regist_response(
+                cipherBytes,
+                cipherBytes.count,
+                aesKey,
+                iv,
+                hmacArg,
+                &plainBuf,
+                plainBuf.count
+            )
+            if decLen > 0 {
+                let data = Data(plainBuf.prefix(Int(decLen)))
+                if let text = String(data: data, encoding: .utf8) ?? String(data: data, encoding: .isoLatin1),
+                   (text.contains("PS5-RegistKey") || text.contains("RP-RegistKey") || text.contains("RP-Key")) {
+                    return text.trimmingCharacters(in: CharacterSet(charactersIn: "\0"))
+                }
+            }
+        }
+
+        // 2. Nhánh dự phòng quét đa offset
         let candidateOffsets = [0x20, 0x00, 0x10, 0x30]
 
         for offset in candidateOffsets where cipherData.count > offset + 16 {
@@ -463,7 +515,16 @@ final class ChiakiEmbeddedCore {
 
         let nonce = [UInt8](nonceData)
 
-// Mã hoá RP-Auth & RP-Did
+        // 1. Mã hoá RP-Auth & RP-Did trực tiếp bằng chiaki_rpcrypt_init_auth trong C-Bridge
+        var cEncAuth = [UInt8](repeating: 0, count: 16)
+        var cEncDid = [UInt8](repeating: 0, count: 32)
+        let rawAuthBytes = [UInt8](rawAuthData)
+        if chiaki_bridge_encrypt_session_data(nonce, rpKeyBytes, 0, rawAuthBytes, 16, &cEncAuth) == 0 &&
+           chiaki_bridge_encrypt_session_data(nonce, rpKeyBytes, 1, didBytes, 32, &cEncDid) == 0 {
+            return (Data(cEncAuth).base64EncodedString(), Data(cEncDid).base64EncodedString())
+        }
+
+        // 2. Nhánh dự phòng
         var sessionKey = [UInt8](repeating: 0, count: 16)
         var sessionIV = [UInt8](repeating: 0, count: 16)
 
@@ -589,7 +650,7 @@ final class ChiakiEmbeddedCore {
 }
 
 // ============================================================================
-// 2. BỘ GIẢI MÃ VIDEO PHẦN CỨNG CHIAKI TRỰC TIẾP TRÊN IPHONE
+// 2. BỘ GIẢI MÃ VIDEO PHẦN CỨNG CHIAKI TAKION UDP TRỰC TIẾP TRÊN IPHONE
 // ============================================================================
 final class ChiakiHardwareVideoDecoder {
     private var formatDesc: CMVideoFormatDescription?
@@ -601,8 +662,6 @@ final class ChiakiHardwareVideoDecoder {
     private var reassemblyBuffer = Data()
     private let ciContext = CIContext(options: nil)
     var onFrameDecoded: ((CGImage) -> Void)?
-
-
 
     func feedTakionUDPPacket(_ data: Data) {
         guard data.count > 16 else { return }
@@ -624,25 +683,28 @@ final class ChiakiHardwareVideoDecoder {
 
     private func scanAndDecodeNALUnits(in buffer: Data) {
         let bytes = [UInt8](buffer)
-        guard bytes.count > 6 else { return }
-        var nalStarts: [(offset: Int, headerLen: Int)] = []
+        guard bytes.count > 4 else { return }
+        var nalStarts: [(start: Int, prefixLen: Int)] = []
         var i = 0
         while i < bytes.count - 3 {
-            if i + 3 < bytes.count && bytes[i] == 0x00 && bytes[i+1] == 0x00 && bytes[i+2] == 0x00 && bytes[i+3] == 0x01 {
-                nalStarts.append((offset: i, headerLen: 4))
-                i += 4
-            } else if bytes[i] == 0x00 && bytes[i+1] == 0x00 && bytes[i+2] == 0x01 {
-                nalStarts.append((offset: i, headerLen: 3))
-                i += 3
-            } else {
-                i += 1
+            if bytes[i] == 0x00 && bytes[i+1] == 0x00 {
+                if bytes[i+2] == 0x01 {
+                    nalStarts.append((start: i, prefixLen: 3))
+                    i += 3
+                    continue
+                } else if i < bytes.count - 3 && bytes[i+2] == 0x00 && bytes[i+3] == 0x01 {
+                    nalStarts.append((start: i, prefixLen: 4))
+                    i += 4
+                    continue
+                }
             }
+            i += 1
         }
 
         guard !nalStarts.isEmpty else { return }
         for idx in 0..<nalStarts.count {
-            let start = nalStarts[idx].offset + nalStarts[idx].headerLen
-            let end = (idx + 1 < nalStarts.count) ? nalStarts[idx + 1].offset : bytes.count
+            let start = nalStarts[idx].start + nalStarts[idx].prefixLen
+            let end = (idx + 1 < nalStarts.count) ? nalStarts[idx + 1].start : bytes.count
             guard start < end else { continue }
             let nalUnit = Data(bytes[start..<end])
             processNALUnit(nalUnit)

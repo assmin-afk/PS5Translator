@@ -1,6 +1,6 @@
 // ============================================================================
 // FILE 6B: 6B_TranslatorViewsAndModals.swift (TÁCH TỪ FILE 6 - PHẦN 2/2)
-// PHIÊN BẢN: PS5Translator 1.09 (CHIAKI REMOTE PLAY HOÀN CHỈNH)
+// PHIÊN BẢN: PS5Translator 1.07 (ĐỒNG BỘ COOKIE DEFAULT & NÚT REPLAYKIT LIVE)
 // ============================================================================
 
 import SwiftUI
@@ -69,7 +69,7 @@ struct MainTranslatorView: View {
                             .frame(width: 7, height: 7)
                         Text(coord.videoMgr.isConnectedToPS5
                              ? "Chiaki Live: \(coord.videoMgr.ps5HostIP)"
-                             : (coord.videoMgr.isAccountRemembered && !coord.videoMgr.psnUsername.isEmpty ? "Đã nhớ TK: \(coord.videoMgr.psnUsername)" : "Chưa nối PS5"))
+                             : (coord.videoMgr.isAccountRemembered ? "Đã nhớ TK: \(coord.videoMgr.psnUsername)" : "Chưa nối PS5"))
                             .font(.system(size: 11, weight: .medium))
                             .foregroundColor(.white.opacity(0.85))
                     }
@@ -371,7 +371,7 @@ struct MainTranslatorView: View {
                         VStack(alignment: .leading, spacing: 2) {
                             Text("Liên kết máy PS5")
                                 .font(.system(size: 13, weight: .bold))
-                            Text(coord.videoMgr.isAccountRemembered && !coord.videoMgr.psnUsername.isEmpty ? "Đã nhớ: \(coord.videoMgr.psnUsername)" : "Lõi Chiaki & Mã PIN")
+                            Text(coord.videoMgr.isAccountRemembered ? "Đã nhớ: \(coord.videoMgr.psnUsername)" : "Lõi Chiaki & Mã PIN")
                                 .font(.system(size: 10))
                                 .foregroundColor(.white.opacity(0.8))
                         }
@@ -865,8 +865,6 @@ struct PS5ConnectionWizardView: View {
                         .foregroundColor(.white)
                         .cornerRadius(12)
                     }
-
-
 
                     if coord.videoMgr.isConnectedToPS5 {
                         Button(action: {

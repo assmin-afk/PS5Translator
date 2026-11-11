@@ -163,7 +163,7 @@ class PredictiveTranslator: ObservableObject {
     
     private func insertTranslationRow(lineID: Int, rawEn: String, viText: String) {
         guard let db = db else { return }
-        let cleanEn = cleanString(rawEn)
+        let cleanEn = cleanString(rawEn).replacingOccurrences(of: "'", with: "''")
         let safeRaw = rawEn.replacingOccurrences(of: "'", with: "''")
         let safeVi = viText.replacingOccurrences(of: "'", with: "''")
         let sql = "INSERT INTO translations (line_id, text_raw, text_clean, text_vi) VALUES ('\(lineID)', '\(safeRaw)', '\(cleanEn)', '\(safeVi)');"
@@ -188,7 +188,7 @@ class PredictiveTranslator: ObservableObject {
             
             let rawEn = parts[0].trimmingCharacters(in: .whitespaces)
             let viText = parts[1].trimmingCharacters(in: .whitespaces)
-            let cleanEn = cleanString(rawEn)
+            let cleanEn = cleanString(rawEn).replacingOccurrences(of: "'", with: "''")
             
             if !cleanEn.isEmpty && !viText.isEmpty {
                 count += 1
@@ -250,7 +250,14 @@ class PredictiveTranslator: ObservableObject {
         let tokens = cleaned.split(separator: " ").map { String($0) }.filter { $0.count >= 2 }
         
         if let db = db, !tokens.isEmpty {
-            let ftsQuery = tokens.map { "\($0)*" }.joined(separator: " OR ")
+            let sanitizedTokens = tokens.map { token in
+                token.replacingOccurrences(of: "'", with: "")
+                     .replacingOccurrences(of: "\"", with: "")
+                     .replacingOccurrences(of: ";", with: "")
+                     .replacingOccurrences(of: "*", with: "")
+            }.filter { !$0.isEmpty }
+            guard !sanitizedTokens.isEmpty else { return (rawText, false) }
+            let ftsQuery = sanitizedTokens.map { "\($0)*" }.joined(separator: " OR ")
             let querySQL = "SELECT line_id, text_clean, text_vi FROM translations WHERE text_clean MATCH '\(ftsQuery)' LIMIT 20;"
             
             var statement: OpaquePointer?

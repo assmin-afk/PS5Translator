@@ -462,10 +462,10 @@ class TVWebSocketServer: ObservableObject {
                 self.connections.append(conn)
                 DispatchQueue.main.async { self.connectedCount = self.connections.count }
                 conn.stateUpdateHandler = { [weak self, weak conn] state in
-                    guard let self = self, let c = conn else { return }
+                    guard let self = self, let conn = conn else { return }
                     switch state {
-                    case .cancelled, .failed:
-                        self.connections.removeAll { $0 === c }
+                    case .failed, .cancelled:
+                        self.connections.removeAll(where: { $0 === conn })
                         DispatchQueue.main.async { self.connectedCount = self.connections.count }
                     default:
                         break
@@ -478,16 +478,15 @@ class TVWebSocketServer: ObservableObject {
     }
 
     func broadcast(boxes: [TranslatedBox]) {
-        let texts = boxes.map { box in
-            TVTextItem(
-                text: box.text,
-                x: box.x * 100.0,
-                y: box.y * 100.0,
-                width: box.w * 100.0,
-                height: box.h * 100.0
-            )
+        let textItems = boxes.map { box -> TVTextItem in
+            let xPct = (box.x <= 1.0) ? box.x * 100.0 : box.x
+            let yPct = (box.y <= 1.0) ? box.y * 100.0 : box.y
+            let wPct = (box.w <= 1.0) ? box.w * 100.0 : box.w
+            let hPct = (box.h <= 1.0) ? box.h * 100.0 : box.h
+            return TVTextItem(text: box.text, x: xPct, y: yPct, width: wPct, height: hPct)
         }
-        let payload = TVPayload(status: boxes.isEmpty ? "clear" : "show", boxes: boxes, texts: texts)
+        var payload = TVPayload(status: boxes.isEmpty ? "clear" : "show", boxes: boxes)
+        payload.texts = textItems
         guard let data = try? JSONEncoder().encode(payload) else { return }
         let metadata = NWProtocolWebSocket.Metadata(opcode: .text)
         let context = NWConnection.ContentContext(identifier: "ws", metadata: [metadata])
