@@ -736,10 +736,10 @@ struct PS5ConnectionWizardView: View {
                     .background(Color.white.opacity(0.06))
                     .cornerRadius(14)
 
-                    // BƯỚC 2: TÀI KHOẢN PSN PHỤ & GHI NHỚ TỰ ĐỘNG
+                    // BƯỚC 2: TÀI KHOẢN PSN (CƠ CHẾ CONSOLE TRANSLATOR: KHUYÊN DÙNG TÀI KHOẢN PHỤ)
                     VStack(alignment: .leading, spacing: 10) {
                         HStack {
-                            Label("BƯỚC 2: Tài khoản PSN (Phải trùng với User mở mã PIN trên PS5)", systemImage: "2.circle.fill")
+                            Label("BƯỚC 2: Tài khoản PSN (Khuyên dùng Tài khoản phụ)", systemImage: "2.circle.fill")
                                 .font(.subheadline.bold())
                                 .foregroundColor(.cyan)
                             Spacer()
@@ -750,7 +750,20 @@ struct PS5ConnectionWizardView: View {
                             }
                         }
 
-                        Text("Lưu ý: Trên PS5 bạn đang mở màn hình lấy mã PIN ở User nào thì phải đăng nhập đúng tài khoản PSN đó ở đây:")
+                        // Banner hướng dẫn cơ chế Console Translator
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text("💡 Cơ chế dịch chuẩn giống app Console Translator:")
+                                .font(.caption.bold())
+                                .foregroundColor(.yellow)
+                            Text("• Tài khoản chính: Cầm tay cầm DualSense chơi game trực tiếp trên TV (0 độ trễ).\n• Tài khoản phụ: Tạo/chọn User phụ trên PS5, vào Cài đặt -> Hệ thống -> Chơi từ xa -> Liên kết thiết bị để lấy mã PIN 8 số. Nhập User phụ đó vào App iPhone này để nhận hình ảnh dịch mà KHÔNG bị ngắt tay cầm.")
+                                .font(.system(size: 11))
+                                .foregroundColor(.white.opacity(0.85))
+                        }
+                        .padding(8)
+                        .background(Color.yellow.opacity(0.12))
+                        .cornerRadius(8)
+
+                        Text("Lưu ý: Màn hình lấy mã PIN 8 số trên PS5 đang mở ở User nào thì bạn nhập đúng tài khoản PSN của User đó ở đây:")
                             .font(.caption)
                             .foregroundColor(.gray)
 

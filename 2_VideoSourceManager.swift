@@ -525,7 +525,7 @@ class VideoSourceManager: NSObject, ObservableObject {
         for line in lines {
             let parts = line.components(separatedBy: ":")
             if parts.count >= 2 && parts[0].lowercased().trimmingCharacters(in: CharacterSet.whitespaces) == key.lowercased() {
-                return parts.dropFirst().joined(separator: ":").trimmingCharacters(in: CharacterSet.whitespacesAndNewlines)
+                return parts.dropFirst().joined(separator: ":").trimmingCharacters(in: CharacterSet.whitespacesAndNewlines.union(CharacterSet(charactersIn: "\0\"' ")))
             }
         }
         return nil
@@ -737,15 +737,24 @@ class VideoSourceManager: NSObject, ObservableObject {
                                     return
                                 }
 
-                                self.savedRegistKey = regKey
-                                self.savedRPKey = rpKey
-                                UserDefaults.standard.set(regKey, forKey: "chiaki_real_regist_key_v102")
-                                UserDefaults.standard.set(rpKey, forKey: "chiaki_real_rp_key_v102")
+                                let cleanRegKey = regKey.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines.union(CharacterSet(charactersIn: "\0\"' ")))
+                                let cleanRPKey = rpKey.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines.union(CharacterSet(charactersIn: "\0\"' ")))
+
+                                self.savedRegistKey = cleanRegKey
+                                self.savedRPKey = cleanRPKey
+                                UserDefaults.standard.set(cleanRegKey, forKey: "chiaki_real_regist_key_v102")
+                                UserDefaults.standard.set(cleanRPKey, forKey: "chiaki_real_rp_key_v102")
                                 UserDefaults.standard.synchronize()
 
                                 self.psnPinCode = ""
-                                self.statusLog = "✅ Ghép đôi PIN thành công (HTTP 200 OK - RegistKey: \(regKey))! Đang mở phiên điều khiển PS5..."
-                                self.startRealChiakiSessionInitAndCtrl(ip: ip, registKey: regKey, rpKey: rpKey)
+                                self.statusLog = "✅ Ghép đôi PIN thành công (HTTP 200 OK)! Đang đợi máy PS5 giải phóng cổng kết nối sau 2 giây..."
+
+                                // Chờ 2.0s để PS5 daemon lưu khoá đăng ký và hoàn tất đóng socket rgst trước khi mở phiên init
+                                DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in
+                                    guard let self = self else { return }
+                                    self.statusLog = "Chiaki-NG: Đang mở phiên điều khiển PS5 (/sie/ps5/rp/sess/init)..."
+                                    self.startRealChiakiSessionInitAndCtrl(ip: ip, registKey: cleanRegKey, rpKey: cleanRPKey)
+                                }
                             } else {
                                 let reasonCode = self.extractHeader(from: headerStr, key: "RP-Application-Reason") ?? "HTTP 403"
                                 self.isConnectedToPS5 = false
@@ -779,14 +788,15 @@ class VideoSourceManager: NSObject, ObservableObject {
         initConn.stateUpdateHandler = { [weak self] state in
             guard let self = self else { return }
             if case .ready = state {
-                let rawKeyBytes = ChiakiEmbeddedCore.shared.parseRegistKeyTo16Bytes(registKey)
-                let hexRegistKey = rawKeyBytes.map { String(format: "%02x", $0) }.joined()
+                let cleanRegistKey = registKey.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines.union(CharacterSet(charactersIn: "\0\"' ")))
+                let hexOnly = cleanRegistKey.filter { $0.isHexDigit }
+                let keyToSend = (hexOnly.count == 32) ? hexOnly : cleanRegistKey
 
                 var initReq = "GET /sie/ps5/rp/sess/init HTTP/1.1\r\n"
                 initReq += "Host: \(ip):\(ROIDefaultConfig.registAndCtrlPort)\r\n"
                 initReq += "User-Agent: remoteplay Windows\r\n"
                 initReq += "Connection: close\r\n"
-                initReq += "RP-RegistKey: \(hexRegistKey)\r\n"
+                initReq += "RP-RegistKey: \(keyToSend)\r\n"
                 initReq += "RP-Version: 1.0\r\n\r\n"
 
                 initConn.send(content: initReq.data(using: .utf8), completion: .contentProcessed({ _ in
@@ -798,8 +808,13 @@ class VideoSourceManager: NSObject, ObservableObject {
                             let reason = self.extractHeader(from: initRespStr, key: "RP-Application-Reason") ?? "HTTP 403"
                             DispatchQueue.main.async {
                                 self.isConnectedToPS5 = false
-                                self.connectionState = .error(message: "PS5 từ chối khởi tạo phiên (\(reason))")
-                                self.statusLog = "❌ Khởi tạo phiên thất bại (Mã: \(reason)). Hãy nhập mã PIN 8 số mới trên màn hình PS5 để ghép đôi lại."
+                                if reason.contains("80108b26") {
+                                    self.connectionState = .error(message: "PS5 báo lỗi 80108b26 (Xung đột tài khoản)")
+                                    self.statusLog = "❌ PS5 từ chối phiên (Mã: 80108b26 - Xung đột tài khoản). Cơ chế chuẩn giống app Console Translator: Bạn chơi game trên TV bằng Tài khoản chính, còn mã PIN và app iPhone này liên kết bằng Tài khoản PSN phụ để không bị ngắt tay cầm."
+                                } else {
+                                    self.connectionState = .error(message: "PS5 từ chối khởi tạo phiên (\(reason))")
+                                    self.statusLog = "❌ Khởi tạo phiên thất bại (Mã: \(reason)). Hãy nhập mã PIN 8 số mới trên màn hình PS5 để ghép đôi lại."
+                                }
                             }
                             return
                         }
@@ -807,12 +822,12 @@ class VideoSourceManager: NSObject, ObservableObject {
                         let serverNonce = self.extractHeader(from: initRespStr, key: "RP-Nonce")
 
                         let authHeaders = ChiakiEmbeddedCore.shared.buildSessionAuthHeaders(
-                            registKey: registKey,
+                            registKey: keyToSend,
                             rpKeyBase64: rpKey,
                             serverNonceBase64: serverNonce
                         )
 
-                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
                             self.openPersistentCtrlChannel(
                                 ip: ip,
                                 rpAuth: authHeaders.rpAuth,

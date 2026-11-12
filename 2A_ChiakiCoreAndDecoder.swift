@@ -479,8 +479,9 @@ final class ChiakiEmbeddedCore {
 
     // ĐÃ SỬA: Hỗ trợ giải mã PS5-RegistKey dạng Hex 32 ký tự sang đúng 16 bytes nhị phân chuẩn
     func parseRegistKeyTo16Bytes(_ registKey: String) -> Data {
-        let clean = registKey.trimmingCharacters(in: .whitespacesAndNewlines)
-        if clean.count == 32, let hexBytes = Self.hexStringToBytes(clean), hexBytes.count == 16 {
+        let clean = registKey.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines.union(CharacterSet(charactersIn: "\0\"' ")))
+        let hexChars = clean.filter { $0.isHexDigit }
+        if hexChars.count == 32, let hexBytes = Self.hexStringToBytes(hexChars), hexBytes.count == 16 {
             return Data(hexBytes)
         }
         var bytes = [UInt8](repeating: 0, count: 16)
