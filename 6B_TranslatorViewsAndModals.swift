@@ -817,6 +817,9 @@ struct PS5ConnectionWizardView: View {
                     .background(Color.white.opacity(0.06))
                     .cornerRadius(14)
 
+                    // 1.10: TÀI KHOẢN ĐÃ LIÊN KẾT (GHI NHỚ) + TỰ KẾT NỐI LẠI + GIỮ KẾT NỐI KHI RA NGOÀI
+                    LinkedPS5ProfilesSection(videoMgr: coord.videoMgr)
+
                     // BƯỚC 3: MÃ PIN 8 CHỮ SỐ TRÊN MÀN HÌNH PS5
                     VStack(alignment: .leading, spacing: 10) {
                         Label("BƯỚC 3: Mã PIN 8 số liên kết thiết bị (Chỉ cần nhập lần đầu)", systemImage: "3.circle.fill")
@@ -1270,6 +1273,82 @@ struct SonyOAuthWebView: UIViewRepresentable {
                 self.onExtractedAccount(onlineID, base64ID, numericID)
             }
         }
+    }
+}
+
+// 1.10: Danh sách tài khoản PS5 đã liên kết + tuỳ chọn tự kết nối lại / chạy nền
+struct LinkedPS5ProfilesSection: View {
+    @ObservedObject var videoMgr: VideoSourceManager
+    private let psBlue = Color(red: 0.0, green: 0.44, blue: 0.82)
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Label("Tài khoản đã liên kết (chạm để kết nối, không cần PIN)", systemImage: "person.2.fill")
+                .font(.subheadline.bold())
+                .foregroundColor(.cyan)
+
+            if videoMgr.linkedProfiles.isEmpty {
+                Text("Chưa có tài khoản nào. Ghép đôi bằng mã PIN 8 số ở BƯỚC 3 (mỗi tài khoản PSN ghép đôi 1 lần).")
+                    .font(.caption)
+                    .foregroundColor(.gray)
+            } else {
+                ForEach(videoMgr.linkedProfiles) { profile in
+                    HStack(spacing: 10) {
+                        Button(action: {
+                            videoMgr.connectWithProfile(profile)
+                        }) {
+                            HStack {
+                                Image(systemName: profile.accountBase64 == videoMgr.psnAccountIDBase64 ? "checkmark.circle.fill" : "person.circle")
+                                    .foregroundColor(profile.accountBase64 == videoMgr.psnAccountIDBase64 ? .green : .white)
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text(profile.username.isEmpty ? profile.accountBase64 : profile.username)
+                                        .font(.subheadline.bold())
+                                        .foregroundColor(.white)
+                                    Text("PS5: \(profile.host)")
+                                        .font(.caption2)
+                                        .foregroundColor(.gray)
+                                }
+                                Spacer()
+                                Text("Kết nối")
+                                    .font(.caption.bold())
+                                    .foregroundColor(.white)
+                                    .padding(.horizontal, 10)
+                                    .padding(.vertical, 6)
+                                    .background(psBlue)
+                                    .cornerRadius(8)
+                            }
+                        }
+                        Button(action: {
+                            videoMgr.removeProfile(profile)
+                        }) {
+                            Image(systemName: "trash")
+                                .foregroundColor(.red.opacity(0.8))
+                        }
+                    }
+                    .padding(10)
+                    .background(Color.black.opacity(0.35))
+                    .cornerRadius(10)
+                }
+            }
+
+            Toggle(isOn: $videoMgr.autoReconnectEnabled) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Tự kết nối lại").font(.subheadline.bold()).foregroundColor(.white)
+                    Text("Khi mở app, khi quay lại app, hoặc khi PS5 ngắt phiên (đổi tài khoản bằng nút PS)")
+                        .font(.caption2).foregroundColor(.gray)
+                }
+            }
+            Toggle(isOn: $videoMgr.keepAliveInBackground) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Giữ kết nối khi thoát app ra ngoài").font(.subheadline.bold()).foregroundColor(.white)
+                    Text("App tiếp tục chạy nền để không mất Remote Play (tốn pin hơn)")
+                        .font(.caption2).foregroundColor(.gray)
+                }
+            }
+        }
+        .padding()
+        .background(Color.white.opacity(0.06))
+        .cornerRadius(14)
     }
 }
 
