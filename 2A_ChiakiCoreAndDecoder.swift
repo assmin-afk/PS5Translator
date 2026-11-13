@@ -1,6 +1,6 @@
 // ============================================================================
 // FILE 2A: 2A_ChiakiCoreAndDecoder.swift (TÁCH TỪ FILE 2 - PHẦN 1/2)
-// PHIÊN BẢN: PS5Translator 1.08 (CHUẨN HOÁ C-BRIDGE CHIAKI-NG & HEX REGISTKEY)
+// PHIÊN BẢN: PS5Translator 1.09 (SỬA LỖI 80108bff: HEADER sess/init & sess/ctrl ĐÚNG CHIAKI-NG)
 // ============================================================================
 
 import Foundation
@@ -370,7 +370,7 @@ final class ChiakiEmbeddedCore {
         }
 
         // 2. Nhánh dự phòng quét đa offset
-        let candidateOffsets = [0x20, 0x00, 0x10, 0x30]
+        let candidateOffsets = [0x00, 0x20, 0x10, 0x30]
 
         for offset in candidateOffsets where cipherData.count > offset + 16 {
             let sub = cipherData.subdata(in: offset..<cipherData.count)
@@ -477,66 +477,91 @@ final class ChiakiEmbeddedCore {
         return rawStr.trimmingCharacters(in: CharacterSet(charactersIn: "\0"))
     }
 
-    // ĐÃ SỬA: Hỗ trợ giải mã PS5-RegistKey dạng Hex 32 ký tự sang đúng 16 bytes nhị phân chuẩn
+    // ĐÃ SỬA (1.09): Xử lý RegistKey GIỐNG HỆT chiaki-ng (regist.c + session.c)
+    // - regist.c: rp_regist_key[16] = parse_hex(giá trị "PS5-RegistKey"), phần còn lại = 0x00
+    // - session.c: header "RP-Registkey" = format_hex(rp_regist_key, cắt tại byte 0x00 đầu tiên) (chữ thường)
+    // - ctrl.c: RP-Auth = rpcrypt_encrypt(16 byte rp_regist_key, counter 0)
     func parseRegistKeyTo16Bytes(_ registKey: String) -> Data {
         let clean = registKey.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines.union(CharacterSet(charactersIn: "\0\"' ")))
-        let hexChars = clean.filter { $0.isHexDigit }
-        if hexChars.count == 32, let hexBytes = Self.hexStringToBytes(hexChars), hexBytes.count == 16 {
-            return Data(hexBytes)
-        }
         var bytes = [UInt8](repeating: 0, count: 16)
-        let utf8 = Array(clean.utf8)
-        for i in 0..<min(16, utf8.count) {
-            bytes[i] = utf8[i]
+        if !clean.isEmpty, clean.count % 2 == 0, clean.count <= 32,
+           clean.allSatisfy({ $0.isHexDigit }),
+           let hexBytes = Self.hexStringToBytes(clean) {
+            for i in 0..<min(16, hexBytes.count) { bytes[i] = hexBytes[i] }
+            return Data(bytes)
         }
+        // Dự phòng: khoá không phải hex (không nên xảy ra với PS5) -> dùng ASCII
+        let utf8 = Array(clean.utf8)
+        for i in 0..<min(16, utf8.count) { bytes[i] = utf8[i] }
         return Data(bytes)
     }
 
-    func buildSessionAuthHeaders(registKey: String, rpKeyBase64: String, serverNonceBase64: String?) -> (rpAuth: String, rpDid: String) {
-        let rawAuthData = parseRegistKeyTo16Bytes(registKey)
+    /// Giá trị header RP-Registkey đúng chuẩn chiaki-ng (hex chữ thường, cắt tại byte 0 đầu tiên)
+    func registKeyHeaderValue(_ registKey: String) -> String {
+        let bytes = [UInt8](parseRegistKeyTo16Bytes(registKey))
+        var len = bytes.count
+        if let firstZero = bytes.firstIndex(of: 0) { len = firstZero }
+        return bytes.prefix(len).map { String(format: "%02x", $0) }.joined()
+    }
 
-        var didBytes = [UInt8](repeating: 0, count: 32)
-        let prefix: [UInt8] = [0x00, 0x18, 0x00, 0x00, 0x00, 0x09, 0x00, 0x40, 0x00, 0x80]
-        for i in 0..<prefix.count { didBytes[i] = prefix[i] }
+    func isValidRegistKey(_ registKey: String) -> Bool {
+        let clean = registKey.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines.union(CharacterSet(charactersIn: "\0\"' ")))
+        return !clean.isEmpty && clean.count % 2 == 0 && clean.count <= 32 && clean.allSatisfy({ $0.isHexDigit })
+    }
 
+    func parseRPKeyBytes(_ rpKey: String) -> [UInt8]? {
+        let clean = rpKey.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines.union(CharacterSet(charactersIn: "\0\"' ")))
+        if clean.count == 32, let hexData = Self.hexStringToBytes(clean), hexData.count == 16 {
+            return hexData
+        }
+        if let decodedKey = Data(base64Encoded: clean), decodedKey.count == 16 {
+            return [UInt8](decodedKey)
+        }
+        return nil
+    }
+
+    struct ChiakiCtrlHeaders {
+        let rpAuth: String
+        let rpDid: String
+        let osType: String
+        let startBitrate: String
+        let streamingType: String
+    }
+
+    /// Tạo các header mã hoá cho /sie/ps5/rp/sess/ctrl giống ctrl.c của chiaki-ng.
+    /// Thứ tự counter: 0 = RP-Auth, 1 = RP-Did, 2 = RP-OSType, 3 = RP-StartBitrate, 4 = RP-StreamingType
+    func buildCtrlHeaders(registKey: String, rpKey: String, serverNonceBase64: String?) -> ChiakiCtrlHeaders? {
         guard let nonceStr = serverNonceBase64?.trimmingCharacters(in: .whitespacesAndNewlines),
-              let nonceData = Data(base64Encoded: nonceStr), nonceData.count == 16 else {
-            return (rawAuthData.base64EncodedString(), Data(didBytes).base64EncodedString())
+              let nonceData = Data(base64Encoded: nonceStr), nonceData.count == 16,
+              let rpKeyBytes = parseRPKeyBytes(rpKey) else {
+            return nil
         }
-
-        let cleanRPKey = rpKeyBase64.trimmingCharacters(in: .whitespacesAndNewlines)
-        let rpKeyBytes: [UInt8]
-        if cleanRPKey.count == 32, let hexData = Self.hexStringToBytes(cleanRPKey), hexData.count == 16 {
-            rpKeyBytes = hexData
-        } else if let decodedKey = Data(base64Encoded: cleanRPKey), decodedKey.count == 16 {
-            rpKeyBytes = [UInt8](decodedKey)
-        } else {
-            return (rawAuthData.base64EncodedString(), Data(didBytes).base64EncodedString())
-        }
-
         let nonce = [UInt8](nonceData)
 
-        // 1. Mã hoá RP-Auth & RP-Did trực tiếp bằng chiaki_rpcrypt_init_auth trong C-Bridge
-        var cEncAuth = [UInt8](repeating: 0, count: 16)
-        var cEncDid = [UInt8](repeating: 0, count: 32)
-        let rawAuthBytes = [UInt8](rawAuthData)
-        if chiaki_bridge_encrypt_session_data(nonce, rpKeyBytes, 0, rawAuthBytes, 16, &cEncAuth) == 0 &&
-           chiaki_bridge_encrypt_session_data(nonce, rpKeyBytes, 1, didBytes, 32, &cEncDid) == 0 {
-            return (Data(cEncAuth).base64EncodedString(), Data(cEncDid).base64EncodedString())
+        func enc(_ counter: UInt64, _ input: [UInt8]) -> String? {
+            var out = [UInt8](repeating: 0, count: input.count)
+            let r = chiaki_bridge_encrypt_session_data(nonce, rpKeyBytes, counter, input, input.count, &out)
+            return r == 0 ? Data(out).base64EncodedString() : nil
         }
 
-        // 2. Nhánh dự phòng
-        var sessionKey = [UInt8](repeating: 0, count: 16)
-        var sessionIV = [UInt8](repeating: 0, count: 16)
+        // RP-Did: 10 byte prefix + 16 byte ngẫu nhiên + 6 byte 0 (chiaki session.c)
+        var did = [UInt8](repeating: 0, count: 32)
+        let didPrefix: [UInt8] = [0x00, 0x18, 0x00, 0x00, 0x00, 0x07, 0x00, 0x40, 0x00, 0x80]
+        for i in 0..<didPrefix.count { did[i] = didPrefix[i] }
+        for i in didPrefix.count..<(32 - 6) { did[i] = UInt8.random(in: 0...255) }
 
-        for i in 0..<16 {
-            sessionIV[i] = nonce[(i + 8) % 16] ^ ps5Key0[i]
-            sessionKey[i] = nonce[i] ^ ps5Key1[i] ^ rpKeyBytes[i]
+        let osType = Array("Win10.0.0".utf8) + [0x00]
+        let bitrate: [UInt8] = [0, 0, 0, 0]
+        let streamingType: [UInt8] = [1, 0, 0, 0] // 1 = H.264 (little-endian uint32)
+
+        guard let a = enc(0, [UInt8](parseRegistKeyTo16Bytes(registKey))),
+              let d = enc(1, did),
+              let o = enc(2, osType),
+              let b = enc(3, bitrate),
+              let st = enc(4, streamingType) else {
+            return nil
         }
-
-        let encAuth = chiakiRPCryptXOR(data: rawAuthData, key: sessionKey, iv: sessionIV, counter: 0)
-        let encDid = chiakiRPCryptXOR(data: Data(didBytes), key: sessionKey, iv: sessionIV, counter: 1)
-        return (encAuth.base64EncodedString(), encDid.base64EncodedString())
+        return ChiakiCtrlHeaders(rpAuth: a, rpDid: d, osType: o, startBitrate: b, streamingType: st)
     }
 
     static func hexStringToBytes(_ hex: String) -> [UInt8]? {

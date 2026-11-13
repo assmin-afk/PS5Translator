@@ -1,6 +1,6 @@
 // ============================================================================
 // FILE 2B: 2_VideoSourceManager.swift (TÁCH TỪ FILE 2 - PHẦN 2/2)
-// PHIÊN BẢN: PS5Translator 1.08 (CHUẨN HOÁ UDP SRC3/RES3 & GOM ĐỦ GÓI TCP 9295)
+// PHIÊN BẢN: PS5Translator 1.09 (SỬA LỖI 80108bff: sess/init + sess/ctrl ĐÚNG CHIAKI-NG)
 // ============================================================================
 
 import Foundation
@@ -751,6 +751,14 @@ class VideoSourceManager: NSObject, ObservableObject {
                                 let cleanRegKey = regKey.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines.union(CharacterSet(charactersIn: "\0\"' ")))
                                 let cleanRPKey = rpKey.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines.union(CharacterSet(charactersIn: "\0\"' ")))
 
+                                guard ChiakiEmbeddedCore.shared.isValidRegistKey(cleanRegKey),
+                                      ChiakiEmbeddedCore.shared.parseRPKeyBytes(cleanRPKey) != nil else {
+                                    self.isConnectedToPS5 = false
+                                    self.connectionState = .error(message: "Giải mã khoá ghép đôi bị sai")
+                                    self.statusLog = "❌ PS5 trả 200 OK nhưng khoá giải mã ra không hợp lệ (RegistKey: \(cleanRegKey.count) ký tự, RP-Key: \(cleanRPKey.count) ký tự). Hãy lấy mã PIN mới và ghép đôi lại."
+                                    return
+                                }
+
                                 self.savedRegistKey = cleanRegKey
                                 self.savedRPKey = cleanRPKey
                                 UserDefaults.standard.set(cleanRegKey, forKey: "chiaki_real_regist_key_v102")
@@ -758,10 +766,11 @@ class VideoSourceManager: NSObject, ObservableObject {
                                 UserDefaults.standard.synchronize()
 
                                 self.psnPinCode = ""
-                                self.statusLog = "✅ Ghép đôi PIN thành công (HTTP 200 OK)! Đang đợi máy PS5 giải phóng cổng kết nối sau 2 giây..."
+                                self.connectionState = .connectingStream
+                                self.statusLog = "✅ Ghép đôi PIN thành công (HTTP 200 OK)! Đang đợi PS5 lưu thiết bị mới (3 giây)..."
 
-                                // Chờ 2.0s để PS5 daemon lưu khoá đăng ký và hoàn tất đóng socket rgst trước khi mở phiên init
-                                DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in
+                                // Chờ 3s để PS5 lưu thiết bị mới và đóng socket rgst trước khi mở phiên init
+                                DispatchQueue.main.asyncAfter(deadline: .now() + 3.0) { [weak self] in
                                     guard let self = self else { return }
                                     self.statusLog = "Chiaki-NG: Đang mở phiên điều khiển PS5 (/sie/ps5/rp/sess/init)..."
                                     self.startRealChiakiSessionInitAndCtrl(ip: ip, registKey: cleanRegKey, rpKey: cleanRPKey)
@@ -790,73 +799,125 @@ class VideoSourceManager: NSObject, ObservableObject {
         tcpConn.start(queue: .global(qos: .userInteractive))
     }
 
-    private func startRealChiakiSessionInitAndCtrl(ip: String, registKey: String, rpKey: String) {
+    // ĐÃ SỬA (1.09): Gửi /sie/ps5/rp/sess/init GIỐNG HỆT session.c của chiaki-ng
+    // - Tên header viết y hệt chiaki-ng: "RP-Registkey" và "Rp-Version"
+    // - Giá trị RP-Registkey = hex chữ thường của rp_regist_key (cắt tại byte 0 đầu tiên)
+    // - Tự thử lại khi PS5 trả 80108bff/lỗi TCP thoáng qua ngay sau khi ghép đôi
+    private func startRealChiakiSessionInitAndCtrl(ip: String, registKey: String, rpKey: String, attempt: Int = 1) {
+        let maxAttempts = 4
         let host = NWEndpoint.Host(ip)
         guard let port = NWEndpoint.Port(rawValue: ROIDefaultConfig.registAndCtrlPort) else { return }
 
+        let core = ChiakiEmbeddedCore.shared
+        guard core.isValidRegistKey(registKey), core.parseRPKeyBytes(rpKey) != nil else {
+            DispatchQueue.main.async {
+                self.isConnectedToPS5 = false
+                self.connectionState = .error(message: "Khoá ghép đôi đã lưu không hợp lệ")
+                self.statusLog = "❌ Khoá ghép đôi đã lưu bị hỏng (RegistKey \(registKey.count) ký tự, RP-Key \(rpKey.count) ký tự). Hãy bấm 'Xoá & Đổi TK' rồi ghép đôi lại bằng mã PIN mới."
+            }
+            return
+        }
+        let registKeyHeader = core.registKeyHeaderValue(registKey)
+
         let initConn = NWConnection(host: host, port: port, using: .tcp)
+        var finished = false
 
         initConn.stateUpdateHandler = { [weak self] state in
             guard let self = self else { return }
-            if case .ready = state {
-                let cleanRegistKey = registKey.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines.union(CharacterSet(charactersIn: "\0\"' ")))
-                let hexOnly = cleanRegistKey.filter { $0.isHexDigit }
-                let keyToSend = (hexOnly.count == 32) ? hexOnly : cleanRegistKey
-
+            switch state {
+            case .ready:
                 var initReq = "GET /sie/ps5/rp/sess/init HTTP/1.1\r\n"
                 initReq += "Host: \(ip):\(ROIDefaultConfig.registAndCtrlPort)\r\n"
                 initReq += "User-Agent: remoteplay Windows\r\n"
                 initReq += "Connection: close\r\n"
                 initReq += "Content-Length: 0\r\n"
-                initReq += "RP-RegistKey: \(keyToSend)\r\n"
-                initReq += "RP-Version: 1.0\r\n\r\n"
+                initReq += "RP-Registkey: \(registKeyHeader)\r\n"
+                initReq += "Rp-Version: 1.0\r\n\r\n"
 
                 initConn.send(content: initReq.data(using: .utf8), completion: .contentProcessed({ _ in
                     self.receiveFullHTTPResponse(from: initConn) { data in
+                        guard !finished else { return }
+                        finished = true
                         initConn.cancel()
-                        let initRespStr = String(data: data, encoding: .utf8) ?? ""
+                        let initRespStr = String(data: data, encoding: .utf8) ?? String(data: data, encoding: .isoLatin1) ?? ""
 
                         if !initRespStr.contains("200 OK") && !initRespStr.contains("200 Ok") {
-                            let reason = self.extractHeader(from: initRespStr, key: "RP-Application-Reason") ?? "HTTP 403"
+                            let reason = (self.extractHeader(from: initRespStr, key: "RP-Application-Reason") ?? "HTTP lỗi").lowercased()
                             DispatchQueue.main.async {
-                                self.isConnectedToPS5 = false
-                                if reason.contains("80108b26") {
-                                    self.connectionState = .error(message: "PS5 báo lỗi 80108b26 (Phiên đang bận)")
-                                    self.statusLog = "❌ PS5 báo lỗi 80108b26: Máy PS5 đang bận hoặc tài khoản này đang giữ phiên điều khiển trên TV. Hãy thoát ra màn hình chính PS5 và thử lại."
-                                } else if reason.contains("80108bff") {
-                                    self.connectionState = .error(message: "PS5 báo lỗi 80108bff (Khoá chưa khớp)")
-                                    self.statusLog = "❌ Khởi tạo phiên thất bại (Mã: 80108bff). Hãy thoát màn hình PIN trên TV, mở lại để lấy mã PIN 8 số mới và liên kết lại."
-                                } else {
-                                    self.connectionState = .error(message: "PS5 từ chối khởi tạo phiên (\(reason))")
-                                    self.statusLog = "❌ Khởi tạo phiên thất bại (Mã: \(reason)). Hãy nhập mã PIN 8 số mới trên màn hình PS5 để ghép đôi lại."
-                                }
+                                self.handleSessionInitFailure(ip: ip, registKey: registKey, rpKey: rpKey,
+                                                              reason: reason, attempt: attempt, maxAttempts: maxAttempts)
                             }
                             return
                         }
 
                         let serverNonce = self.extractHeader(from: initRespStr, key: "RP-Nonce")
-
-                        let authHeaders = ChiakiEmbeddedCore.shared.buildSessionAuthHeaders(
-                            registKey: keyToSend,
-                            rpKeyBase64: rpKey,
+                        guard let ctrlHeaders = core.buildCtrlHeaders(
+                            registKey: registKey,
+                            rpKey: rpKey,
                             serverNonceBase64: serverNonce
-                        )
-
-                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
-                            self.openPersistentCtrlChannel(
-                                ip: ip,
-                                rpAuth: authHeaders.rpAuth,
-                                rpDid: authHeaders.rpDid
-                            )
+                        ) else {
+                            DispatchQueue.main.async {
+                                self.isConnectedToPS5 = false
+                                self.connectionState = .error(message: "Không đọc được RP-Nonce")
+                                self.statusLog = "❌ PS5 chấp nhận phiên nhưng app không tạo được khoá phiên (RP-Nonce: \(serverNonce ?? "trống")). Hãy thử kết nối lại."
+                            }
+                            return
                         }
+
+                        DispatchQueue.main.async {
+                            self.statusLog = "✅ PS5 đã chấp nhận phiên (sess/init 200 OK). Đang mở kênh điều khiển (sess/ctrl)..."
+                        }
+                        self.openPersistentCtrlChannel(ip: ip, headers: ctrlHeaders)
                     }
                 }))
+            case .failed(let err):
+                guard !finished else { return }
+                finished = true
+                initConn.cancel()
+                DispatchQueue.main.async {
+                    self.handleSessionInitFailure(ip: ip, registKey: registKey, rpKey: rpKey,
+                                                  reason: "tcp: \(err.localizedDescription)", attempt: attempt, maxAttempts: maxAttempts)
+                }
+            default:
+                break
             }
         }
         initConn.start(queue: .global(qos: .userInitiated))
     }
 
-    private func openPersistentCtrlChannel(ip: String, rpAuth: String, rpDid: String) {
+    private func handleSessionInitFailure(ip: String, registKey: String, rpKey: String, reason: String, attempt: Int, maxAttempts: Int) {
+        // 80108bff = lỗi "không xác định" của PS5. Ngay sau khi ghép đôi, PS5 thường trả mã này
+        // vài giây đầu vì chưa lưu xong thiết bị mới -> chờ rồi thử lại, KHÔNG bắt nhập PIN mới.
+        let retryable = reason.contains("80108bff") || reason.hasPrefix("tcp:") || reason.contains("80108b10")
+        if retryable && attempt < maxAttempts {
+            let delay = Double(attempt) * 2.0
+            connectionState = .connectingStream
+            statusLog = "⏳ PS5 chưa sẵn sàng mở phiên (Mã: \(reason)). Thử lại lần \(attempt + 1)/\(maxAttempts) sau \(Int(delay)) giây..."
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+                self?.startRealChiakiSessionInitAndCtrl(ip: ip, registKey: registKey, rpKey: rpKey, attempt: attempt + 1)
+            }
+            return
+        }
+
+        isConnectedToPS5 = false
+        if reason.contains("80108b10") || reason.contains("80108b26") {
+            connectionState = .error(message: "PS5 đang bận (\(reason))")
+            statusLog = "❌ PS5 báo đang có thiết bị khác Remote Play (Mã: \(reason)). Hãy ngắt Remote Play trên thiết bị kia rồi thử lại."
+        } else if reason.contains("80108bff") {
+            connectionState = .error(message: "PS5 từ chối mở phiên (80108bff)")
+            statusLog = "❌ PS5 vẫn từ chối mở phiên (80108bff) sau \(maxAttempts) lần. Kiểm tra: PS5 đang ở màn hình chính (không ở màn hình PIN), đã bật Cài đặt > Hệ thống > Remote Play, và tài khoản trong app đúng là tài khoản đã lấy mã PIN. Nếu vẫn lỗi, bấm 'Xoá & Đổi TK' rồi ghép đôi lại."
+        } else {
+            connectionState = .error(message: "PS5 từ chối khởi tạo phiên (\(reason))")
+            statusLog = "❌ Khởi tạo phiên thất bại (Mã: \(reason))."
+        }
+    }
+
+    // ĐÃ SỬA (1.09) - NGUYÊN NHÂN CHÍNH CỦA LỖI 80108bff Ở BƯỚC sess/ctrl:
+    // 1) RP-Auth trước đây mã hoá chuỗi ASCII của RegistKey thay vì 16 byte đã giải hex (chiaki regist.c parse_hex)
+    // 2) RP-OSType / RP-StartBitrate gửi dạng chữ thường, thiếu RP-StreamingType (PS5 bắt buộc)
+    // 3) RP-Did sai prefix (0x09 -> 0x07) và thiếu 16 byte ngẫu nhiên
+    // Nay mã hoá toàn bộ bằng rpcrypt theo đúng thứ tự counter của chiaki-ng ctrl.c.
+    private func openPersistentCtrlChannel(ip: String, headers: ChiakiEmbeddedCore.ChiakiCtrlHeaders) {
         ctrlSessionTCPConn?.cancel()
         let host = NWEndpoint.Host(ip)
         guard let port = NWEndpoint.Port(rawValue: ROIDefaultConfig.registAndCtrlPort) else { return }
@@ -866,40 +927,51 @@ class VideoSourceManager: NSObject, ObservableObject {
 
         conn.stateUpdateHandler = { [weak self] state in
             guard let self = self else { return }
-            if case .ready = state {
+            switch state {
+            case .ready:
                 var ctrlReq = "GET /sie/ps5/rp/sess/ctrl HTTP/1.1\r\n"
                 ctrlReq += "Host: \(ip):\(ROIDefaultConfig.registAndCtrlPort)\r\n"
                 ctrlReq += "User-Agent: remoteplay Windows\r\n"
                 ctrlReq += "Connection: keep-alive\r\n"
-                ctrlReq += "RP-Auth: \(rpAuth)\r\n"
+                ctrlReq += "Content-Length: 0\r\n"
+                ctrlReq += "RP-Auth: \(headers.rpAuth)\r\n"
                 ctrlReq += "RP-Version: 1.0\r\n"
-                ctrlReq += "RP-Did: \(rpDid)\r\n"
+                ctrlReq += "RP-Did: \(headers.rpDid)\r\n"
                 ctrlReq += "RP-ControllerType: 3\r\n"
                 ctrlReq += "RP-ClientType: 11\r\n"
-                ctrlReq += "RP-OSType: Win10.0.0\r\n"
+                ctrlReq += "RP-OSType: \(headers.osType)\r\n"
                 ctrlReq += "RP-ConPath: 1\r\n"
-                ctrlReq += "RP-StartBitrate: 15000\r\n\r\n"
+                ctrlReq += "RP-StartBitrate: \(headers.startBitrate)\r\n"
+                ctrlReq += "RP-StreamingType: \(headers.streamingType)\r\n\r\n"
 
                 conn.send(content: ctrlReq.data(using: .utf8), completion: .contentProcessed({ _ in
                     conn.receive(minimumIncompleteLength: 1, maximumLength: 4096) { data, _, _, _ in
                         DispatchQueue.main.async {
-                            let resp = data != nil ? (String(data: data!, encoding: .utf8) ?? "") : ""
+                            let resp = data != nil ? (String(data: data!, encoding: .utf8) ?? String(data: data!, encoding: .isoLatin1) ?? "") : ""
                             if resp.contains("200 OK") || resp.contains("200 Ok") || resp.contains("RP-Server-") {
                                 self.isConnectedToPS5 = true
                                 self.isUsingTestSimulator = false
                                 let hostTitle = self.discoveredPS5Name.isEmpty ? "PS5 Console" : self.discoveredPS5Name
                                 self.connectionState = .connected(hostName: "\(hostTitle) (\(ip))")
-                                self.statusLog = "✅ Đã kết nối Remote Play với \(hostTitle) (\(ip))! Đang bắt tay Takion v12 nhận hình ảnh cổng UDP 9296..."
+                                self.statusLog = "✅ Đã mở phiên Remote Play với \(hostTitle) (\(ip)). Đang bắt tay luồng hình ảnh UDP 9296..."
                                 self.openTakionVideoUDPStream(ip: ip)
                             } else {
-                                let reason = self.extractHeader(from: resp, key: "RP-Application-Reason") ?? "HTTP Error"
+                                let reason = self.extractHeader(from: resp, key: "RP-Application-Reason") ?? (resp.isEmpty ? "PS5 đóng kết nối" : "HTTP lỗi")
                                 self.isConnectedToPS5 = false
-                                self.connectionState = .error(message: "Phiên điều khiển từ chối (\(reason))")
-                                self.statusLog = "⚠️ PS5 từ chối mở phiên điều khiển (Mã: \(reason)). Hãy nhập mã PIN 8 chữ số mới trên TV để liên kết lại."
+                                self.connectionState = .error(message: "Phiên điều khiển bị từ chối (\(reason))")
+                                self.statusLog = "⚠️ PS5 từ chối kênh điều khiển sess/ctrl (Mã: \(reason)). Thử kết nối lại; nếu vẫn lỗi hãy ghép đôi lại."
                             }
                         }
                     }
                 }))
+            case .failed(let err):
+                DispatchQueue.main.async {
+                    self.isConnectedToPS5 = false
+                    self.connectionState = .error(message: err.localizedDescription)
+                    self.statusLog = "❌ Không mở được kênh điều khiển cổng 9295: \(err.localizedDescription)"
+                }
+            default:
+                break
             }
         }
         conn.start(queue: .global(qos: .userInitiated))
