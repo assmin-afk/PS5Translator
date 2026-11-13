@@ -521,11 +521,22 @@ class VideoSourceManager: NSObject, ObservableObject {
     }
 
     private func extractHeader(from text: String, key: String) -> String? {
-        let lines = text.replacingOccurrences(of: "\r\n", with: "\n").components(separatedBy: "\n")
-        for line in lines {
+        let normalized = text.replacingOccurrences(of: "\r\n", with: "\n")
+                             .replacingOccurrences(of: "\r", with: "\n")
+                             .replacingOccurrences(of: "\0", with: "\n")
+        let lines = normalized.components(separatedBy: "\n")
+        for rawLine in lines {
+            let line = rawLine.trimmingCharacters(in: .whitespaces)
             let parts = line.components(separatedBy: ":")
             if parts.count >= 2 && parts[0].lowercased().trimmingCharacters(in: CharacterSet.whitespaces) == key.lowercased() {
-                return parts.dropFirst().joined(separator: ":").trimmingCharacters(in: CharacterSet.whitespacesAndNewlines.union(CharacterSet(charactersIn: "\0\"' ")))
+                var value = parts.dropFirst().joined(separator: ":").trimmingCharacters(in: CharacterSet.whitespacesAndNewlines.union(CharacterSet(charactersIn: "\0\"' ")))
+                if let nextToken = value.range(of: " RP-", options: .caseInsensitive) {
+                    value = String(value[..<nextToken.lowerBound]).trimmingCharacters(in: .whitespacesAndNewlines)
+                }
+                if let nextToken = value.range(of: " PS5-", options: .caseInsensitive) {
+                    value = String(value[..<nextToken.lowerBound]).trimmingCharacters(in: .whitespacesAndNewlines)
+                }
+                return value
             }
         }
         return nil
@@ -796,6 +807,7 @@ class VideoSourceManager: NSObject, ObservableObject {
                 initReq += "Host: \(ip):\(ROIDefaultConfig.registAndCtrlPort)\r\n"
                 initReq += "User-Agent: remoteplay Windows\r\n"
                 initReq += "Connection: close\r\n"
+                initReq += "Content-Length: 0\r\n"
                 initReq += "RP-RegistKey: \(keyToSend)\r\n"
                 initReq += "RP-Version: 1.0\r\n\r\n"
 
@@ -809,8 +821,11 @@ class VideoSourceManager: NSObject, ObservableObject {
                             DispatchQueue.main.async {
                                 self.isConnectedToPS5 = false
                                 if reason.contains("80108b26") {
-                                    self.connectionState = .error(message: "PS5 báo lỗi 80108b26 (Xung đột tài khoản)")
-                                    self.statusLog = "❌ PS5 từ chối phiên (Mã: 80108b26 - Xung đột tài khoản). Cơ chế chuẩn giống app Console Translator: Bạn chơi game trên TV bằng Tài khoản chính, còn mã PIN và app iPhone này liên kết bằng Tài khoản PSN phụ để không bị ngắt tay cầm."
+                                    self.connectionState = .error(message: "PS5 báo lỗi 80108b26 (Phiên đang bận)")
+                                    self.statusLog = "❌ PS5 báo lỗi 80108b26: Máy PS5 đang bận hoặc tài khoản này đang giữ phiên điều khiển trên TV. Hãy thoát ra màn hình chính PS5 và thử lại."
+                                } else if reason.contains("80108bff") {
+                                    self.connectionState = .error(message: "PS5 báo lỗi 80108bff (Khoá chưa khớp)")
+                                    self.statusLog = "❌ Khởi tạo phiên thất bại (Mã: 80108bff). Hãy thoát màn hình PIN trên TV, mở lại để lấy mã PIN 8 số mới và liên kết lại."
                                 } else {
                                     self.connectionState = .error(message: "PS5 từ chối khởi tạo phiên (\(reason))")
                                     self.statusLog = "❌ Khởi tạo phiên thất bại (Mã: \(reason)). Hãy nhập mã PIN 8 số mới trên màn hình PS5 để ghép đôi lại."
