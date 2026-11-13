@@ -559,7 +559,7 @@ jobs:
                   memset(out_plain, 0, max_plain_len);
                   if (chiaki_rpcrypt_decrypt(&rpcrypt, 0, cipher + off, out_plain, enc_len) == CHIAKI_ERR_SUCCESS) {
                       for (size_t i = 0; i < enc_len; i++) {
-                          if (out_plain[i] == 0) out_plain[i] = ' ';
+                          if (out_plain[i] == 0) out_plain[i] = '\n';
                       }
                       out_plain[enc_len] = 0;
                       if (strstr((const char *)out_plain, "RegistKey") != NULL ||
@@ -704,11 +704,12 @@ jobs:
 
               # Tu dong nang cap parseRegistKeyTo16Bytes de ho tro PS5-RegistKey dang Hex 32 ky tu
               old_parse_sig = "func parseRegistKeyTo16Bytes(_ registKey: String) -> Data {"
-              if old_parse_sig in content and "Self.hexStringToBytes(clean)" not in content:
+              if old_parse_sig in content and "Self.hexStringToBytes" not in content:
                   new_parse_hook = (
                       "func parseRegistKeyTo16Bytes(_ registKey: String) -> Data {\n"
-                      "        let cleanHexCheck = registKey.trimmingCharacters(in: .whitespacesAndNewlines)\n"
-                      "        if cleanHexCheck.count == 32, let hb = Self.hexStringToBytes(cleanHexCheck), hb.count == 16 {\n"
+                      "        let cleanHexCheck = registKey.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines.union(CharacterSet(charactersIn: \"\\0\\\"' \")))\n"
+                      "        let hexChars = cleanHexCheck.filter { $0.isHexDigit }\n"
+                      "        if hexChars.count == 32, let hb = Self.hexStringToBytes(hexChars), hb.count == 16 {\n"
                       "            return Data(hb)\n"
                       "        }"
                   )
