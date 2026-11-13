@@ -549,7 +549,8 @@ jobs:
               (void)bright; (void)echidna; (void)hmac_key;
               if (!cipher || cipher_len < 16 || !out_plain || !g_has_last_rpcrypt) return -1;
 
-              const size_t offsets[3] = { 0x20, 0x00, 0x10 };
+              // chiaki-ng regist.c giai ma toan bo body tu offset 0 -> thu 0x00 TRUOC
+              const size_t offsets[3] = { 0x00, 0x20, 0x10 };
               for (int k = 0; k < 3; k++) {
                   size_t off = offsets[k];
                   if (cipher_len <= off) continue;
