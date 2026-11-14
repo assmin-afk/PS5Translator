@@ -1,6 +1,6 @@
 // ============================================================================
 // FILE 9: 9_GameLibraryView.swift
-// PHIÊN BẢN: PS5Translator 1.12
+// PHIÊN BẢN: PS5Translator 1.19 (tab Thư viện Game)
 //
 // THƯ VIỆN GAME (thay màn hình "Quản lý Hồ sơ Game" cũ):
 // - Thẻ game đang dùng: tên, số câu Việt hoá dùng được, tình trạng data, bộ dịch AI.
@@ -150,281 +150,219 @@ enum DataImporter {
     }
 }
 
-// MARK: - Thư viện game
+// MARK: - Thư viện game (1.19: tab "Thư viện Game" ở thanh tab dưới)
 
 struct GameLibraryView: View {
     @ObservedObject var coord: PipelineCoordinator
-    @Environment(\.presentationMode) var presentationMode
+    /// Gọi sau khi chọn game -> chuyển sang tab Game
+    var onPicked: (() -> Void)? = nil
 
     @State private var showAddGame = false
     @State private var importTargetFolder: String = ""
     @State private var showImporter = false
     @State private var confirmDelete: GameProfileFolder?
+    @State private var searchText = ""
 
-    private let columns = [GridItem(.flexible(), spacing: 12), GridItem(.flexible(), spacing: 12)]
-    private let accent = Color(red: 0.0, green: 0.44, blue: 0.82)
+    private var filteredProfiles: [GameProfileFolder] {
+        let q = searchText.trimmingCharacters(in: .whitespaces)
+        guard !q.isEmpty else { return coord.gameProfiles }
+        return coord.gameProfiles.filter { $0.folderName.localizedCaseInsensitiveContains(q) }
+    }
 
     var body: some View {
-        NavigationView {
-            ScrollView {
-                VStack(alignment: .leading, spacing: 18) {
-                    activeGameCard
-                    if let msg = coord.importMessage {
-                        Text(msg)
-                            .font(.caption)
-                            .foregroundColor(msg.hasPrefix("✅") ? .green : .orange)
-                            .padding(10)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                            .background(Color.white.opacity(0.06))
-                            .cornerRadius(10)
+        ScrollView(.vertical, showsIndicators: false) {
+            VStack(alignment: .leading, spacing: 12) {
+                HStack {
+                    Text("Thư viện Game")
+                        .font(.system(size: 30, weight: .heavy))
+                        .foregroundColor(.white)
+                    Spacer()
+                    Button(action: { showAddGame = true }) {
+                        Image(systemName: "plus")
+                            .font(.system(size: 20, weight: .bold))
+                            .frame(width: 44, height: 44)
+                            .mqPill(true)
                     }
+                    .buttonStyle(.plain)
+                }
+                .padding(.horizontal, 4)
+                .padding(.top, 6)
 
-                    HStack {
-                        Text("Danh sách game")
-                            .font(.title3.bold())
-                        Spacer()
-                        Text("\(coord.gameProfiles.count) game")
-                            .font(.caption)
-                            .foregroundColor(.gray)
+                HStack(spacing: 8) {
+                    Image(systemName: "magnifyingglass")
+                        .foregroundColor(MQTheme.tertiary)
+                    TextField("Tìm game…", text: $searchText)
+                        .foregroundColor(.white)
+                        .autocorrectionDisabled()
+                }
+                .padding(.horizontal, 16)
+                .frame(height: 44)
+                .background(Capsule().fill(Color.white.opacity(0.07)))
+                .overlay(Capsule().stroke(MQTheme.hairline, lineWidth: 1))
+
+                if let msg = coord.importMessage {
+                    Text(msg)
+                        .font(.system(size: 12))
+                        .foregroundColor(MQTheme.secondary)
+                        .padding(12)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .mqGlass(16)
+                }
+
+                sectionTitle("Đã cài data (\(coord.gameProfiles.count))")
+                if filteredProfiles.isEmpty {
+                    Text(coord.gameProfiles.isEmpty ? "Chưa có game nào. Bấm + để thêm game và nạp data Việt hoá." : "Không tìm thấy game.")
+                        .font(.system(size: 13))
+                        .foregroundColor(MQTheme.tertiary)
+                        .padding(.horizontal, 6)
+                }
+                ForEach(filteredProfiles) { profile in
+                    gameRow(profile)
+                }
+
+                sectionTitle("Thêm data")
+                VStack(spacing: 0) {
+                    actionRow(icon: "square.and.arrow.down", title: "Nạp file data cho \(coord.activeProfileFolderName)",
+                              subtitle: ".sqlite, .db, .csv, .tsv, .txt · từ Tệp / iCloud Drive") {
+                        importTargetFolder = coord.activeProfileFolderName
+                        showImporter = true
                     }
-
-                    LazyVGrid(columns: columns, spacing: 12) {
-                        addGameTile
-                        ForEach(coord.gameProfiles) { profile in
-                            gameTile(profile)
-                        }
+                    Rectangle().fill(MQTheme.hairline).frame(height: 1)
+                    actionRow(icon: "plus", title: "Thêm game mới", subtitle: "Tên game + data Việt hoá (chưa có data thì dịch bằng AI)") {
+                        showAddGame = true
                     }
+                }
+                .padding(.horizontal, 14)
+                .mqGlass(24)
 
-                    aiEngineSection
-                    tvSection
-                    dataHelpSection
-                }
-                .padding(16)
+                Text("Tạo data từ file game: dùng tools/vietsub_db_tool.py trên máy tính.")
+                    .font(.system(size: 12))
+                    .foregroundColor(MQTheme.tertiary)
+                    .padding(.horizontal, 6)
             }
-            .background(Color(red: 0.02, green: 0.04, blue: 0.09).ignoresSafeArea())
-            .navigationTitle("Thư viện game")
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                ToolbarItem(placement: .navigationBarTrailing) {
-                    Button("Xong") { presentationMode.wrappedValue.dismiss() }
-                }
-            }
-            .sheet(isPresented: $showAddGame) {
-                AddGameSheet(coord: coord)
-            }
-            .fileImporter(isPresented: $showImporter, allowedContentTypes: DataTypes.allowed, allowsMultipleSelection: false) { result in
-                if case .success(let urls) = result, let url = urls.first {
-                    coord.importDataIntoProfileFolder(folderName: importTargetFolder, sourceURL: url)
-                }
-            }
-            .alert(item: $confirmDelete) { profile in
-                Alert(
-                    title: Text("Xoá game \"\(profile.folderName)\"?"),
-                    message: Text("Data Việt hoá của game này cũng bị xoá khỏi app."),
-                    primaryButton: .destructive(Text("Xoá")) { coord.deleteGameProfileFolder(folderName: profile.folderName) },
-                    secondaryButton: .cancel(Text("Huỷ"))
-                )
+            .padding(.horizontal, 14)
+            .padding(.bottom, 20)
+        }
+        .sheet(isPresented: $showAddGame) {
+            AddGameSheet(coord: coord)
+        }
+        .fileImporter(isPresented: $showImporter, allowedContentTypes: DataTypes.allowed, allowsMultipleSelection: false) { result in
+            if case .success(let urls) = result, let url = urls.first {
+                coord.importDataIntoProfileFolder(folderName: importTargetFolder, sourceURL: url)
             }
         }
-        .navigationViewStyle(.stack)
-        .preferredColorScheme(.dark)
-    }
-
-    // Thẻ game đang chơi
-    private var activeGameCard: some View {
-        HStack(spacing: 14) {
-            GameMonogram(name: coord.activeProfileFolderName, size: 64)
-            VStack(alignment: .leading, spacing: 5) {
-                Text("ĐANG CHƠI")
-                    .font(.system(size: 10, weight: .heavy))
-                    .foregroundColor(.green)
-                Text(coord.activeProfileFolderName)
-                    .font(.title2.bold())
-                    .foregroundColor(.white)
-                    .lineLimit(1)
-                Label(coord.loadedLineCount > 0 ? "\(coord.loadedLineCount.formatted()) câu Việt hoá" : "Chưa có câu Việt hoá dùng được",
-                      systemImage: coord.loadedLineCount > 0 ? "checkmark.seal.fill" : "exclamationmark.triangle.fill")
-                    .font(.caption.bold())
-                    .foregroundColor(coord.loadedLineCount > 0 ? .green : .orange)
-                Text(coord.databaseReport)
-                    .font(.system(size: 10))
-                    .foregroundColor(.white.opacity(0.6))
-                    .lineLimit(3)
-            }
-            Spacer(minLength: 0)
-        }
-        .padding(14)
-        .background(
-            LinearGradient(colors: [accent.opacity(0.55), Color(red: 0.05, green: 0.10, blue: 0.22)],
-                           startPoint: .topLeading, endPoint: .bottomTrailing)
-        )
-        .cornerRadius(18)
-        .overlay(RoundedRectangle(cornerRadius: 18).stroke(Color.white.opacity(0.12)))
-    }
-
-    private var addGameTile: some View {
-        Button(action: { showAddGame = true }) {
-            VStack(spacing: 10) {
-                Image(systemName: "plus.circle.fill")
-                    .font(.system(size: 34))
-                    .foregroundColor(accent)
-                Text("Thêm game mới")
-                    .font(.subheadline.bold())
-                    .foregroundColor(.white)
-                Text("Tên game + data Việt hoá")
-                    .font(.caption2)
-                    .foregroundColor(.gray)
-            }
-            .frame(maxWidth: .infinity, minHeight: 150)
-            .background(Color.white.opacity(0.05))
-            .cornerRadius(16)
-            .overlay(
-                RoundedRectangle(cornerRadius: 16)
-                    .stroke(style: StrokeStyle(lineWidth: 1.5, dash: [6, 4]))
-                    .foregroundColor(accent.opacity(0.8))
+        .alert(item: $confirmDelete) { profile in
+            Alert(
+                title: Text("Xoá game \"\(profile.folderName)\"?"),
+                message: Text("Data Việt hoá của game này cũng bị xoá khỏi app."),
+                primaryButton: .destructive(Text("Xoá")) { coord.deleteGameProfileFolder(folderName: profile.folderName) },
+                secondaryButton: .cancel(Text("Huỷ"))
             )
         }
-        .buttonStyle(.plain)
     }
 
-    private func gameTile(_ profile: GameProfileFolder) -> some View {
+    private func sectionTitle(_ t: String) -> some View {
+        Text(t.uppercased())
+            .font(.system(size: 12, weight: .bold))
+            .tracking(0.6)
+            .foregroundColor(MQTheme.tertiary)
+            .padding(.horizontal, 6)
+            .padding(.top, 6)
+    }
+
+    private func pick(_ profile: GameProfileFolder) {
+        if coord.activeProfileFolderName != profile.folderName {
+            coord.activateGameProfileFolder(folderName: profile.folderName)
+        }
+        onPicked?()
+    }
+
+    private func gameRow(_ profile: GameProfileFolder) -> some View {
         let isActive = coord.activeProfileFolderName == profile.folderName
         let stat = coord.profileStats[profile.folderName]
         let hasFile = profile.sqliteFileName.hasSuffix(".sqlite") || profile.sqliteFileName.hasSuffix(".db")
-        return Button(action: { coord.activateGameProfileFolder(folderName: profile.folderName) }) {
-            VStack(alignment: .leading, spacing: 8) {
-                HStack(alignment: .top) {
-                    GameMonogram(name: profile.folderName, size: 44)
-                    Spacer()
-                    if isActive {
-                        Image(systemName: "checkmark.circle.fill")
-                            .foregroundColor(.green)
-                            .font(.title3)
-                    }
-                    Menu {
-                        Button(action: {
-                            importTargetFolder = profile.folderName
-                            showImporter = true
-                        }) {
-                            Label(hasFile ? "Thay data Việt hoá" : "Nạp data Việt hoá", systemImage: "square.and.arrow.down")
-                        }
-                        Button(action: { coord.activateGameProfileFolder(folderName: profile.folderName) }) {
-                            Label("Chọn game này", systemImage: "checkmark.circle")
-                        }
-                        Button(role: .destructive, action: { confirmDelete = profile }) {
-                            Label("Xoá game", systemImage: "trash")
-                        }
-                    } label: {
-                        Image(systemName: "ellipsis.circle")
-                            .font(.title3)
-                            .foregroundColor(.white.opacity(0.75))
-                            .padding(.leading, 4)
-                    }
-                }
+        let subtitle: String
+        if !hasFile {
+            subtitle = "Chưa có data · dịch bằng AI"
+        } else if let n = stat {
+            subtitle = n > 0 ? "\(n.formatted()) câu Việt hoá" : "Data lỗi (0 câu)"
+        } else {
+            subtitle = "Có data · chọn để kiểm tra"
+        }
+        return HStack(spacing: 12) {
+            GameMonogram(name: profile.folderName, size: 54)
+            VStack(alignment: .leading, spacing: 3) {
                 Text(profile.folderName)
-                    .font(.headline)
+                    .font(.system(size: 16, weight: .bold))
                     .foregroundColor(.white)
-                    .lineLimit(2)
-                    .multilineTextAlignment(.leading)
-                Spacer(minLength: 0)
-                if !hasFile {
-                    Label("Chưa có data", systemImage: "doc.badge.plus")
-                        .font(.caption2.bold())
-                        .foregroundColor(.orange)
-                } else if let n = stat {
-                    Label(n > 0 ? "\(n.formatted()) câu" : "Data lỗi (0 câu)", systemImage: n > 0 ? "text.book.closed.fill" : "exclamationmark.triangle.fill")
-                        .font(.caption2.bold())
-                        .foregroundColor(n > 0 ? .cyan : .orange)
-                } else {
-                    Label("Có data · chạm để kiểm tra", systemImage: "doc.text")
-                        .font(.caption2)
-                        .foregroundColor(.gray)
-                }
+                    .lineLimit(1)
+                Text(subtitle)
+                    .font(.system(size: 12))
+                    .foregroundColor(MQTheme.secondary)
+                    .lineLimit(1)
             }
-            .padding(12)
-            .frame(maxWidth: .infinity, minHeight: 150, alignment: .topLeading)
-            .background(isActive ? Color.green.opacity(0.12) : Color.white.opacity(0.07))
-            .cornerRadius(16)
-            .overlay(RoundedRectangle(cornerRadius: 16).stroke(isActive ? Color.green.opacity(0.7) : Color.white.opacity(0.1), lineWidth: isActive ? 1.5 : 1))
+            Spacer(minLength: 6)
+            Menu {
+                Button(action: {
+                    importTargetFolder = profile.folderName
+                    showImporter = true
+                }) {
+                    Label(hasFile ? "Thay data Việt hoá" : "Nạp data Việt hoá", systemImage: "square.and.arrow.down")
+                }
+                Button(role: .destructive, action: { confirmDelete = profile }) {
+                    Label("Xoá game", systemImage: "trash")
+                }
+            } label: {
+                Image(systemName: "ellipsis")
+                    .font(.system(size: 15, weight: .bold))
+                    .foregroundColor(MQTheme.secondary)
+                    .frame(width: 30, height: 30)
+            }
+            Button(action: { pick(profile) }) {
+                Text(isActive ? "Đang chơi" : "Chọn")
+                    .font(.system(size: 13, weight: .bold))
+                    .padding(.horizontal, 13)
+                    .frame(height: 32)
+                    .mqPill(isActive)
+            }
+            .buttonStyle(.plain)
+        }
+        .padding(10)
+        .mqGlass(22)
+        .overlay(
+            RoundedRectangle(cornerRadius: 22, style: .continuous)
+                .stroke(Color.white.opacity(isActive ? 0.55 : 0), lineWidth: 1.5)
+        )
+        .contentShape(Rectangle())
+        .onTapGesture { pick(profile) }
+    }
+
+    private func actionRow(icon: String, title: String, subtitle: String, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            HStack(spacing: 12) {
+                Image(systemName: icon)
+                    .font(.system(size: 15, weight: .semibold))
+                    .foregroundColor(.white)
+                    .frame(width: 34, height: 34)
+                    .background(RoundedRectangle(cornerRadius: 10, style: .continuous).fill(Color.white.opacity(0.08)))
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(title)
+                        .font(.system(size: 15, weight: .semibold))
+                        .foregroundColor(.white)
+                        .lineLimit(1)
+                    Text(subtitle)
+                        .font(.system(size: 12))
+                        .foregroundColor(MQTheme.tertiary)
+                        .lineLimit(2)
+                }
+                Spacer(minLength: 6)
+                Image(systemName: "chevron.right")
+                    .foregroundColor(MQTheme.tertiary)
+            }
+            .padding(.vertical, 11)
+            .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-    }
-
-    private var aiEngineSection: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            Text("Bộ dịch AI")
-                .font(.title3.bold())
-            Text(OnDeviceAITranslator.shared.statusText)
-                .font(.caption)
-                .foregroundColor(.white.opacity(0.75))
-            ForEach(TranslationEngineMode.allCases) { mode in
-                Button(action: { coord.translationEngineMode = mode }) {
-                    HStack(alignment: .top, spacing: 10) {
-                        Image(systemName: coord.translationEngineMode == mode ? "largecircle.fill.circle" : "circle")
-                            .foregroundColor(coord.translationEngineMode == mode ? accent : .gray)
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text(mode.title).font(.subheadline.bold()).foregroundColor(.white)
-                            Text(mode.detail).font(.caption2).foregroundColor(.gray)
-                        }
-                        Spacer()
-                    }
-                    .padding(10)
-                    .background(Color.white.opacity(coord.translationEngineMode == mode ? 0.1 : 0.04))
-                    .cornerRadius(12)
-                }
-                .buttonStyle(.plain)
-            }
-        }
-    }
-
-    private var tvSection: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Text("TV Samsung")
-                .font(.title3.bold())
-            HStack {
-                Label("IP nhập vào TV", systemImage: "tv")
-                Spacer()
-                Text("\(coord.server.ipAddress):\(String(AppConfig.webSocketPort))")
-                    .font(.system(.subheadline, design: .monospaced).bold())
-                    .foregroundColor(.green)
-            }
-            HStack {
-                Label("TV đang kết nối", systemImage: "wifi")
-                Spacer()
-                Text("\(coord.server.connectedCount)")
-                    .bold()
-            }
-            Button(action: {
-                coord.triggerTVTestSentence()
-                presentationMode.wrappedValue.dismiss()
-            }) {
-                Label("Gửi câu test lên TV", systemImage: "tv.badge.wifi")
-                    .font(.subheadline.bold())
-                    .frame(maxWidth: .infinity)
-                    .padding(10)
-                    .background(Color.green.opacity(0.2))
-                    .foregroundColor(.green)
-                    .cornerRadius(10)
-            }
-        }
-        .font(.subheadline)
-        .padding(14)
-        .background(Color.white.opacity(0.05))
-        .cornerRadius(16)
-    }
-
-    private var dataHelpSection: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            Text("Data Việt hoá nhận được")
-                .font(.subheadline.bold())
-            Text("• .sqlite / .db có cột tiếng Anh + cột tiếng Việt (vd: en, vi)\n• .csv / .tsv có dòng tiêu đề en,vi (tuỳ chọn: speaker)\n• .txt mỗi dòng: Câu tiếng Anh ||| Câu tiếng Việt\nTạo data từ file game: dùng tools/vietsub_db_tool.py trên máy tính.")
-                .font(.caption)
-                .foregroundColor(.gray)
-        }
-        .padding(14)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(Color.white.opacity(0.04))
-        .cornerRadius(16)
     }
 }
 
@@ -444,16 +382,17 @@ struct GameMonogram: View {
 
     var body: some View {
         let initials = name.split(separator: " ").prefix(2).compactMap { $0.first }.map { String($0).uppercased() }.joined()
-        let hue = Double(name.unicodeScalars.reduce(0) { ($0 * 31 + Int($1.value)) % 360 }) / 360.0
+        // 1.19: ô xám đơn sắc (đen mờ & trắng), độ sáng khác nhau theo tên game
+        let shade = Double(name.unicodeScalars.reduce(0) { ($0 * 31 + Int($1.value)) % 360 }) / 360.0
         Text(initials.isEmpty ? "?" : initials)
             .font(.system(size: size * 0.38, weight: .heavy, design: .rounded))
             .foregroundColor(.white)
             .frame(width: size, height: size)
             .background(
-                LinearGradient(colors: [Color(hue: hue, saturation: 0.7, brightness: 0.85), Color(hue: hue, saturation: 0.8, brightness: 0.45)],
+                LinearGradient(colors: [Color(white: 0.24 + shade * 0.16), Color(white: 0.07)],
                                startPoint: .topLeading, endPoint: .bottomTrailing)
             )
-            .cornerRadius(size * 0.24)
+            .clipShape(RoundedRectangle(cornerRadius: size * 0.26, style: .continuous))
     }
 }
 
@@ -466,7 +405,7 @@ struct AddGameSheet: View {
     @State private var pickedFile: URL?
     @State private var showImporter = false
 
-    private let accent = Color(red: 0.0, green: 0.44, blue: 0.82)
+    private let accent = Color.white.opacity(0.6)
 
     var body: some View {
         NavigationView {
@@ -513,9 +452,9 @@ struct AddGameSheet: View {
                         .font(.headline)
                         .frame(maxWidth: .infinity)
                         .padding(14)
-                        .background(name.trimmingCharacters(in: .whitespaces).isEmpty ? Color.gray : accent)
-                        .foregroundColor(.white)
-                        .cornerRadius(14)
+                        .background(name.trimmingCharacters(in: .whitespaces).isEmpty ? Color.white.opacity(0.12) : MQTheme.pearl)
+                        .foregroundColor(name.trimmingCharacters(in: .whitespaces).isEmpty ? MQTheme.tertiary : MQTheme.ink)
+                        .clipShape(Capsule())
                 }
                 .disabled(name.trimmingCharacters(in: .whitespaces).isEmpty)
             }

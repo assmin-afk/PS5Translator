@@ -1,6 +1,6 @@
 // ============================================================================
 // FILE 7: 7_SmartSubtitleEngine.swift
-// PHIÊN BẢN: PS5Translator 1.14 (DỊCH TỪNG CÂU THEO DATA, CỐ ĐỊNH CỠ CHỮ, SỬA AI CHO LỰA CHỌN)
+// PHIÊN BẢN: PS5Translator 1.17 (BỎ CHỮ TRÊN GIẤY / THƯ / BIỂN BÁO: MỰC TỐI TRÊN NỀN SÁNG)
 //
 // Luồng xử lý mỗi lần quét:
 //  1. OCR Apple Vision (.accurate) -> lấy từng DÒNG + toạ độ TỪNG TỪ.
@@ -36,18 +36,39 @@ struct SSLine {
     var confidence: Float
     var rect: CGRect
     var words: [SSWord]
+    /// 1.16: độ nghiêng (độ) và độ méo phối cảnh của dòng chữ -> chữ in trên vật phẩm 3D thường nghiêng/méo
+    var skewDegrees: CGFloat = 0
+    var shearRatio: CGFloat = 0
 }
 
 struct SSStyle: Equatable {
     var textRGB: (Double, Double, Double)
     var backgroundRGB: (Double, Double, Double)
     var isBold: Bool
+    /// 1.17: chữ TỐI trên nền SÁNG (mực trên giấy / biển báo)
+    var darkOnLight: Bool = false
 
     static let fallback = SSStyle(textRGB: (1, 1, 1), backgroundRGB: (0.05, 0.05, 0.07), isBold: true)
 
     static func == (a: SSStyle, b: SSStyle) -> Bool {
-        a.textRGB == b.textRGB && a.backgroundRGB == b.backgroundRGB && a.isBold == b.isBold
+        a.textRGB == b.textRGB && a.backgroundRGB == b.backgroundRGB && a.isBold == b.isBold && a.darkOnLight == b.darkOnLight
     }
+
+    static func luminance(_ c: (Double, Double, Double)) -> Double { 0.299 * c.0 + 0.587 * c.1 + 0.114 * c.2 }
+}
+
+/// 1.19: Loại dòng log quét chữ
+enum ScanLogKind: String {
+    case data, ai, pending, missing, trash
+}
+
+/// 1.19: 1 dòng log của 1 lần quét (engine -> bộ điều phối)
+struct ScanLogItem {
+    let key: String
+    let kind: ScanLogKind
+    let source: String
+    let translation: String?
+    let note: String?
 }
 
 /// 1 đơn vị chữ cần dịch + vẽ khung (1 khối thoại, 1 dòng menu hoặc 1 đoạn giữa 2 nút bấm)
@@ -153,8 +174,16 @@ final class GameTextFilter {
         return ok
     }
 
+    /// "Hannah's" -> "Hannah"
+    static func stripPossessive(_ w: String) -> String {
+        for suf in ["'s", "’s", "'S", "’S"] where w.hasSuffix(suf) && w.count > 3 {
+            return String(w.dropLast(2))
+        }
+        return w
+    }
+
     func isName(_ raw: String) -> Bool {
-        let w = raw.lowercased()
+        let w = Self.stripPossessive(raw).lowercased()
         return GameVocabulary.builtInNames.contains(w) || extraNames.contains(w)
     }
 
@@ -243,7 +272,8 @@ final class SmartOCREngine {
             langs.append("vi-VT")
         }
         request.recognitionLanguages = langs
-        request.minimumTextHeight = 0.018
+        // 1.16: đọc được chữ nhỏ (nhãn địa điểm, ghi chú ~10px) -> trước đây 0.018 làm chữ nhỏ lúc có lúc không
+        request.minimumTextHeight = 0.011
         if !customWords.isEmpty { request.customWords = Array(customWords.prefix(200)) }
 
         let handler = VNImageRequestHandler(cgImage: cropped, options: [:])
@@ -279,7 +309,17 @@ final class SmartOCREngine {
             if words.isEmpty {
                 words = [SSWord(text: str, rect: lineRect)]
             }
-            lines.append(SSLine(text: str, confidence: cand.confidence, rect: lineRect, words: words))
+            // Độ nghiêng của đường chân chữ và độ méo cạnh trái (theo pixel ảnh)
+            let iw = CGFloat(cropped.width), ih = CGFloat(cropped.height)
+            let dx = (obs.topRight.x - obs.topLeft.x) * iw
+            let dy = (obs.topRight.y - obs.topLeft.y) * ih
+            let angle = abs(atan2(dy, dx) * 180 / .pi)
+            let heightPx = max(1, (obs.topLeft.y - obs.bottomLeft.y) * ih)
+            let shear = abs((obs.topLeft.x - obs.bottomLeft.x) * iw) / heightPx
+            var line = SSLine(text: str, confidence: cand.confidence, rect: lineRect, words: words)
+            line.skewDegrees = angle
+            line.shearRatio = shear
+            lines.append(line)
         }
         return lines
     }
@@ -390,14 +430,24 @@ enum PieceBuilder {
         return (nil, nil, text)
     }
 
+    /// 1.16: dòng chỉ gồm tên riêng ("SAM", "Hannah", "Dr. Hill") -> không cần dịch
+    static func isNamesOnly(_ text: String, filter: GameTextFilter) -> Bool {
+        let words = text.split(separator: " ").map { GameTextFilter.stripPossessive(String($0).trimmingCharacters(in: .punctuationCharacters)) }
+            .filter { $0.contains(where: { $0.isLetter }) }
+        guard !words.isEmpty, words.count <= 3 else { return false }
+        return words.allSatisfy { w in filter.isName(w) || ["dr", "mr", "mrs", "ms"].contains(w.lowercased()) }
+    }
+
     /// 1.13: lựa chọn câu trả lời / menu ngắn (1-4 từ, toàn từ hợp lệ) không phải chữ rác
     static func isChoiceLike(_ a: GameTextFilter.Analysis) -> Bool {
         a.alphaWords >= 1 && a.alphaWords <= 4 && a.validRatio >= 0.99 && a.dictionaryWords >= 1
     }
 
-    static func classify(rect: CGRect, wordCount: Int, hasSpeaker: Bool) -> TextRegionCategory {
+    static func classify(rect: CGRect, wordCount: Int, hasSpeaker: Bool, text: String = "") -> TextRegionCategory {
         if hasSpeaker { return .dialogue }
-        if rect.midY >= 0.62 && abs(rect.midX - 0.5) < 0.25 && wordCount >= 3 { return .dialogue }
+        // 1.16: chữ IN HOA không có người nói ("TEN HOURS UNTIL DAWN") là tiêu đề / nhãn, không phải lời thoại
+        let allCaps = SmartSubtitleEngine.isAllCaps(text)
+        if !allCaps && rect.midY >= 0.62 && abs(rect.midX - 0.5) < 0.25 && wordCount >= 3 { return .dialogue }
         if rect.midY <= 0.30 && (rect.midX <= 0.35 || rect.midX >= 0.65) { return .quest }
         return .menu
     }
@@ -413,7 +463,11 @@ enum PieceBuilder {
             guard line.confidence >= 0.45 else { continue }
             if TranslationMemory.hasVietnameseMarks(line.text) { continue }   // đã là tiếng Việt
             let hPx = line.rect.height * refH
-            guard hPx >= 9, hPx <= 90 else { continue }   // quá nhỏ (số HUD) hoặc quá to (vệt sáng)
+            // 1.16: quá nhỏ (số HUD) hoặc CHỮ TO (tên nhân vật "SAM", tiêu đề chương "MEMENTO MORI")
+            // -> không dịch để không che màn hình game
+            guard hPx >= 7.5, hPx <= 50 else { continue }
+            // 1.16: chữ in trên vật phẩm 3D (lá thư, biển báo, chữ viết tay) thường nghiêng / méo phối cảnh
+            if line.skewDegrees > 3.0 || line.shearRatio > 0.22 { continue }
 
             let segs = segments(of: line, refW: refW)
             if segs.count == 1 && segs[0].rightLimit == nil && segs[0].words.count == line.words.count {
@@ -427,10 +481,11 @@ enum PieceBuilder {
                 let norm = TranslationMemory.normalize(text)
                 let isUI = GameVocabulary.uiDictionary[norm] != nil
                 let known = isKnownText(text)
+                if isNamesOnly(text, filter: filter) { continue }
                 guard a.isMeaningful || isUI || known || isChoiceLike(a) else { continue }
                 let rect = union(seg.words.map { $0.rect })
                 var piece = SSPiece(sourceText: text, speaker: nil, rect: rect, lineCount: 1,
-                                    category: classify(rect: rect, wordCount: a.alphaWords, hasSpeaker: false),
+                                    category: classify(rect: rect, wordCount: a.alphaWords, hasSpeaker: false, text: text),
                                     confidence: line.confidence, validRatio: a.validRatio,
                                     wordCount: a.alphaWords, rightLimit: seg.rightLimit)
                 piece.knownInData = known
@@ -470,6 +525,7 @@ enum PieceBuilder {
             let a = filter.analyze(rest)
             let norm = TranslationMemory.normalize(rest)
             let known = isKnownText(rest)
+            if isNamesOnly(rest, filter: filter) { continue }
             // Từ game cơ bản đứng một mình thì bỏ, NHƯNG lời thoại có người nói ("(Josh) No.") vẫn dịch
             if speaker == nil && !known && GameVocabulary.basicGamerWords.contains(norm) { continue }
             if speaker == nil && GameVocabulary.screenEffects.contains(norm) { continue }
@@ -478,7 +534,7 @@ enum PieceBuilder {
             let rect = union(block.map { $0.rect })
             let conf = block.map { $0.confidence }.min() ?? 0
             var piece = SSPiece(sourceText: rest, speaker: speaker, rect: rect, lineCount: block.count,
-                                category: classify(rect: rect, wordCount: a.alphaWords, hasSpeaker: speaker != nil),
+                                category: classify(rect: rect, wordCount: a.alphaWords, hasSpeaker: speaker != nil, text: rest),
                                 confidence: conf, validRatio: a.validRatio, wordCount: a.alphaWords, rightLimit: nil)
             piece.speakerLabel = label
             piece.knownInData = known
@@ -1102,9 +1158,25 @@ enum StyleSampler {
         // Chữ thường chiếm ít điểm ảnh hơn nền
         let textIsBright = hi.3 <= lo.3
         let textFrac = Double(textIsBright ? hi.3 : lo.3) / Double(n)
-        return SSStyle(textRGB: textIsBright ? hiC : loC,
-                       backgroundRGB: textIsBright ? loC : hiC,
-                       isBold: textFrac > 0.22)
+        let textC = textIsBright ? hiC : loC
+        let bgC = textIsBright ? loC : hiC
+        let lt = SSStyle.luminance(textC), lb = SSStyle.luminance(bgC)
+        var style = SSStyle(textRGB: textC, backgroundRGB: bgC, isBold: textFrac > 0.22)
+        // Tương đối (không dùng ngưỡng sáng tuyệt đối): cảnh đêm tờ giấy rất tối nhưng mực vẫn tối hơn giấy
+        style.darkOnLight = !textIsBright && (lb - lt) >= 0.05 && lb >= lt * 1.5
+        return style
+    }
+
+    /// 1.17: Chữ nằm trên TỜ GIẤY / THƯ / BIỂN BÁO: mực tối trên nền sáng, và vùng xung quanh khối chữ
+    /// cũng là mặt nền sáng đồng màu (mặt giấy). Chữ giao diện game thường là chữ sáng trên nền tối.
+    static func isPaperText(frame: CGImage, rect: CGRect, style: SSStyle) -> Bool {
+        guard style.darkOnLight else { return false }
+        let padX = max(0.02, rect.width * 0.12), padY = max(0.02, rect.height * 0.6)
+        let ring = rect.insetBy(dx: -padX, dy: -padY).intersection(CGRect(x: 0, y: 0, width: 1, height: 1))
+        let around = sample(frame: frame, rect: ring)
+        // Vùng mở rộng (mặt giấy quanh chữ) vẫn có phần tối chiếm thiểu số và tối hơn hẳn phần nền
+        let la = SSStyle.luminance(around.backgroundRGB), lt = SSStyle.luminance(around.textRGB)
+        return la >= lt * 1.3 && (la - lt) >= 0.04
     }
 
     /// Ảnh xám rất nhỏ của vùng chữ để phát hiện chữ gốc đã biến mất
@@ -1159,6 +1231,18 @@ final class TrackedPiece {
     var lockedFontPx: CGFloat?
     /// Khoá chữ đã gửi AI (OCR có thể đọc hơi khác ở lần sau)
     var requestKey: String?
+    /// 1.16: số lần chữ DI CHUYỂN theo máy quay (chữ trên vật phẩm / biển báo trong game)
+    var moveEvents = 0
+    /// 1.17: chữ in trên giấy / thư / biển báo (mực tối trên nền sáng)
+    var isPaper = false
+
+    /// Chữ dính vào vật thể 3D: di chuyển ở phần lớn các lần quét -> không dịch
+    var isWorldText: Bool {
+        guard piece.category != .dialogue, piece.speaker == nil else { return false }
+        if isPaper { return true }
+        guard !piece.knownInData else { return false }
+        return moveEvents >= 1 && moveEvents * 2 >= max(1, hits - 1)
+    }
 
     init(id: String, order: Int, key: String, piece: SSPiece) {
         self.id = id
@@ -1191,7 +1275,7 @@ final class TrackedPiece {
     }
 
     func isVisible(at now: Date) -> Bool {
-        guard translation != nil, isConfirmed else { return false }
+        guard translation != nil, isConfirmed, !isWorldText else { return false }
         if let until = holdUntil() { return now < until }
         return true
     }
@@ -1269,13 +1353,20 @@ enum SubtitleLayoutEngine {
 
             if p.category == .dialogue {
                 // ---- Lời thoại: cỡ chữ + đáy dòng cố định, căn giữa, mọc lên trên ----
-                fontPx = stabilizer.dialogueFontPx ?? observedFont
+                // 1.16: chỉ dùng cỡ chữ / đáy dòng cố định khi chữ nằm đúng vùng phụ đề quen thuộc
+                if let f = stabilizer.dialogueFontPx, abs(f - observedFont) / observedFont < 0.35 {
+                    fontPx = f
+                } else {
+                    fontPx = observedFont
+                }
                 let padX = fontPx * 0.35, padY = fontPx * 0.18
                 let cx = abs(p.rect.midX - 0.5) < 0.12 ? refW / 2 : o.midX
                 let maxW = min(refW * 0.9, 2 * (min(cx, refW - cx) - 6))
                 let size = measure(display, fontPx: fontPx, width: maxW - padX * 2)
                 let boxW = min(maxW, max(size.width * 1.04 + padX * 2 + 2, o.width + padX * 2))
-                var bottom = (stabilizer.dialogueBottomPx ?? o.maxY) + padY
+                let lineHpx = o.height / CGFloat(max(1, p.lineCount))
+                var bottom = o.maxY + padY
+                if let sb = stabilizer.dialogueBottomPx, abs(sb - o.maxY) < lineHpx * 1.2 { bottom = sb + padY }
                 bottom = max(bottom, o.maxY + padY)
                 let boxH = max(size.height + padY * 2, bottom - (o.minY - padY))
                 boxRect = CGRect(x: cx - boxW / 2, y: bottom - boxH, width: boxW, height: boxH)
@@ -1364,10 +1455,16 @@ final class SmartSubtitleEngine {
     var engineMode: TranslationEngineMode = .appleThenGoogle
     /// Tên game đang chơi (ngữ cảnh cho AI)
     var gameTitle: String = ""
+    /// 1.17: không dịch chữ trên giấy / thư / biển báo (mực tối trên nền sáng)
+    var skipPaperText = true
     private var frameRefW: CGFloat = 1280
     private var recentDialogue: [String] = []
     /// Gọi khi bản dịch AI về muộn -> cập nhật khung ngay không đợi lần quét sau
     var onAsyncUpdate: (([TranslatedBox]) -> Void)?
+    /// 1.19: Log quét chữ cho màn hình chính (DATA / AI / RÁC). Gọi trên luồng nền.
+    var onScanLog: (([ScanLogItem]) -> Void)?
+    /// 1.19: Tên riêng trong data Việt hoá đang dùng (giữ nguyên khi dịch)
+    var knownNames: [String] { memory.names.sorted() }
 
     func loadDatabase(url: URL) -> TranslationDBReport {
         let rep = memory.load(url: url)
@@ -1407,8 +1504,50 @@ final class SmartSubtitleEngine {
                     return "\(src) \(t.piece.sourceText)"
                 }.joined(separator: " | ")
             }
+            if let logCB = self.onScanLog {
+                logCB(self.buildScanLog(lines: lines, pieces: pieces, present: present))
+            }
             completion(boxes, summary)
         }
+    }
+
+    /// 1.19: Gom kết quả 1 lần quét thành các dòng log: câu khớp data, câu dịch AI, chữ rác bị bỏ qua (kèm lý do)
+    private func buildScanLog(lines: [SSLine], pieces: [SSPiece], present: [TrackedPiece]) -> [ScanLogItem] {
+        var items: [ScanLogItem] = []
+        for t in present {
+            let src = t.piece.sourceText
+            if t.isPaper {
+                items.append(ScanLogItem(key: t.key, kind: .trash, source: src, translation: nil, note: "Bỏ qua: chữ trên giấy / thư / biển báo"))
+            } else if t.isWorldText {
+                items.append(ScanLogItem(key: t.key, kind: .trash, source: src, translation: nil, note: "Bỏ qua: chữ dính vật thể trong game"))
+            } else if let vi = t.translation {
+                items.append(ScanLogItem(key: t.key, kind: t.fromDatabase ? .data : .ai, source: src, translation: vi, note: nil))
+            } else if t.aiPending {
+                items.append(ScanLogItem(key: t.key, kind: .pending, source: src, translation: nil, note: "AI đang dịch…"))
+            } else {
+                items.append(ScanLogItem(key: t.key, kind: .missing, source: src, translation: nil,
+                                         note: "Không có trong data, AI đang tắt hoặc chưa dịch được"))
+            }
+        }
+        // Dòng OCR không thành câu cần dịch = chữ rác / HUD / nút bấm
+        let pieceText = pieces.map { TranslationMemory.normalize($0.sourceText) }.joined(separator: " | ")
+        for line in lines {
+            guard !TranslationMemory.hasVietnameseMarks(line.text) else { continue }
+            let key = TranslationMemory.normalize(line.text)
+            guard key.count >= 2, !pieceText.contains(key) else { continue }
+            items.append(ScanLogItem(key: "trash|" + key, kind: .trash, source: line.text, translation: nil,
+                                     note: "Bỏ qua: " + Self.trashReason(line)))
+        }
+        return items
+    }
+
+    private static func trashReason(_ line: SSLine) -> String {
+        if line.confidence < 0.45 { return "OCR mờ, không chắc chữ" }
+        let hPx = line.rect.height * PieceBuilder.refH
+        if hPx < 7.5 { return "chữ quá nhỏ (số / HUD)" }
+        if hPx > 50 { return "chữ quá to (tiêu đề / tên)" }
+        if line.skewDegrees > 3.0 || line.shearRatio > 0.22 { return "chữ nghiêng trên vật thể 3D" }
+        return "ký tự rác / nút bấm / tên riêng"
     }
 
     func reset() {
@@ -1420,7 +1559,19 @@ final class SmartSubtitleEngine {
 
     /// Khung đang hiện: khung đã "hết chữ gốc" (đang giữ) sẽ nhường chỗ cho câu mới ở cùng vị trí
     private func visibleItems(now: Date) -> [TrackedPiece] {
-        let candidates = tracked.filter { $0.isVisible(at: now) }.sorted { $0.createdOrder > $1.createdOrder }
+        var candidates = tracked.filter { $0.isVisible(at: now) }.sorted { $0.createdOrder > $1.createdOrder }
+        // 1.17: Cùng nội dung xuất hiện 2 lần (tờ thư + bảng chữ giao diện): chỉ dịch bản chữ SÁNG (giao diện)
+        if skipPaperText {
+            let present = tracked.filter { $0.goneAt == nil }
+            candidates.removeAll { t in
+                guard t.style.darkOnLight, t.piece.category != .dialogue, t.piece.speaker == nil else { return false }
+                let tk = t.key.split(separator: " ").map(String.init)
+                return present.contains { o in
+                    o !== t && !o.style.darkOnLight
+                        && TranslationMemory.similarity(tk, o.key.split(separator: " ").map(String.init)) >= 0.6
+                }
+            }
+        }
         var out: [TrackedPiece] = []
         for t in candidates {
             let r = t.piece.rect.insetBy(dx: -0.01, dy: -0.02)
@@ -1476,11 +1627,18 @@ final class SmartSubtitleEngine {
                 let r = t.piece.rect, n = piece.rect
                 let moved = abs(r.minX - n.minX) > 0.012 || abs(r.minY - n.minY) > 0.012
                     || abs(r.width - n.width) > 0.03 || abs(r.height - n.height) > 0.02
+                // Cả khối dịch chuyển (không chỉ OCR rung khung) -> chữ đang trôi theo máy quay
+                if abs(r.midX - n.midX) > 0.015 && abs(r.midY - n.midY) > 0.004 || abs(r.midY - n.midY) > 0.015 {
+                    t.moveEvents += 1
+                }
                 var updated = piece
                 if !moved { updated.rect = r }   // giữ nguyên vị trí -> khung không rung
                 if t.piece.speakerLabel != nil && updated.speakerLabel == nil { updated.speakerLabel = t.piece.speakerLabel }
                 t.piece = updated
-                if moved { t.style = StyleSampler.sample(frame: frame, rect: piece.rect) }
+                if moved {
+                    t.style = StyleSampler.sample(frame: frame, rect: piece.rect)
+                    t.isPaper = skipPaperText && StyleSampler.isPaperText(frame: frame, rect: piece.rect, style: t.style)
+                }
                 t.thumb = StyleSampler.thumbnail(frame: frame, rect: t.piece.rect)
                 if t.key != key {
                     let oldTokens = t.key.split(separator: " ").map(String.init)
@@ -1501,7 +1659,14 @@ final class SmartSubtitleEngine {
                 let t = TrackedPiece(id: "ss\(nextID)", order: nextID, key: key, piece: piece)
                 nextID += 1
                 t.style = StyleSampler.sample(frame: frame, rect: piece.rect)
+                t.isPaper = skipPaperText && StyleSampler.isPaperText(frame: frame, rect: piece.rect, style: t.style)
                 t.thumb = StyleSampler.thumbnail(frame: frame, rect: piece.rect)
+                if t.isPaper {
+                    // Không dịch chữ trên giấy -> không tốn lượt AI
+                    tracked.append(t)
+                    matchedIDs.insert(t.id)
+                    continue
+                }
                 if let m = dbMatch {
                     t.translation = m.vi
                     t.fromDatabase = true
@@ -1537,6 +1702,7 @@ final class SmartSubtitleEngine {
     }
 
     private func translate(_ t: TrackedPiece) {
+        guard !t.isPaper else { return }
         let src = t.piece.sourceText
         if let m = memory.lookupMatch(src) {
             t.translation = m.vi
@@ -1571,7 +1737,7 @@ final class SmartSubtitleEngine {
         let aiSource = allCaps ? sentenceCase(src) : src
         // Tên riêng: tên có sẵn + từ viết hoa giữa câu không có trong từ điển tiếng Anh
         var protected: [String] = []
-        let words = aiSource.split(separator: " ").map { String($0).trimmingCharacters(in: .punctuationCharacters) }
+        let words = aiSource.split(separator: " ").map { GameTextFilter.stripPossessive(String($0).trimmingCharacters(in: .punctuationCharacters)) }
         for (i, w) in words.enumerated() where !w.isEmpty {
             if filter.isName(w) || (i > 0 && GameTextFilter.isProperNounCandidate(w) && !filter.isEnglishWord(w.lowercased())) {
                 if !protected.contains(w) { protected.append(w) }
@@ -1653,7 +1819,7 @@ final class SmartSubtitleEngine {
         var words = lower.split(separator: " ", omittingEmptySubsequences: false).map(String.init)
         for (i, w) in words.enumerated() {
             let core = w.trimmingCharacters(in: .punctuationCharacters)
-            if core == "i" || core.hasPrefix("i'") || filter.isName(core) || i == 0 {
+            if core == "i" || core.hasPrefix("i'") || filter.isName(GameTextFilter.stripPossessive(core)) || i == 0 {
                 if let f = w.firstIndex(where: { $0.isLetter }) {
                     words[i] = w.replacingCharacters(in: f...f, with: String(w[f]).uppercased())
                 }

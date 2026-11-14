@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<widget xmlns="http://www.w3.org/ns/widgets" xmlns:tizen="http://tizen.org/ns/widgets" id="CTSubV0001.ConsoleTranslatorV" version="1.0.19" viewmodes="fullscreen">
+    <tizen:application id="CTSubV0001.ConsoleTranslatorV" package="CTSubV0001" required_version="3.0"/>
+    <access origin="*" subdomains="true"/>
+    <tizen:privilege name="http://tizen.org/privilege/tv.window"/>
+    <tizen:privilege name="http://tizen.org/privilege/internet"/>
+    <tizen:privilege name="http://tizen.org/privilege/network.get"/>
+    <tizen:setting screen-orientation="landscape" context-menu="disable" background-support="disable" encryption="disable" install-location="auto" hwkey-event="enable"/>
+    <content src="index.html"/>
+    <icon src="icon.png"/>
+    <name>PS5 Translator TV</name>
+    <tizen:profile name="tv-common"/>
+</widget>

@@ -1,6 +1,6 @@
 // ============================================================================
 // FILE 6B: 6B_TranslatorViewsAndModals.swift (TÁCH TỪ FILE 6 - PHẦN 2/2)
-// PHIÊN BẢN: PS5Translator 1.12 (TAB YOUTUBE, XOAY NGANG, THƯ VIỆN GAME)
+// PHIÊN BẢN: PS5Translator 1.19 (GIAO DIỆN MỚI: TRANG CHỦ · GAME · THƯ VIỆN GAME, LOG QUÉT CHỮ)
 // ============================================================================
 
 import SwiftUI
@@ -13,203 +13,234 @@ import UniformTypeIdentifiers
 struct MainTranslatorView: View {
     @StateObject private var coord = PipelineCoordinator()
     @StateObject private var youtube = YouTubeTranslatorModel()
+    @State private var section: MainSection = .home
     @State private var showPS5ConnectSheet = false
-    @State private var showGameProfilesSheet = false
-    @State private var showROICalibrationPanel = false
-
-    private let psDarkBg = Color(red: 0.02, green: 0.04, blue: 0.09)
-    private let psBluePrimary = Color(red: 0.0, green: 0.26, blue: 0.61)
-    private let psNeonAccent = Color(red: 0.0, green: 0.44, blue: 0.82)
+    @State private var showSettings = false
+    @State private var showLogHistory = false
 
     var body: some View {
+        let fullscreen = coord.isLandscapeFullscreen
         ZStack {
-            LinearGradient(
-                gradient: Gradient(colors: [psDarkBg, Color(red: 0.04, green: 0.09, blue: 0.20), psDarkBg]),
-                startPoint: .topLeading,
-                endPoint: .bottomTrailing
-            )
-            .ignoresSafeArea()
+            MQBackground()
 
-            // 1.12: 2 tab (Remote PS5 / Dịch YouTube) + chế độ xoay ngang toàn màn hình
+            // 1.19: Trang chủ · Game · Thư viện Game (thanh tab dưới), chế độ xoay ngang toàn màn hình giữ như cũ
             VStack(spacing: 0) {
-                if !coord.isLandscapeFullscreen {
-                    appTabPicker
+                if !fullscreen && section == .home {
+                    homeHeader
+                    modeSegmentRow
                 }
-                if coord.activeTab == .youtube {
+                if coord.activeTab == .youtube && section == .home {
                     YouTubeTranslatorTab(model: youtube, coord: coord)
-                        .ignoresSafeArea(edges: coord.isLandscapeFullscreen ? .all : [])
-                } else if coord.isLandscapeFullscreen {
+                        .ignoresSafeArea(edges: fullscreen ? .all : [])
+                } else if fullscreen {
                     PS5FullscreenView(coord: coord, videoMgr: coord.videoMgr)
                 } else {
-                    ScrollView(.vertical, showsIndicators: false) {
-                        VStack(spacing: 11) {
-                            topPlayStationBar
-                            ps5ScreenViewport
-                            liveOCRAndTVTestStrip
-                            bottomDualSenseControlBar
-                        }
-                        .padding(.top, 6)
-                        .padding(.bottom, 16)
+                    switch section {
+                    case .home:
+                        ps5Home
+                    case .game:
+                        GamePlayingView(
+                            coord: coord,
+                            onPlay: {
+                                coord.activeTab = .ps5
+                                withAnimation { section = .home }
+                            },
+                            onChangeGame: { withAnimation { section = .library } }
+                        )
+                    case .library:
+                        GameLibraryView(coord: coord, onPicked: { withAnimation { section = .game } })
                     }
+                }
+            }
+            .safeAreaInset(edge: .bottom, spacing: 0) {
+                if !fullscreen {
+                    MQTabBar(selection: $section)
                 }
             }
         }
         .preferredColorScheme(.dark)
-        .statusBarHidden(coord.isLandscapeFullscreen)
+        .tint(.white)
+        .statusBarHidden(fullscreen)
+        .onChange(of: coord.isLandscapeFullscreen) { on in
+            if on { section = .home }
+        }
         .sheet(isPresented: $showPS5ConnectSheet) {
             PS5ConnectionWizardView(coord: coord)
         }
-        .sheet(isPresented: $showGameProfilesSheet) {
-            GameLibraryView(coord: coord)
+        .sheet(isPresented: $showSettings) {
+            MQSettingsSheet(coord: coord, videoMgr: coord.videoMgr, server: coord.server)
+        }
+        .sheet(isPresented: $showLogHistory) {
+            ScanLogHistorySheet(coord: coord)
         }
     }
 
-    private var appTabPicker: some View {
-        HStack(spacing: 6) {
-            ForEach(AppTab.allCases) { tab in
-                Button(action: {
-                    withAnimation(.easeInOut(duration: 0.15)) { coord.activeTab = tab }
-                }) {
-                    Label(tab.title, systemImage: tab.icon)
-                        .font(.system(size: 13, weight: .bold))
-                        .frame(maxWidth: .infinity)
-                        .padding(.vertical, 8)
-                        .background(coord.activeTab == tab ? psNeonAccent : Color.white.opacity(0.06))
-                        .foregroundColor(.white)
-                        .cornerRadius(10)
+    // MARK: Thanh đầu: logo MQ · Dịch YouTube · Cài đặt
+
+    private var homeHeader: some View {
+        HStack(spacing: 10) {
+            MQLogoView(height: 46)
+            Spacer(minLength: 6)
+            Button(action: {
+                withAnimation(.easeInOut(duration: 0.15)) {
+                    coord.activeTab = coord.activeTab == .youtube ? .ps5 : .youtube
                 }
-                .buttonStyle(.plain)
+            }) {
+                HStack(spacing: 8) {
+                    Image(systemName: "play.rectangle.fill")
+                        .font(.system(size: 17, weight: .semibold))
+                    Text("Dịch YouTube")
+                        .font(.system(size: 14, weight: .semibold))
+                        .lineLimit(1)
+                }
+                .padding(.horizontal, 14)
+                .frame(height: 40)
+                .mqPill(coord.activeTab == .youtube)
             }
-            Button(action: { showGameProfilesSheet = true }) {
-                Image(systemName: "books.vertical.fill")
-                    .font(.system(size: 14, weight: .bold))
-                    .padding(9)
-                    .background(Color.white.opacity(0.08))
-                    .foregroundColor(.cyan)
-                    .cornerRadius(10)
+            .buttonStyle(.plain)
+
+            Button(action: { showSettings = true }) {
+                Image(systemName: "gearshape.fill")
+                    .font(.system(size: 17, weight: .semibold))
+                    .frame(width: 40, height: 40)
+                    .mqPill(false)
             }
             .buttonStyle(.plain)
         }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 6)
+        .padding(.horizontal, 16)
+        .padding(.top, 4)
+        .padding(.bottom, 8)
     }
 
-    private var topPlayStationBar: some View {
-        HStack(spacing: 10) {
-            HStack(spacing: 8) {
-                Image(systemName: "gamecontroller.fill")
-                    .font(.system(size: 18, weight: .bold))
-                    .foregroundColor(.white)
-                    .padding(8)
-                    .background(psNeonAccent)
-                    .clipShape(Circle())
+    // MARK: Remote PS5 · TV · Kết nối PS5 (gộp Liên kết máy PS5 vào đây)
 
-                VStack(alignment: .leading, spacing: 2) {
-                    Text(TranslatorV102Config.appVersionName)
-                        .font(.system(size: 15, weight: .bold))
-                        .foregroundColor(.white)
-                    HStack(spacing: 5) {
-                        Circle()
-                            .fill(coord.videoMgr.isConnectedToPS5 ? Color.green : (coord.videoMgr.isAccountRemembered ? Color.cyan : Color.orange))
-                            .frame(width: 7, height: 7)
-                        Text(coord.videoMgr.isConnectedToPS5
-                             ? "Chiaki Live: \(coord.videoMgr.ps5HostIP)"
-                             : (coord.videoMgr.isAccountRemembered ? "Đã nhớ TK: \(coord.videoMgr.psnUsername)" : "Chưa nối PS5"))
-                            .font(.system(size: 11, weight: .medium))
-                            .foregroundColor(.white.opacity(0.85))
+    private var modeSegmentRow: some View {
+        HStack(spacing: 6) {
+            Button(action: { withAnimation(.easeInOut(duration: 0.15)) { coord.activeTab = .ps5 } }) {
+                segLabel("Remote PS5", icon: "gamecontroller.fill")
+                    .mqPill(coord.activeTab == .ps5)
+            }
+            .buttonStyle(.plain)
+
+            MQObserve(coord.server) { server in
+                HStack(spacing: 6) {
+                    Image(systemName: "tv")
+                        .font(.system(size: 14, weight: .semibold))
+                    Text("TV: \(server.connectedCount)")
+                        .font(.system(size: 13, weight: .semibold))
+                        .lineLimit(1)
+                    if server.connectedCount > 0 {
+                        Circle().fill(Color.white).frame(width: 6, height: 6)
                     }
                 }
+                .foregroundColor(server.connectedCount > 0 ? .white : MQTheme.secondary)
+                .frame(maxWidth: .infinity)
+                .frame(height: 42)
             }
 
-            Spacer()
-
-            HStack(spacing: 4) {
-                Image(systemName: "tv.fill")
-                    .font(.caption2)
-                Text("TV: \(coord.server.connectedCount)")
-                    .font(.caption.bold())
-            }
-            .padding(.horizontal, 10)
-            .padding(.vertical, 6)
-            .background(coord.server.connectedCount > 0 ? Color.green.opacity(0.25) : Color.white.opacity(0.1))
-            .foregroundColor(coord.server.connectedCount > 0 ? .green : .white)
-            .clipShape(Capsule())
-
-            Button(action: { showPS5ConnectSheet = true }) {
-                HStack(spacing: 4) {
-                    Image(systemName: "link.badge.plus")
-                    Text(coord.videoMgr.isConnectedToPS5 ? "Đổi PS5" : "Kết nối PS5")
-                        .font(.caption.bold())
+            MQObserve(coord.videoMgr) { videoMgr in
+                Button(action: { showPS5ConnectSheet = true }) {
+                    segLabel(videoMgr.isConnectedToPS5 ? "Đổi PS5" : "Kết nối PS5", icon: "link")
+                        .foregroundColor(.white)
+                        .contentShape(Capsule())
                 }
-                .padding(.horizontal, 12)
-                .padding(.vertical, 7)
-                .background(psNeonAccent)
-                .foregroundColor(.white)
-                .clipShape(Capsule())
+                .buttonStyle(.plain)
             }
         }
+        .padding(5)
+        .background(Capsule().fill(Color.white.opacity(0.06)))
+        .overlay(Capsule().stroke(MQTheme.hairline, lineWidth: 1))
         .padding(.horizontal, 14)
+        .padding(.bottom, 10)
+    }
+
+    private func segLabel(_ title: String, icon: String) -> some View {
+        HStack(spacing: 7) {
+            Image(systemName: icon)
+                .font(.system(size: 14, weight: .semibold))
+            Text(title)
+                .font(.system(size: 13, weight: .semibold))
+                .lineLimit(1)
+                .minimumScaleFactor(0.8)
+        }
+        .frame(maxWidth: .infinity)
+        .frame(height: 42)
+    }
+
+    // MARK: Nội dung Trang chủ (Remote PS5)
+
+    private var ps5Home: some View {
+        ScrollView(.vertical, showsIndicators: false) {
+            VStack(spacing: 12) {
+                statusRow
+                ps5ScreenViewport
+                ScanLogPanel(coord: coord, onShowAll: { showLogHistory = true })
+                controlsCard
+            }
+            .padding(.top, 2)
+            .padding(.bottom, 16)
+        }
+    }
+
+    private var statusRow: some View {
+        MQObserve(coord.videoMgr) { _ in statusRowContent }
+    }
+
+    private var statusRowContent: some View {
+        Button(action: { showPS5ConnectSheet = true }) {
+            HStack(spacing: 12) {
+                Circle()
+                    .fill(coord.videoMgr.isConnectedToPS5 ? Color.green : (coord.videoMgr.isAccountRemembered ? Color.white : Color.orange))
+                    .frame(width: 9, height: 9)
+                    .shadow(color: (coord.videoMgr.isConnectedToPS5 ? Color.green : Color.white).opacity(0.7), radius: 4)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(TranslatorV102Config.appVersionName)
+                        .font(.system(size: 16, weight: .bold))
+                        .foregroundColor(.white)
+                    Text(statusSubtitle)
+                        .font(.system(size: 13))
+                        .foregroundColor(MQTheme.secondary)
+                        .lineLimit(1)
+                }
+                Spacer()
+                Image(systemName: "chevron.right")
+                    .font(.system(size: 14, weight: .semibold))
+                    .foregroundColor(MQTheme.secondary)
+            }
+            .padding(.horizontal, 20)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+    }
+
+    private var statusSubtitle: String {
+        let ps5: String
+        if coord.videoMgr.isConnectedToPS5 {
+            ps5 = "Chiaki Live: \(coord.videoMgr.ps5HostIP)"
+        } else if coord.videoMgr.isAccountRemembered {
+            ps5 = "Đã nhớ TK: \(coord.videoMgr.psnUsername)"
+        } else {
+            ps5 = "Chưa nối PS5"
+        }
+        return "\(ps5) · Đang chơi: \(coord.activeProfileFolderName)"
     }
 
     private var ps5ScreenViewport: some View {
+        MQObserve(coord.videoMgr) { videoMgr in
+            viewportContent(videoMgr)
+        }
+    }
+
+    private func viewportContent(_ videoMgr: VideoSourceManager) -> some View {
         ZStack {
-            if let img = coord.videoMgr.currentFullFrame {
+            if let img = videoMgr.currentFullFrame {
                 Image(uiImage: UIImage(cgImage: img))
                     .resizable()
                     .aspectRatio(16/9, contentMode: .fit)
                     .overlay(
                         GeometryReader { geo in
                             ZStack {
-                                if coord.showROIGuideBox {
-                                    let roi = coord.videoMgr.getNormalizedROIRect(for: coord.roiMode)
-                                    ZStack(alignment: .topLeading) {
-                                        RoundedRectangle(cornerRadius: 8)
-                                            .stroke(
-                                                style: StrokeStyle(
-                                                    lineWidth: coord.roiMode == .fullScreen ? 1.4 : 2.2,
-                                                    dash: [6, 4]
-                                                )
-                                            )
-                                            .foregroundColor(coord.roiMode == .fullScreen ? .cyan.opacity(0.55) : .cyan)
-                                            .background(Color.cyan.opacity(coord.roiMode == .fullScreen ? 0.0 : 0.05))
-
-                                        if coord.roiMode != .fullScreen {
-                                            Text("ROI: \(coord.roiMode.rawValue) (Chạm kéo để di chuyển)")
-                                                .font(.system(size: 9, weight: .bold))
-                                                .foregroundColor(.black)
-                                                .padding(.horizontal, 6)
-                                                .padding(.vertical, 2)
-                                                .background(Color.cyan)
-                                                .cornerRadius(4)
-                                                .padding(4)
-                                        }
-                                    }
-                                    .frame(
-                                        width: roi.size.width * geo.size.width,
-                                        height: roi.size.height * geo.size.height
-                                    )
-                                    .position(
-                                        x: (roi.origin.x + roi.size.width / 2) * geo.size.width,
-                                        y: (roi.origin.y + roi.size.height / 2) * geo.size.height
-                                    )
-                                    .gesture(
-                                        DragGesture()
-                                            .onChanged { value in
-                                                guard coord.roiMode != .fullScreen else { return }
-                                                let newX = (value.location.x / geo.size.width) - (roi.size.width / 2)
-                                                let newY = (value.location.y / geo.size.height) - (roi.size.height / 2)
-                                                let updated = CGRect(
-                                                    x: newX,
-                                                    y: newY,
-                                                    width: roi.size.width,
-                                                    height: roi.size.height
-                                                )
-                                                coord.videoMgr.updateCustomROIRect(for: coord.roiMode, newRect: updated)
-                                            }
-                                    )
-                                }
-
-                                // 1.11: Khung dịch neo đúng vị trí chữ gốc, cùng cỡ chữ / màu chữ / màu nền
+                                // Khung dịch neo đúng vị trí chữ gốc, cùng cỡ chữ / màu chữ / màu nền
                                 ForEach(coord.translatedBoxes) { box in
                                     TranslatedSubtitleBoxView(box: box, frameSize: geo.size)
                                 }
@@ -217,306 +248,94 @@ struct MainTranslatorView: View {
                         }
                     )
             } else {
-                VStack(spacing: 10) {
-                    ProgressView()
-                    Text("Đang khởi tạo luồng hình Chiaki PS5...")
-                        .font(.caption)
-                        .foregroundColor(.gray)
+                VStack(spacing: 8) {
+                    Image(systemName: "viewfinder")
+                        .font(.system(size: 30, weight: .light))
+                    Text("Quét màn hình để dịch")
+                        .font(.system(size: 17, weight: .semibold))
+                    Text(videoMgr.isConnectedToPS5 ? "Đang chờ luồng hình từ PS5..." : "(Màn hình PS5 được truyền về iPhone)")
+                        .font(.system(size: 12))
+                        .foregroundColor(MQTheme.tertiary)
                 }
+                .foregroundColor(Color.white.opacity(0.85))
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .overlay(
+                    RoundedRectangle(cornerRadius: 17, style: .continuous)
+                        .stroke(style: StrokeStyle(lineWidth: 1.2, dash: [6, 5]))
+                        .foregroundColor(Color.white.opacity(0.22))
+                        .padding(8)
+                )
             }
         }
         .aspectRatio(16/9, contentMode: .fit)
-        .background(Color.black)
-        .cornerRadius(14)
+        .background(Color.black.opacity(0.6))
+        .clipShape(RoundedRectangle(cornerRadius: 24, style: .continuous))
         .overlay(
-            RoundedRectangle(cornerRadius: 14)
-                .stroke(
-                    LinearGradient(
-                        colors: [psNeonAccent.opacity(0.9), Color.cyan.opacity(0.3), psBluePrimary],
-                        startPoint: .topLeading,
-                        endPoint: .bottomTrailing
-                    ),
-                    lineWidth: 2
-                )
+            RoundedRectangle(cornerRadius: 24, style: .continuous)
+                .stroke(Color.white.opacity(0.14), lineWidth: 1)
         )
-        .shadow(color: psNeonAccent.opacity(0.35), radius: 12, x: 0, y: 4)
-        .padding(.horizontal, 12)
-    }
-
-    private func calculateMatchingFontSize(boxWidth: CGFloat, boxHeight: CGFloat, text: String) -> CGFloat {
-        let estimatedLines: CGFloat = (boxHeight > 34 && text.count > 42) ? 2.0 : 1.0
-        let singleLineHeight = boxHeight / estimatedLines
-        let rawFontSize = singleLineHeight * 0.78
-        return max(9.5, min(18.0, rawFontSize))
-    }
-
-    private var liveOCRAndTVTestStrip: some View {
-        HStack(spacing: 8) {
-            Image(systemName: coord.isShowingTVTestSentence ? "tv.and.mediabox.fill" : "viewfinder")
-                .foregroundColor(coord.isShowingTVTestSentence ? .green : .cyan)
-
-            Text(coord.isShowingTVTestSentence ? "TV Test: \(TranslatorV102Config.tvTestSentence)" : "Quét (\(coord.translatedBoxes.count) vùng): \(coord.lastRecognizedEnglish)")
-                .font(.system(size: 12, weight: .medium))
-                .foregroundColor(.white.opacity(0.92))
-                .lineLimit(1)
-
-            Spacer()
-
+        .overlay(
             Button(action: { coord.isLandscapeFullscreen = true }) {
                 Image(systemName: "arrow.up.left.and.arrow.down.right")
-                    .font(.system(size: 12, weight: .bold))
-                    .padding(6)
-                    .background(Color.white.opacity(0.12))
+                    .font(.system(size: 13, weight: .bold))
+                    .frame(width: 32, height: 32)
+                    .background(Circle().fill(.ultraThinMaterial))
                     .foregroundColor(.white)
-                    .cornerRadius(7)
             }
-
-            Button(action: {
-                coord.triggerTVTestSentence()
-            }) {
-                HStack(spacing: 4) {
-                    Image(systemName: "tv.badge.wifi")
-                    Text("Test phụ đề TV")
-                        .font(.system(size: 11, weight: .bold))
-                }
-                .padding(.horizontal, 10)
-                .padding(.vertical, 5)
-                .background(coord.isShowingTVTestSentence ? Color.green : psNeonAccent)
-                .foregroundColor(.white)
-                .cornerRadius(7)
-            }
-        }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 8)
-        .background(Color.white.opacity(0.06))
-        .cornerRadius(10)
-        .padding(.horizontal, 12)
+            .padding(10),
+            alignment: .topTrailing
+        )
+        .shadow(color: Color.black.opacity(0.45), radius: 14, x: 0, y: 6)
+        .padding(.horizontal, 14)
     }
 
-    private var bottomDualSenseControlBar: some View {
-        VStack(spacing: 11) {
-            HStack {
-                Text("Vùng quét chữ:")
-                    .font(.caption.bold())
-                    .foregroundColor(.white.opacity(0.85))
+    // MARK: Tốc độ quét · Dịch AI (đã bỏ "Vùng quét chữ": app luôn dịch toàn màn hình)
 
-                Picker("Chế độ quét ROI", selection: $coord.roiMode) {
-                    ForEach(ROIMode.allCases, id: \.self) { mode in
-                        Text(mode.rawValue).tag(mode)
-                    }
-                }
-                .pickerStyle(SegmentedPickerStyle())
-
-                Toggle("", isOn: $coord.showROIGuideBox)
-                    .labelsHidden()
-            }
-
-            if coord.roiMode != .fullScreen {
-                VStack(spacing: 8) {
-                    HStack {
-                        Label("Căn chỉnh khung ROI (\(coord.roiMode.rawValue))", systemImage: "crop")
-                            .font(.system(size: 12, weight: .bold))
-                            .foregroundColor(.cyan)
-                        Spacer()
-                        Button(action: {
-                            withAnimation { showROICalibrationPanel.toggle() }
-                        }) {
-                            Text(showROICalibrationPanel ? "Thu gọn" : "Mở thanh căn chỉnh")
-                                .font(.system(size: 11, weight: .bold))
-                                .padding(.horizontal, 8)
-                                .padding(.vertical, 4)
-                                .background(Color.cyan.opacity(0.2))
-                                .foregroundColor(.cyan)
-                                .cornerRadius(6)
-                        }
-
-                        Button(action: {
-                            coord.videoMgr.resetROIRectToDefault(for: coord.roiMode)
-                        }) {
-                            Text("Mặc định")
-                                .font(.system(size: 11, weight: .medium))
-                                .padding(.horizontal, 8)
-                                .padding(.vertical, 4)
-                                .background(Color.white.opacity(0.1))
-                                .foregroundColor(.white)
-                                .cornerRadius(6)
-                        }
-                    }
-
-                    if showROICalibrationPanel {
-                        roiCalibrationSlidersView
-                    }
-                }
-                .padding(10)
-                .background(Color.black.opacity(0.28))
-                .cornerRadius(10)
-            }
-
+    private var controlsCard: some View {
+        VStack(spacing: 0) {
             HStack(spacing: 10) {
-                HStack(spacing: 4) {
-                    Image(systemName: "speedometer")
-                        .foregroundColor(.cyan)
-                        .font(.caption)
-                    Text("Tốc độ quét: \(Int(coord.scanFPS)) FPS")
-                        .font(.caption.bold())
-                        .foregroundColor(.white)
-                        .frame(width: 115, alignment: .leading)
-                }
-
+                Image(systemName: "bolt.fill")
+                    .font(.system(size: 15, weight: .semibold))
+                    .frame(width: 22)
+                Text("Tốc độ quét: \(Int(coord.scanFPS)) FPS")
+                    .font(.system(size: 14, weight: .semibold))
+                    .fixedSize()
                 Slider(
                     value: $coord.scanFPS,
                     in: TranslatorV102Config.minScanFPS...TranslatorV102Config.maxScanFPS,
                     step: 1.0
                 )
-                .tint(psNeonAccent)
+                .tint(.white)
             }
+            .frame(height: 50)
 
-            HStack {
-                Image(systemName: "sparkles")
-                    .foregroundColor(.yellow)
-                VStack(alignment: .leading, spacing: 1) {
-                    Text("Dịch AI: \(coord.translationEngineMode.title)")
-                        .font(.system(size: 12, weight: .bold))
-                        .foregroundColor(.white)
-                    Text("Dịch câu chưa có trong data Việt hoá. Đổi bộ dịch trong Thư viện game.")
-                        .font(.system(size: 10))
-                        .foregroundColor(.white.opacity(0.7))
-                }
-                Spacer()
-                Toggle("", isOn: $coord.enableAppleIntelligenceFallback)
-                    .labelsHidden()
-                    .tint(.blue)
-            }
-            .padding(.horizontal, 10)
-            .padding(.vertical, 7)
-            .background(Color.white.opacity(0.06))
-            .cornerRadius(10)
+            Rectangle().fill(MQTheme.hairline).frame(height: 1)
 
             HStack(spacing: 10) {
-                Button(action: { showPS5ConnectSheet = true }) {
-                    HStack {
-                        Image(systemName: "play.tv.fill")
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text("Liên kết máy PS5")
-                                .font(.system(size: 13, weight: .bold))
-                            Text(coord.videoMgr.isAccountRemembered ? "Đã nhớ: \(coord.videoMgr.psnUsername)" : "Lõi Chiaki & Mã PIN")
-                                .font(.system(size: 10))
-                                .foregroundColor(.white.opacity(0.8))
-                        }
-                        Spacer()
-                    }
-                    .padding(10)
-                    .background(psBluePrimary.opacity(0.85))
-                    .foregroundColor(.white)
-                    .cornerRadius(12)
+                Image(systemName: "sparkles")
+                    .font(.system(size: 16, weight: .semibold))
+                    .frame(width: 22)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Dịch AI: \(coord.translationEngineMode.title)")
+                        .font(.system(size: 14, weight: .semibold))
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.8)
+                    Text("Dịch câu chưa có trong data Việt hoá. Đổi bộ dịch ở tab Game.")
+                        .font(.system(size: 12))
+                        .foregroundColor(MQTheme.tertiary)
+                        .lineLimit(2)
                 }
-
-                Button(action: { showGameProfilesSheet = true }) {
-                    HStack {
-                        Image(systemName: "folder.fill.badge.gearshape")
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text("Thư viện game")
-                                .font(.system(size: 13, weight: .bold))
-                            Text("\(coord.activeProfileFolderName) (\(coord.loadedLineCount) câu)")
-                                .font(.system(size: 10))
-                                .foregroundColor(.cyan)
-                                .lineLimit(1)
-                        }
-                        Spacer()
-                    }
-                    .padding(10)
-                    .background(Color.white.opacity(0.10))
-                    .foregroundColor(.white)
-                    .cornerRadius(12)
-                }
+                Spacer(minLength: 6)
+                Toggle("", isOn: $coord.enableAppleIntelligenceFallback)
+                    .labelsHidden()
+                    .tint(Color(white: 0.75))
             }
+            .padding(.vertical, 10)
         }
-        .padding(12)
-        .background(Color(red: 0.05, green: 0.10, blue: 0.22).opacity(0.92))
-        .cornerRadius(16)
-        .overlay(
-            RoundedRectangle(cornerRadius: 16)
-                .stroke(Color.white.opacity(0.12), lineWidth: 1)
-        )
-        .padding(.horizontal, 12)
-    }
-
-    private var roiCalibrationSlidersView: some View {
-        let currentRect = coord.videoMgr.getNormalizedROIRect(for: coord.roiMode)
-
-        return VStack(spacing: 6) {
-            HStack {
-                Text("Ngang (X): \(Int(currentRect.origin.x * 100))%")
-                    .font(.system(size: 11))
-                    .foregroundColor(.white.opacity(0.85))
-                    .frame(width: 95, alignment: .leading)
-                Slider(
-                    value: Binding(
-                        get: { Double(currentRect.origin.x) },
-                        set: { newX in
-                            var r = currentRect
-                            r.origin.x = CGFloat(newX)
-                            coord.videoMgr.updateCustomROIRect(for: coord.roiMode, newRect: r)
-                        }
-                    ),
-                    in: 0.02...0.80
-                )
-            }
-
-            HStack {
-                Text("Cao/Thấp (Y): \(Int(currentRect.origin.y * 100))%")
-                    .font(.system(size: 11))
-                    .foregroundColor(.white.opacity(0.85))
-                    .frame(width: 95, alignment: .leading)
-                Slider(
-                    value: Binding(
-                        get: { Double(currentRect.origin.y) },
-                        set: { newY in
-                            var r = currentRect
-                            r.origin.y = CGFloat(newY)
-                            coord.videoMgr.updateCustomROIRect(for: coord.roiMode, newRect: r)
-                        }
-                    ),
-                    in: 0.02...0.88
-                )
-            }
-
-            HStack {
-                Text("Độ rộng (W): \(Int(currentRect.size.width * 100))%")
-                    .font(.system(size: 11))
-                    .foregroundColor(.white.opacity(0.85))
-                    .frame(width: 95, alignment: .leading)
-                Slider(
-                    value: Binding(
-                        get: { Double(currentRect.size.width) },
-                        set: { newW in
-                            var r = currentRect
-                            r.size.width = CGFloat(newW)
-                            coord.videoMgr.updateCustomROIRect(for: coord.roiMode, newRect: r)
-                        }
-                    ),
-                    in: 0.20...0.96
-                )
-            }
-
-            HStack {
-                Text("Độ cao (H): \(Int(currentRect.size.height * 100))%")
-                    .font(.system(size: 11))
-                    .foregroundColor(.white.opacity(0.85))
-                    .frame(width: 95, alignment: .leading)
-                Slider(
-                    value: Binding(
-                        get: { Double(currentRect.size.height) },
-                        set: { newH in
-                            var r = currentRect
-                            r.size.height = CGFloat(newH)
-                            coord.videoMgr.updateCustomROIRect(for: coord.roiMode, newRect: r)
-                        }
-                    ),
-                    in: 0.08...0.90
-                )
-            }
-        }
+        .foregroundColor(.white)
+        .padding(.horizontal, 14)
+        .mqGlass(24)
+        .padding(.horizontal, 14)
     }
 }
 

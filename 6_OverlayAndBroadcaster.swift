@@ -22,7 +22,7 @@ import SQLite3
 // 1. THÔNG SỐ CẤU HÌNH PHIÊN BẢN PS5TRANSLATOR 1.02 (Đặt ở đầu file)
 // ============================================================================
 struct TranslatorV102Config {
-    static let appVersionName = "PS5Translator 1.15"
+    static let appVersionName = "PS5Translator 1.19"
     static let tvTestSentence = "phụ đề tiếng Việt như thế này"
     static let defaultScanFPS: Double = 6.0
     static let minScanFPS: Double = 1.0
@@ -442,15 +442,30 @@ class TVWebSocketServer: ObservableObject {
     @Published var ipAddress: String = "Đang lấy IP..."
     private var listener: NWListener?
     private var connections: [NWConnection] = []
+    private var readyConnections: Set<ObjectIdentifier> = []
+    /// 1.18: gói phụ đề cuối cùng -> TV vừa kết nối (hoặc kết nối lại) nhận ngay, không phải chờ câu mới
+    private var lastPayload: Data?
+    private var pingTimer: Timer?
+    private var ipTimer: Timer?
 
     init() {
-        ipAddress = getIP() ?? "192.168.1.15"
+        ipAddress = TVWebSocketServer.currentWiFiIP() ?? "Chưa có Wi-Fi"
         start()
+        // 1.18: "ping" mỗi 3 giây để TV biết kết nối còn sống (TV tự kết nối lại nếu im lặng > 10 giây)
+        pingTimer = Timer.scheduledTimer(withTimeInterval: 3.0, repeats: true) { [weak self] _ in
+            self?.sendControl(status: "ping")
+        }
+        ipTimer = Timer.scheduledTimer(withTimeInterval: 10.0, repeats: true) { [weak self] _ in
+            guard let self = self else { return }
+            let ip = TVWebSocketServer.currentWiFiIP() ?? "Chưa có Wi-Fi"
+            if ip != self.ipAddress { self.ipAddress = ip }
+        }
     }
 
     private func start() {
         do {
             let params = NWParameters.tcp
+            params.allowLocalEndpointReuse = true
             let wsOptions = NWProtocolWebSocket.Options()
             wsOptions.autoReplyPing = true
             params.defaultProtocolStack.applicationProtocols.insert(wsOptions, at: 0)
@@ -458,23 +473,89 @@ class TVWebSocketServer: ObservableObject {
             guard let port = NWEndpoint.Port(rawValue: AppConfig.webSocketPort) else { return }
             listener = try NWListener(using: params, on: port)
             listener?.newConnectionHandler = { [weak self] conn in
-                guard let self = self else { return }
-                self.connections.append(conn)
-                DispatchQueue.main.async { self.connectedCount = self.connections.count }
-                conn.stateUpdateHandler = { [weak self, weak conn] state in
-                    guard let self = self, let conn = conn else { return }
-                    switch state {
-                    case .failed, .cancelled:
-                        self.connections.removeAll(where: { $0 === conn })
-                        DispatchQueue.main.async { self.connectedCount = self.connections.count }
-                    default:
-                        break
-                    }
+                self?.accept(conn)
+            }
+            listener?.stateUpdateHandler = { [weak self] state in
+                // Cổng bị giữ / mạng đổi -> khởi động lại máy chủ sau 2 giây
+                if case .failed = state {
+                    self?.listener?.cancel()
+                    self?.listener = nil
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 2) { self?.start() }
                 }
-                conn.start(queue: .main)
             }
             listener?.start(queue: .main)
-        } catch {}
+        } catch {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in self?.start() }
+        }
+    }
+
+    private func accept(_ conn: NWConnection) {
+        connections.append(conn)
+        conn.stateUpdateHandler = { [weak self, weak conn] state in
+            guard let self = self, let conn = conn else { return }
+            switch state {
+            case .ready:
+                self.readyConnections.insert(ObjectIdentifier(conn))
+                self.connectedCount = self.readyConnections.count
+                // Chào để TV biết đúng là app PS5Translator (TV dùng gói này khi tự tìm iPhone)
+                self.send(self.controlData(status: "hello"), to: conn)
+                if let last = self.lastPayload { self.send(last, to: conn) }
+                self.receiveLoop(conn)
+            case .failed, .cancelled:
+                self.drop(conn)
+            default:
+                break
+            }
+        }
+        conn.start(queue: .main)
+    }
+
+    /// Đọc liên tục để phát hiện TV đóng kết nối (nếu không đọc, NWConnection không báo đóng)
+    private func receiveLoop(_ conn: NWConnection) {
+        conn.receiveMessage { [weak self, weak conn] _, context, isComplete, error in
+            guard let self = self, let conn = conn else { return }
+            if error != nil {
+                conn.cancel()
+                self.drop(conn)
+                return
+            }
+            if let meta = context?.protocolMetadata(definition: NWProtocolWebSocket.definition) as? NWProtocolWebSocket.Metadata,
+               meta.opcode == .close {
+                conn.cancel()
+                self.drop(conn)
+                return
+            }
+            self.receiveLoop(conn)
+        }
+    }
+
+    private func drop(_ conn: NWConnection) {
+        connections.removeAll(where: { $0 === conn })
+        readyConnections.remove(ObjectIdentifier(conn))
+        connectedCount = readyConnections.count
+    }
+
+    private func controlData(status: String) -> Data {
+        let json: [String: Any] = ["status": status, "app": "PS5Translator", "boxes": [], "texts": []]
+        return (try? JSONSerialization.data(withJSONObject: json)) ?? Data()
+    }
+
+    private func sendControl(status: String) {
+        let data = controlData(status: status)
+        for conn in connections where readyConnections.contains(ObjectIdentifier(conn)) {
+            send(data, to: conn)
+        }
+    }
+
+    private func send(_ data: Data, to conn: NWConnection) {
+        let metadata = NWProtocolWebSocket.Metadata(opcode: .text)
+        let context = NWConnection.ContentContext(identifier: "ws", metadata: [metadata])
+        conn.send(content: data, contentContext: context, isComplete: true, completion: .contentProcessed { [weak self, weak conn] error in
+            if error != nil, let conn = conn {
+                conn.cancel()
+                self?.drop(conn)
+            }
+        })
     }
 
     func broadcast(boxes: [TranslatedBox]) {
@@ -488,24 +569,25 @@ class TVWebSocketServer: ObservableObject {
         var payload = TVPayload(status: boxes.isEmpty ? "clear" : "show", boxes: boxes)
         payload.texts = textItems
         guard let data = try? JSONEncoder().encode(payload) else { return }
-        let metadata = NWProtocolWebSocket.Metadata(opcode: .text)
-        let context = NWConnection.ContentContext(identifier: "ws", metadata: [metadata])
-        for conn in connections {
-            conn.send(content: data, contentContext: context, isComplete: true, completion: .idempotent)
+        lastPayload = data
+        for conn in connections where readyConnections.contains(ObjectIdentifier(conn)) {
+            send(data, to: conn)
         }
     }
 
-    private func getIP() -> String? {
+    /// IP Wi-Fi hiện tại của iPhone (en0). Dùng chung cho bộ cài app TV.
+    static func currentWiFiIP() -> String? {
         var addr: String?
         var ifaddr: UnsafeMutablePointer<ifaddrs>?
         if getifaddrs(&ifaddr) == 0 {
             var ptr = ifaddr
             while ptr != nil {
                 if let interface = ptr?.pointee,
-                   interface.ifa_addr.pointee.sa_family == UInt8(AF_INET),
+                   let sa = interface.ifa_addr,
+                   sa.pointee.sa_family == UInt8(AF_INET),
                    String(cString: interface.ifa_name) == "en0" {
                     var hostname = [CChar](repeating: 0, count: Int(NI_MAXHOST))
-                    getnameinfo(interface.ifa_addr, socklen_t(interface.ifa_addr.pointee.sa_len), &hostname, socklen_t(hostname.count), nil, 0, NI_NUMERICHOST)
+                    getnameinfo(sa, socklen_t(sa.pointee.sa_len), &hostname, socklen_t(hostname.count), nil, 0, NI_NUMERICHOST)
                     addr = String(cString: hostname)
                 }
                 ptr = ptr?.pointee.ifa_next
@@ -519,6 +601,17 @@ class TVWebSocketServer: ObservableObject {
 // ============================================================================
 // 6. BỘ ĐIỀU PHỐI TRUNG TÂM ĐỒNG BỘ VỊ TRÍ & THỜI GIAN THỰC (V1.02)
 // ============================================================================
+/// 1.19: 1 dòng trong Log quét chữ
+struct ScanLogEntry: Identifiable, Equatable {
+    let id = UUID()
+    var time: Date
+    var key: String
+    var kind: ScanLogKind
+    var source: String
+    var translation: String?
+    var note: String?
+}
+
 class PipelineCoordinator: ObservableObject {
     @Published var videoMgr = VideoSourceManager()
     @Published var throttler = SmartThrottler()
@@ -567,6 +660,16 @@ class PipelineCoordinator: ObservableObject {
     @Published var isLandscapeFullscreen: Bool = false {
         didSet { OrientationController.setLandscape(isLandscapeFullscreen) }
     }
+    /// 1.17: Không dịch chữ trên giấy / thư / biển báo (mực tối trên nền sáng)
+    @Published var skipPaperText: Bool = (UserDefaults.standard.object(forKey: "skip_paper_text_v117") as? Bool) ?? true {
+        didSet {
+            UserDefaults.standard.set(skipPaperText, forKey: "skip_paper_text_v117")
+            smartEngine.skipPaperText = skipPaperText
+            youtubeEngine.skipPaperText = skipPaperText
+            smartEngine.reset()
+            youtubeEngine.reset()
+        }
+    }
     @Published var youtubeBoxes: [TranslatedBox] = []
     @Published var youtubeSummary: String = "—"
     /// Số câu Việt hoá dùng được của từng game (đã kiểm tra)
@@ -577,6 +680,24 @@ class PipelineCoordinator: ObservableObject {
 
     @Published var translatedBoxes: [TranslatedBox] = []
     @Published var lastRecognizedEnglish: String = "Đang quét chữ thời gian thực..."
+
+    /// 1.19: Log quét chữ hiện to trên màn hình chính (mới nhất ở đầu)
+    @Published var scanLog: [ScanLogEntry] = []
+    /// 1.19: Số câu theo loại trong phiên chơi (DATA / AI / RÁC...)
+    @Published var logCounts: [ScanLogKind: Int] = [:]
+    /// 1.19: Hiện cả chữ rác bị bỏ qua trong log
+    @Published var showTrashInLog: Bool = (UserDefaults.standard.object(forKey: "show_trash_log_v119") as? Bool) ?? true {
+        didSet { UserDefaults.standard.set(showTrashInLog, forKey: "show_trash_log_v119") }
+    }
+    /// 1.19: Tên riêng trong data Việt hoá của game đang chơi
+    @Published var properNames: [String] = []
+    private var logSeen: [String: (kind: ScanLogKind, at: Date)] = [:]
+    private static let logRepeatWindow: TimeInterval = 20
+    private static let logLimit = 120
+
+    var visibleScanLog: [ScanLogEntry] {
+        showTrashInLog ? scanLog : scanLog.filter { $0.kind != .trash }
+    }
 
     private let smartEngine = SmartSubtitleEngine()
     private let youtubeEngine = SmartSubtitleEngine()
@@ -592,6 +713,8 @@ class PipelineCoordinator: ObservableObject {
         throttler.targetScanFPS = TranslatorV102Config.defaultScanFPS
         smartEngine.engineMode = translationEngineMode
         youtubeEngine.engineMode = translationEngineMode
+        smartEngine.skipPaperText = skipPaperText
+        youtubeEngine.skipPaperText = skipPaperText
         youtubeEngine.onAsyncUpdate = { [weak self] boxes in
             DispatchQueue.main.async {
                 guard let self = self, self.activeTab == .youtube else { return }
@@ -604,6 +727,9 @@ class PipelineCoordinator: ObservableObject {
                 self.translatedBoxes = boxes
                 self.server.broadcast(boxes: boxes)
             }
+        }
+        smartEngine.onScanLog = { [weak self] items in
+            DispatchQueue.main.async { self?.ingestScanLog(items) }
         }
         setupInitialGameProfileFolders()
         refreshGameProfileFolders()
@@ -718,6 +844,56 @@ class PipelineCoordinator: ObservableObject {
         youtubeEngine.gameTitle = activeProfileFolderName
         profileStats[activeProfileFolderName] = report.validPairs
         UserDefaults.standard.set(profileStats, forKey: "profile_stats_v112")
+        properNames = smartEngine.knownNames
+    }
+
+    // MARK: - 1.19: Log quét chữ
+
+    /// Thêm kết quả 1 lần quét vào log: không ghi lại câu đang hiện liên tục, chỉ ghi câu mới hoặc câu đổi trạng thái (AI dịch xong)
+    func ingestScanLog(_ items: [ScanLogItem]) {
+        guard activeTab == .ps5, !isShowingTVTestSentence else { return }
+        let now = Date()
+        for it in items {
+            let previous = logSeen[it.key]
+            logSeen[it.key] = (it.kind, now)
+            if let prev = previous, prev.kind == it.kind, now.timeIntervalSince(prev.at) < Self.logRepeatWindow { continue }
+            if let prev = previous, prev.kind != it.kind, let idx = scanLog.firstIndex(where: { $0.key == it.key }) {
+                // Đổi trạng thái (vd: AI đang dịch -> AI xong): cập nhật dòng cũ và đưa lên đầu
+                var entry = scanLog.remove(at: idx)
+                entry.kind = it.kind
+                entry.translation = it.translation
+                entry.note = it.note
+                entry.time = now
+                scanLog.insert(entry, at: 0)
+            } else {
+                scanLog.insert(ScanLogEntry(time: now, key: it.key, kind: it.kind, source: it.source,
+                                            translation: it.translation, note: it.note), at: 0)
+            }
+            if it.kind != .pending { logCounts[it.kind, default: 0] += 1 }
+        }
+        if scanLog.count > Self.logLimit { scanLog.removeLast(scanLog.count - Self.logLimit) }
+        if logSeen.count > 600 {
+            logSeen = logSeen.filter { now.timeIntervalSince($0.value.at) < 60 }
+        }
+    }
+
+    func clearScanLog() {
+        scanLog = []
+        logCounts = [:]
+        logSeen = [:]
+    }
+
+    /// Văn bản log để chia sẻ / lưu
+    func scanLogExportText() -> String {
+        let f = DateFormatter()
+        f.dateFormat = "HH:mm:ss"
+        let lines = scanLog.reversed().map { e -> String in
+            var line = "[\(f.string(from: e.time))] \(e.kind.rawValue.uppercased()): \(e.source)"
+            if let vi = e.translation { line += "  →  \(vi)" }
+            if let n = e.note { line += "  (\(n))" }
+            return line
+        }
+        return "PS5Translator – Log quét chữ – \(activeProfileFolderName)\n" + lines.joined(separator: "\n")
     }
 
     /// 1.12: Nạp data Việt hoá: .sqlite/.db chép thẳng, .csv/.tsv/.txt tự chuyển sang SQLite chuẩn
@@ -804,6 +980,7 @@ class PipelineCoordinator: ObservableObject {
         let folderURL = profilesRootURL.appendingPathComponent(folderName, isDirectory: true)
         let contents = (try? fm.contentsOfDirectory(atPath: folderURL.path)) ?? []
 
+        if activeProfileFolderName != folderName { clearScanLog() }
         activeProfileFolderName = folderName
         if let sqliteFile = contents.first(where: { $0.hasSuffix(".sqlite") || $0.hasSuffix(".db") }) {
             let sourceSQLiteURL = folderURL.appendingPathComponent(sqliteFile)
@@ -811,6 +988,7 @@ class PipelineCoordinator: ObservableObject {
         } else {
             loadedLineCount = 0
             databaseReport = "Game này chưa có data Việt hoá → dịch bằng AI"
+            properNames = []
             smartEngine.gameTitle = folderName
             youtubeEngine.gameTitle = folderName
         }
