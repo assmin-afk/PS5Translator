@@ -1308,7 +1308,9 @@ struct SonyOAuthWebView: UIViewRepresentable {
     }
 }
 
-// 1.13: Vẽ 1 khung dịch đè khít lên chữ gốc: chữ ĐẬM, nền ĐEN cố định, thoại căn giữa
+// 1.14: Vẽ 1 khung dịch: chữ ĐẬM, nền ĐEN, cỡ chữ CỐ ĐỊNH (không tự thu nhỏ).
+// Khung nằm trong vùng đã tính sẵn: thoại neo ĐÁY + căn giữa, menu/lựa chọn neo GÓC TRÁI-TRÊN.
+// Nếu chữ dài hơn dự tính thì khung tự giãn thêm dòng thay vì thu nhỏ chữ.
 struct TranslatedSubtitleBoxView: View {
     let box: TranslatedBox
     let frameSize: CGSize
@@ -1322,21 +1324,28 @@ struct TranslatedSubtitleBoxView: View {
         let padX = fontSize * (center ? 0.35 : 0.32)
         let padY = fontSize * (center ? 0.18 : 0.14)
         let textColor = Color(hexString: box.textColorHex) ?? .white
+        let boxW = CGFloat(box.w) * W
+        let boxH = CGFloat(box.h) * H
 
-        Text(box.text)
-            .font(.system(size: fontSize, weight: .bold))
-            .foregroundColor(textColor)
-            .multilineTextAlignment(center ? .center : .leading)
-            .lineLimit(nil)
-            .minimumScaleFactor(0.85)
-            .padding(.horizontal, padX)
-            .padding(.vertical, padY)
-            .frame(width: CGFloat(box.w) * W, height: CGFloat(box.h) * H, alignment: center ? .center : .topLeading)
-            .background(
-                RoundedRectangle(cornerRadius: max(3, fontSize * 0.22))
-                    .fill(Color.black.opacity(0.86))
+        Color.clear
+            .frame(width: boxW, height: boxH)
+            .overlay(
+                Text(box.text)
+                    .font(.system(size: fontSize, weight: .bold))
+                    .foregroundColor(textColor)
+                    .multilineTextAlignment(center ? .center : .leading)
+                    .lineLimit(nil)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .frame(width: max(10, boxW - padX * 2), alignment: center ? .center : .leading)
+                    .padding(.horizontal, padX)
+                    .padding(.vertical, padY)
+                    .background(
+                        RoundedRectangle(cornerRadius: max(3, fontSize * 0.22))
+                            .fill(Color.black.opacity(0.86))
+                    ),
+                alignment: center ? .bottom : .topLeading
             )
-            .position(x: CGFloat(box.x + box.w / 2) * W, y: CGFloat(box.y + box.h / 2) * H)
+            .position(x: CGFloat(box.x) * W + boxW / 2, y: CGFloat(box.y) * H + boxH / 2)
             .animation(nil, value: box)
             .allowsHitTesting(false)
     }

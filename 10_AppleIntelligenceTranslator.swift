@@ -24,19 +24,19 @@ enum TranslationEngineMode: String, CaseIterable, Identifiable {
 
     var title: String {
         switch self {
-        case .appleThenGoogle: return "Apple Intelligence → Google"
-        case .appleOnly: return "Chỉ Apple Intelligence"
-        case .googleOnly: return "Chỉ Google Dịch"
+        case .appleThenGoogle: return "Dùng chung tất cả (khuyên dùng)"
+        case .appleOnly: return "Data + Apple Intelligence"
+        case .googleOnly: return "Data + Google Dịch"
         case .offline: return "Chỉ data Việt hoá"
         }
     }
 
     var detail: String {
         switch self {
-        case .appleThenGoogle: return "Ưu tiên AI trên iPhone (hiểu ngữ cảnh, không cần mạng). Câu AI không dịch được sẽ dùng Google."
-        case .appleOnly: return "Chỉ dùng AI trên iPhone. Không gửi chữ lên Internet."
-        case .googleOnly: return "Dịch nhanh qua Internet, kém hiểu ngữ cảnh game hơn."
-        case .offline: return "Chỉ hiện câu có trong data Việt hoá và từ điển menu."
+        case .appleThenGoogle: return "Thứ tự: Data Việt hoá → Apple Intelligence → Google Dịch. Câu có trong data lấy data; câu không có (lựa chọn, câu thiếu tiếng Anh) dịch bằng AI trên iPhone; AI không dịch được hoặc quá chậm thì dùng Google."
+        case .appleOnly: return "Data Việt hoá → Apple Intelligence. Không gửi chữ lên Internet."
+        case .googleOnly: return "Data Việt hoá → Google Dịch (qua Internet, kém hiểu ngữ cảnh game hơn)."
+        case .offline: return "Chỉ hiện câu có trong data Việt hoá và từ điển menu. Lựa chọn / câu thiếu trong data sẽ KHÔNG được dịch."
         }
     }
 }

@@ -22,7 +22,7 @@ import SQLite3
 // 1. THÔNG SỐ CẤU HÌNH PHIÊN BẢN PS5TRANSLATOR 1.02 (Đặt ở đầu file)
 // ============================================================================
 struct TranslatorV102Config {
-    static let appVersionName = "PS5Translator 1.13"
+    static let appVersionName = "PS5Translator 1.15"
     static let tvTestSentence = "phụ đề tiếng Việt như thế này"
     static let defaultScanFPS: Double = 6.0
     static let minScanFPS: Double = 1.0
@@ -547,9 +547,9 @@ class PipelineCoordinator: ObservableObject {
     }
     /// 1.12: Bộ dịch AI (Apple Intelligence trên iPhone / Google online)
     @Published var translationEngineMode: TranslationEngineMode =
-        TranslationEngineMode(rawValue: UserDefaults.standard.string(forKey: "translation_engine_v112") ?? "") ?? .appleThenGoogle {
+        TranslationEngineMode(rawValue: UserDefaults.standard.string(forKey: "translation_engine_v115") ?? "") ?? .appleThenGoogle {
         didSet {
-            UserDefaults.standard.set(translationEngineMode.rawValue, forKey: "translation_engine_v112")
+            UserDefaults.standard.set(translationEngineMode.rawValue, forKey: "translation_engine_v115")
             smartEngine.engineMode = translationEngineMode
             youtubeEngine.engineMode = translationEngineMode
             smartEngine.reset()

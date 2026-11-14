@@ -1,6 +1,6 @@
 // ============================================================================
 // FILE 7: 7_SmartSubtitleEngine.swift
-// PHIÊN BẢN: PS5Translator 1.13 (GHÉP DATA THEO ĐOẠN CÂU, CHỐNG CHỚP TẮT, NỀN ĐEN)
+// PHIÊN BẢN: PS5Translator 1.14 (DỊCH TỪNG CÂU THEO DATA, CỐ ĐỊNH CỠ CHỮ, SỬA AI CHO LỰA CHỌN)
 //
 // Luồng xử lý mỗi lần quét:
 //  1. OCR Apple Vision (.accurate) -> lấy từng DÒNG + toạ độ TỪNG TỪ.
@@ -293,7 +293,15 @@ enum PieceBuilder {
 
     static func isControllerToken(_ t: String) -> Bool {
         let core = t.lowercased().trimmingCharacters(in: CharacterSet(charactersIn: ".,:;!?"))
-        return GameVocabulary.controllerTokens.contains(core)
+        if GameVocabulary.controllerTokens.contains(core) { return true }
+        // 1.14: icon nút bị OCR đọc lệch: "[12]", "(12)", "(2)", "(r2)", "[R2)", "(kz)", "(@]", "[7"
+        let brackets = "[](){}"
+        let hasOpen = core.contains { "[({".contains($0) }
+        let hasClose = core.contains { "])}".contains($0) }
+        let inner = core.filter { !brackets.contains($0) && $0 != "|" }
+        let hasDigit = inner.contains { $0.isNumber }
+        if (hasOpen || hasClose) && inner.count <= 3 && ((hasOpen && hasClose) || hasDigit) { return true }
+        return false
     }
 
     /// Chia 1 dòng thành các đoạn chữ nằm giữa các nút bấm / khoảng trống chứa icon
@@ -503,11 +511,13 @@ struct TranslationDBReport {
 
 final class TranslationMemory {
     private let lock = NSLock()
-    private var entries: [(norm: String, tokens: [String], vi: String)] = []
+    private var entries: [(norm: String, tokens: [String], vi: String, en: String)] = []
     private var exact: [String: [Int]] = [:]
     private var inverted: [String: [Int]] = [:]
     /// Vị trí câu vừa khớp trong data (data giữ thứ tự kịch bản -> đoạn tiếp theo thường là câu này hoặc câu kế)
     private var lastIndex: Int = -1
+    /// 1.14: Bảng ghép câu Anh ↔ câu Việt bên trong mỗi dòng data (tính khi cần)
+    private var alignCache: [Int: [(tokStart: Int, tokEnd: Int, vi: String)]] = [:]
 
     struct Match {
         enum Kind { case exact, fuzzy, fragment }
@@ -558,7 +568,7 @@ final class TranslationMemory {
     // ---- Nạp data ----
     @discardableResult
     func load(url: URL) -> TranslationDBReport {
-        var newEntries: [(norm: String, tokens: [String], vi: String)] = []
+        var newEntries: [(norm: String, tokens: [String], vi: String, en: String)] = []
         var newNames: Set<String> = []
         var rep = TranslationDBReport()
 
@@ -633,7 +643,7 @@ final class TranslationMemory {
                     return
                 }
                 let toks = n.split(separator: " ").map(String.init)
-                newEntries.append((n, toks, Self.cleanDisplay(vi)))
+                newEntries.append((n, toks, Self.cleanDisplay(vi), en))
             }
         }
         rep.validPairs = newEntries.count
@@ -653,7 +663,7 @@ final class TranslationMemory {
         return rep
     }
 
-    private func install(entries newEntries: [(norm: String, tokens: [String], vi: String)], names: Set<String>, report rep: TranslationDBReport) {
+    private func install(entries newEntries: [(norm: String, tokens: [String], vi: String, en: String)], names: Set<String>, report rep: TranslationDBReport) {
         var ex: [String: [Int]] = [:]
         var inv: [String: [Int]] = [:]
         for (i, e) in newEntries.enumerated() {
@@ -667,6 +677,7 @@ final class TranslationMemory {
         exact = ex
         inverted = inv
         lastIndex = -1
+        alignCache.removeAll()
         self.names = names
         report = rep
         lock.unlock()
@@ -699,7 +710,7 @@ final class TranslationMemory {
         if let list = exact[n], let first = list.first {
             let idx = list.first(where: { $0 >= last && $0 <= last + 4 }) ?? first
             lastIndex = idx
-            return Match(vi: entries[idx].vi, index: idx, kind: .exact)
+            return Match(vi: entries[idx].vi, index: idx, kind: .exact)   // khớp nguyên dòng -> dịch nguyên dòng
         }
 
         let q = n.split(separator: " ").map(String.init)
@@ -725,6 +736,11 @@ final class TranslationMemory {
             }
             if best.idx >= 0 && best.score >= 0.80 {
                 lastIndex = best.idx
+                // Gần đúng nhưng chỉ là phần lớn của dòng dài -> vẫn chỉ lấy các câu tương ứng
+                let ct = entries[best.idx].tokens
+                if ct.count > q.count + 2, let start = Self.bestWindowStart(q, in: ct) {
+                    return Match(vi: sentenceSlice(best.idx, start: start, length: q.count), index: best.idx, kind: .fuzzy)
+                }
                 return Match(vi: entries[best.idx].vi, index: best.idx, kind: .fuzzy)
             }
         }
@@ -732,14 +748,16 @@ final class TranslationMemory {
         // 3. Đoạn câu liền mạch
         var bestFrag: (idx: Int, len: Int)?
         var fragTranslations = Set<String>()
+        var fragStart: [Int: Int] = [:]
         for idx in candidates {
             let ct = entries[idx].tokens
-            guard ct.count > q.count, Self.containsRun(q, in: ct) else { continue }
+            guard ct.count > q.count, let start = Self.runStart(q, in: ct) else { continue }
             let continuity = last >= 0 && idx >= last && idx <= last + 3
             if continuity && (q.count >= 2 || (q.first?.count ?? 0) >= 4) {
                 lastIndex = idx
-                return Match(vi: entries[idx].vi, index: idx, kind: .fragment)
+                return Match(vi: sentenceSlice(idx, start: start, length: q.count), index: idx, kind: .fragment)
             }
+            fragStart[idx] = start
             fragTranslations.insert(entries[idx].vi)
             if bestFrag == nil || ct.count < bestFrag!.len { bestFrag = (idx, ct.count) }
         }
@@ -751,7 +769,7 @@ final class TranslationMemory {
                 || (q.count == 2 && unique && b.len <= 30)
             if ok {
                 lastIndex = b.idx
-                return Match(vi: entries[b.idx].vi, index: b.idx, kind: .fragment)
+                return Match(vi: sentenceSlice(b.idx, start: fragStart[b.idx] ?? 0, length: q.count), index: b.idx, kind: .fragment)
             }
         }
 
@@ -761,15 +779,16 @@ final class TranslationMemory {
             let covered = Double(q.filter { w in cand.contains(where: { Self.tokenEqual(w, $0) }) }.count) / Double(q.count)
             if covered >= 0.9 && Double(cand.count) <= Double(q.count) * 3 {
                 lastIndex = first
-                return Match(vi: entries[first].vi, index: first, kind: .fragment)
+                let start = Self.bestWindowStart(q, in: cand) ?? 0
+                return Match(vi: sentenceSlice(first, start: start, length: q.count), index: first, kind: .fragment)
             }
         }
         return nil
     }
 
-    /// Các từ của q xuất hiện LIỀN MẠCH trong c (cho phép 1 từ OCR sai nếu đoạn ≥ 5 từ)
-    static func containsRun(_ q: [String], in c: [String]) -> Bool {
-        guard !q.isEmpty, c.count >= q.count else { return false }
+    /// Vị trí (chỉ số từ) mà các từ của q xuất hiện LIỀN MẠCH trong c (cho phép 1 từ OCR sai nếu đoạn ≥ 5 từ)
+    static func runStart(_ q: [String], in c: [String]) -> Int? {
+        guard !q.isEmpty, c.count >= q.count else { return nil }
         let allowedMiss = q.count >= 5 ? 1 : 0
         for start in 0...(c.count - q.count) {
             var miss = 0
@@ -778,9 +797,118 @@ final class TranslationMemory {
                 miss += 1
                 if miss > allowedMiss { ok = false; break }
             }
-            if ok { return true }
+            if ok { return start }
         }
-        return false
+        return nil
+    }
+
+    static func containsRun(_ q: [String], in c: [String]) -> Bool { runStart(q, in: c) != nil }
+
+    /// Cửa sổ trong c khớp nhiều từ của q nhất (cho trường hợp OCR sai nhiều từ)
+    static func bestWindowStart(_ q: [String], in c: [String]) -> Int? {
+        guard !q.isEmpty, c.count >= q.count else { return nil }
+        var best = (score: -1, start: 0)
+        for start in 0...(c.count - q.count) {
+            var sc = 0
+            for k in 0..<q.count where tokenEqual(q[k], c[start + k]) { sc += 1 }
+            if sc > best.score { best = (sc, start) }
+        }
+        return best.start
+    }
+
+    // ---- 1.14: Tách câu + ghép câu Anh ↔ Việt trong 1 dòng data ----
+    private static let reSentence = try! NSRegularExpression(pattern: "(?<=[.!?…])[\"”’)\\]]*\\s+")
+
+    static func splitSentences(_ text: String) -> [String] {
+        let t = replace(reTag, in: text, with: "").trimmingCharacters(in: .whitespacesAndNewlines)
+        var parts: [String] = []
+        var cursor = t.startIndex
+        for m in reSentence.matches(in: t, range: NSRange(t.startIndex..., in: t)) {
+            guard let r = Range(m.range, in: t) else { continue }
+            let piece = String(t[cursor..<r.lowerBound]) + String(t[r]).trimmingCharacters(in: .whitespacesAndNewlines)
+            if !piece.trimmingCharacters(in: .whitespaces).isEmpty { parts.append(piece.trimmingCharacters(in: .whitespaces)) }
+            cursor = r.upperBound
+        }
+        let rest = String(t[cursor...]).trimmingCharacters(in: .whitespacesAndNewlines)
+        if !rest.isEmpty { parts.append(rest) }
+        return parts
+    }
+
+    /// Ghép nhóm câu Anh với nhóm câu Việt theo độ dài (kiểu Gale-Church): 1-1, 1-2, 2-1, 2-2...
+    static func alignSentences(_ en: [String], _ vi: [String]) -> [(en: [Int], vi: [Int])] {
+        let n = en.count, m = vi.count
+        guard n > 0, m > 0 else { return [] }
+        let le = en.map { Double(max(1, $0.count)) }, lv = vi.map { Double(max(1, $0.count)) }
+        let ratio = lv.reduce(0, +) / le.reduce(0, +)
+        let inf = 1e18
+        var D = [[Double]](repeating: [Double](repeating: inf, count: m + 1), count: n + 1)
+        var B = [[(Int, Int)]](repeating: [(Int, Int)](repeating: (0, 0), count: m + 1), count: n + 1)
+        D[0][0] = 0
+        let moves: [(Int, Int, Double)] = [(1, 1, 0), (1, 2, 0.6), (2, 1, 0.6), (1, 0, 3), (0, 1, 3), (2, 2, 1.2), (1, 3, 1.5), (3, 1, 1.5)]
+        for i in 0...n {
+            for j in 0...m where D[i][j] < inf {
+                for (a, b, pen) in moves where i + a <= n && j + b <= m {
+                    var cost = pen
+                    if a > 0 && b > 0 {
+                        let x = le[i..<(i + a)].reduce(0, +) * ratio
+                        let y = lv[j..<(j + b)].reduce(0, +)
+                        cost += abs(log(y / x)) * 2
+                    }
+                    if D[i][j] + cost < D[i + a][j + b] {
+                        D[i + a][j + b] = D[i][j] + cost
+                        B[i + a][j + b] = (a, b)
+                    }
+                }
+            }
+        }
+        var i = n, j = m
+        var groups: [(en: [Int], vi: [Int])] = []
+        while i > 0 || j > 0 {
+            let (a, b) = B[i][j]
+            if a == 0 && b == 0 { break }
+            groups.append((Array((i - a)..<i), Array((j - b)..<j)))
+            i -= a; j -= b
+        }
+        return groups.reversed()
+    }
+
+    /// Các nhóm câu của dòng data idx: khoảng chỉ số từ (theo en_norm) + câu Việt tương ứng
+    private func sentenceGroups(_ idx: Int) -> [(tokStart: Int, tokEnd: Int, vi: String)] {
+        if let cached = alignCache[idx] { return cached }
+        let e = entries[idx]
+        let enS = Self.splitSentences(e.en)
+        let viS = Self.splitSentences(e.vi)
+        var result: [(tokStart: Int, tokEnd: Int, vi: String)] = []
+        if enS.count <= 1 || viS.isEmpty {
+            result = [(0, e.tokens.count, e.vi)]
+        } else {
+            let tokCounts = enS.map { Self.normalize($0).split(separator: " ").count }
+            var starts: [Int] = []
+            var acc = 0
+            for c in tokCounts { starts.append(acc); acc += c }
+            for g in Self.alignSentences(enS, viS) {
+                let viText = g.vi.map { viS[$0] }.joined(separator: " ")
+                if let f = g.en.first, let l = g.en.last {
+                    result.append((starts[f], starts[l] + tokCounts[l], viText))
+                } else if let lastIdx = result.indices.last {
+                    // câu Việt thừa -> nối vào nhóm trước
+                    result[lastIdx].vi += " " + viText
+                }
+            }
+            if result.isEmpty { result = [(0, e.tokens.count, e.vi)] }
+        }
+        alignCache[idx] = result
+        return result
+    }
+
+    /// Chỉ lấy (các) câu Việt tương ứng với đoạn tiếng Anh đang hiện [start, start+length)
+    private func sentenceSlice(_ idx: Int, start: Int, length: Int) -> String {
+        let groups = sentenceGroups(idx)
+        guard groups.count > 1 else { return entries[idx].vi }
+        let end = start + max(1, length)
+        let hit = groups.filter { $0.tokStart < end && $0.tokEnd > start }
+        guard !hit.isEmpty else { return entries[idx].vi }
+        return hit.map { $0.vi }.joined(separator: " ")
     }
 
     static func tokenEqual(_ a: String, _ b: String) -> Bool {
@@ -1029,6 +1157,8 @@ final class TrackedPiece {
     var goneAt: Date?
     /// Cỡ chữ đã khoá (menu, nhiệm vụ) để không nhảy to nhỏ
     var lockedFontPx: CGFloat?
+    /// Khoá chữ đã gửi AI (OCR có thể đọc hơi khác ở lần sau)
+    var requestKey: String?
 
     init(id: String, order: Int, key: String, piece: SSPiece) {
         self.id = id
@@ -1081,7 +1211,8 @@ final class LayoutStabilizer {
         if bottomHistory.count > 9 { bottomHistory.removeFirst() }
         let mf = Self.median(fontHistory)
         if let cur = dialogueFontPx {
-            if abs(mf - cur) / cur > 0.12 { dialogueFontPx = mf.rounded() }
+            // 1.14: chỉ đổi cỡ khi phụ đề game thật sự đổi cỡ (lệch > 25% trên ít nhất 5 lần đo)
+            if fontHistory.count >= 5 && abs(mf - cur) / cur > 0.25 { dialogueFontPx = mf.rounded() }
         } else {
             dialogueFontPx = mf.rounded()
         }
@@ -1143,7 +1274,7 @@ enum SubtitleLayoutEngine {
                 let cx = abs(p.rect.midX - 0.5) < 0.12 ? refW / 2 : o.midX
                 let maxW = min(refW * 0.9, 2 * (min(cx, refW - cx) - 6))
                 let size = measure(display, fontPx: fontPx, width: maxW - padX * 2)
-                let boxW = min(maxW, max(size.width + padX * 2 + 2, o.width + padX * 2))
+                let boxW = min(maxW, max(size.width * 1.04 + padX * 2 + 2, o.width + padX * 2))
                 var bottom = (stabilizer.dialogueBottomPx ?? o.maxY) + padY
                 bottom = max(bottom, o.maxY + padY)
                 let boxH = max(size.height + padY * 2, bottom - (o.minY - padY))
@@ -1181,7 +1312,7 @@ enum SubtitleLayoutEngine {
                     scale -= 0.1
                 }
                 fontPx *= scale
-                let boxW = min(maxW, max(minW, size.width + padX * 2 + 2))
+                let boxW = min(maxW, max(minW, size.width * 1.04 + padX * 2 + 2))
                 let boxH = max(minH, size.height + padY * 2)
                 boxRect = CGRect(x: originX, y: originY, width: boxW, height: boxH)
             }
@@ -1415,27 +1546,32 @@ final class SmartSubtitleEngine {
             return
         }
         if let vi = GameVocabulary.uiDictionary[t.key] {
-            t.translation = vi
+            t.translation = Self.isAllCaps(src) ? vi.uppercased(with: Locale(identifier: "vi_VN")) : vi
             t.fromDatabase = true
             t.shownAt = Date()
             return
         }
+        // Chữ IN HOA (lựa chọn câu trả lời, tiêu đề): gửi AI dạng câu thường, rồi in hoa lại bản dịch
+        let allCaps = Self.isAllCaps(src)
+        let styled: (String) -> String = { allCaps ? $0.uppercased(with: Locale(identifier: "vi_VN")) : $0 }
         let aiKey = "ai|" + t.key
         let preferApple = engineMode == .appleThenGoogle || engineMode == .appleOnly
         if preferApple, let vi = online.cached(aiKey) {
-            t.translation = vi
+            t.translation = styled(vi)
             t.shownAt = Date()
             return
         }
         if engineMode != .appleOnly, let vi = online.cached(t.key) {
-            t.translation = vi
+            t.translation = styled(vi)
             t.shownAt = Date()
             return
         }
-        guard useOnlineAI, engineMode != .offline else { return }
+        guard useOnlineAI, engineMode != .offline, !t.aiPending else { return }
+
+        let aiSource = allCaps ? sentenceCase(src) : src
         // Tên riêng: tên có sẵn + từ viết hoa giữa câu không có trong từ điển tiếng Anh
         var protected: [String] = []
-        let words = src.split(separator: " ").map { String($0).trimmingCharacters(in: .punctuationCharacters) }
+        let words = aiSource.split(separator: " ").map { String($0).trimmingCharacters(in: .punctuationCharacters) }
         for (i, w) in words.enumerated() where !w.isEmpty {
             if filter.isName(w) || (i > 0 && GameTextFilter.isProperNounCandidate(w) && !filter.isEnglishWord(w.lowercased())) {
                 if !protected.contains(w) { protected.append(w) }
@@ -1443,11 +1579,20 @@ final class SmartSubtitleEngine {
         }
         let key = t.key
         t.aiPending = true
-        let deliver: (String) -> Void = { [weak self] vi in
+        t.requestKey = key
+        weak var target = t
+        let done = AIDeliveryFlag()
+
+        // 1.14: giao bản dịch cho ĐÚNG khung đã gửi (kể cả khi OCR đọc chữ hơi khác ở lần quét sau)
+        let deliver: (String) -> Void = { [weak self] raw in
             guard let self = self else { return }
+            let vi = styled(raw)
             self.queue.async {
+                guard !done.value else { return }
+                done.value = true
                 var changed = false
-                for item in self.tracked where item.key == key && item.translation == nil {
+                for item in self.tracked where item.translation == nil
+                    && (item === target || item.key == key || item.requestKey == key) {
                     item.translation = vi
                     item.aiPending = false
                     item.shownAt = Date()
@@ -1460,7 +1605,7 @@ final class SmartSubtitleEngine {
             }
         }
         let google: () -> Void = { [weak self] in
-            self?.online.request(text: src, key: key, protectedWords: protected, completion: deliver)
+            self?.online.request(text: aiSource, key: key, protectedWords: protected, completion: deliver)
         }
 
         if preferApple && OnDeviceAITranslator.shared.isAvailable {
@@ -1476,18 +1621,48 @@ final class SmartSubtitleEngine {
                 if recentDialogue.count > 3 { recentDialogue.removeFirst() }
             }
             let mode = engineMode
-            OnDeviceAITranslator.shared.translate(src, key: aiKey, context: context) { [weak self] vi in
+            OnDeviceAITranslator.shared.translate(aiSource, key: aiKey, context: context) { [weak self] vi in
                 if let vi = vi {
                     self?.online.store(key: aiKey, value: vi)
                     deliver(vi)
                 } else if mode == .appleThenGoogle {
                     google()
                 } else {
-                    self?.queue.async { for item in self?.tracked ?? [] where item.key == key { item.aiPending = false } }
+                    self?.queue.async { for item in self?.tracked ?? [] where item.requestKey == key { item.aiPending = false } }
+                }
+            }
+            // Apple Intelligence chậm quá 1,2 giây -> gửi Google song song, bản nào về trước thì hiện
+            if mode == .appleThenGoogle {
+                queue.asyncAfter(deadline: .now() + 1.2) {
+                    if !done.value { google() }
                 }
             }
         } else if engineMode != .appleOnly {
             google()
         }
     }
+
+    static func isAllCaps(_ text: String) -> Bool {
+        let letters = text.filter { $0.isLetter }
+        return letters.count >= 3 && letters.allSatisfy { $0.isUppercase }
+    }
+
+    /// "IT MAKES ME HAPPY" -> "It makes me happy" (giữ tên riêng viết hoa)
+    private func sentenceCase(_ text: String) -> String {
+        let lower = text.lowercased()
+        var words = lower.split(separator: " ", omittingEmptySubsequences: false).map(String.init)
+        for (i, w) in words.enumerated() {
+            let core = w.trimmingCharacters(in: .punctuationCharacters)
+            if core == "i" || core.hasPrefix("i'") || filter.isName(core) || i == 0 {
+                if let f = w.firstIndex(where: { $0.isLetter }) {
+                    words[i] = w.replacingCharacters(in: f...f, with: String(w[f]).uppercased())
+                }
+            }
+        }
+        return words.joined(separator: " ")
+    }
+}
+
+final class AIDeliveryFlag {
+    var value = false
 }
