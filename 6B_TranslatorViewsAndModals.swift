@@ -1308,7 +1308,7 @@ struct SonyOAuthWebView: UIViewRepresentable {
     }
 }
 
-// 1.11: Vẽ 1 khung dịch đè khít lên chữ gốc
+// 1.13: Vẽ 1 khung dịch đè khít lên chữ gốc: chữ ĐẬM, nền ĐEN cố định, thoại căn giữa
 struct TranslatedSubtitleBoxView: View {
     let box: TranslatedBox
     let frameSize: CGSize
@@ -1318,26 +1318,26 @@ struct TranslatedSubtitleBoxView: View {
         let fontSize: CGFloat = box.fontSizeNorm > 0
             ? CGFloat(box.fontSizeNorm) * H
             : max(9.5, min(18.0, CGFloat(box.h) * H * 0.78))
-        let padX = fontSize * 0.30, padY = fontSize * 0.10
-        let textColor = Color(hexString: box.textColorHex) ?? .yellow
-        let bgColor = Color(hexString: box.backgroundColorHex) ?? .black
+        let center = box.textAlignCenter
+        let padX = fontSize * (center ? 0.35 : 0.32)
+        let padY = fontSize * (center ? 0.18 : 0.14)
+        let textColor = Color(hexString: box.textColorHex) ?? .white
 
         Text(box.text)
-            .font(.system(size: fontSize, weight: box.isBold ? .semibold : .medium))
+            .font(.system(size: fontSize, weight: .bold))
             .foregroundColor(textColor)
-            .shadow(color: Color.black.opacity(0.55), radius: 0.6, x: 0.5, y: 0.5)
-            .multilineTextAlignment(.leading)
+            .multilineTextAlignment(center ? .center : .leading)
             .lineLimit(nil)
-            .minimumScaleFactor(0.7)
-            .fixedSize(horizontal: false, vertical: false)
+            .minimumScaleFactor(0.85)
             .padding(.horizontal, padX)
             .padding(.vertical, padY)
-            .frame(width: CGFloat(box.w) * W, height: CGFloat(box.h) * H, alignment: .topLeading)
+            .frame(width: CGFloat(box.w) * W, height: CGFloat(box.h) * H, alignment: center ? .center : .topLeading)
             .background(
-                RoundedRectangle(cornerRadius: max(2, fontSize * 0.18))
-                    .fill(bgColor.opacity(0.94))
+                RoundedRectangle(cornerRadius: max(3, fontSize * 0.22))
+                    .fill(Color.black.opacity(0.86))
             )
             .position(x: CGFloat(box.x + box.w / 2) * W, y: CGFloat(box.y + box.h / 2) * H)
+            .animation(nil, value: box)
             .allowsHitTesting(false)
     }
 }

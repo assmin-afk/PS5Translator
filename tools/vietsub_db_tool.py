@@ -169,7 +169,7 @@ def create_db(out_path, pairs, names):
     for p in pairs:
         en, vi = (p.get("en") or "").strip(), (p.get("vi") or "").strip()
         n = normalize(en)
-        if not n or not vi or n == normalize(vi):
+        if not n or not vi or n == normalize(vi) or (has_vi(en) and not has_vi(vi)):
             skipped += 1
             continue
         key = (n, vi)

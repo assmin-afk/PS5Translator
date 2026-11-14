@@ -111,6 +111,8 @@ struct TranslatedBox: Codable, Identifiable, Equatable {
     var textColorHex: String = ""
     var backgroundColorHex: String = ""
     var isBold: Bool = true
+    /// 1.13: lời thoại căn giữa như phụ đề game
+    var textAlignCenter: Bool = false
 }
 
 struct TVTextItem: Codable {

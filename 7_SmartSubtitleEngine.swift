@@ -1,6 +1,6 @@
 // ============================================================================
 // FILE 7: 7_SmartSubtitleEngine.swift
-// PHIÊN BẢN: PS5Translator 1.12 (QUÉT CHỮ THÔNG MINH + YOUTUBE + APPLE INTELLIGENCE)
+// PHIÊN BẢN: PS5Translator 1.13 (GHÉP DATA THEO ĐOẠN CÂU, CHỐNG CHỚP TẮT, NỀN ĐEN)
 //
 // Luồng xử lý mỗi lần quét:
 //  1. OCR Apple Vision (.accurate) -> lấy từng DÒNG + toạ độ TỪNG TỪ.
@@ -62,6 +62,10 @@ struct SSPiece {
     var wordCount: Int
     /// Giới hạn mép phải (không được vẽ qua): mép trái của nút bấm kế tiếp
     var rightLimit: CGFloat?
+    /// Tên người nói giữ nguyên kiểu ngoặc gốc: "(Dr. Hill)" hoặc "[Ashley]"
+    var speakerLabel: String? = nil
+    /// Chữ này có trong data Việt hoá (chắc chắn không phải chữ rác)
+    var knownInData: Bool = false
 }
 
 // MARK: - Từ vựng game
@@ -309,7 +313,9 @@ enum PieceBuilder {
             }
             if let prev = current.last ?? (i > 0 ? words[i - 1] : nil), !current.isEmpty {
                 let gapPx = (w.rect.minX - prev.rect.maxX) * refW
-                if gapPx > max(18, lineHpx * 1.5) {
+                // 1.13: khoảng trống sau tên người nói "(Dr. Hill)   Interesting." KHÔNG phải icon nút
+                let afterSpeaker = current.count <= 3 && (prev.text.hasSuffix(")") || prev.text.hasSuffix("]") || prev.text.hasSuffix(":"))
+                if !afterSpeaker && gapPx > max(26, lineHpx * 2.0) {
                     // Khoảng trống lớn = icon nút bấm Vision không đọc được -> ngắt khung
                     result.append((current, prev.rect.maxX + (w.rect.minX - prev.rect.maxX) * 0.2))
                     current = []
@@ -321,12 +327,37 @@ enum PieceBuilder {
         return result
     }
 
+    /// 1.13: Vision hay tách "(Dr. Hill)" và lời thoại thành 2 dòng cùng hàng -> gộp lại
+    static func mergeRowFragments(_ lines: [SSLine], refW: CGFloat) -> [SSLine] {
+        let sorted = lines.sorted { $0.rect.minX < $1.rect.minX }
+        var rows: [SSLine] = []
+        for line in sorted {
+            if let i = rows.firstIndex(where: { row in
+                let h = max(row.rect.height, line.rect.height)
+                let sameRow = abs(row.rect.midY - line.rect.midY) < h * 0.35
+                let similarH = abs(row.rect.height - line.rect.height) < h * 0.35
+                let gapPx = (line.rect.minX - row.rect.maxX) * refW
+                return sameRow && similarH && gapPx > -h * refH * 0.5 && gapPx < max(48, h * refH * 3.5)
+            }) {
+                var row = rows[i]
+                row.text = row.text + " " + line.text
+                row.rect = row.rect.union(line.rect)
+                row.words += line.words
+                row.confidence = min(row.confidence, line.confidence)
+                rows[i] = row
+            } else {
+                rows.append(line)
+            }
+        }
+        return rows
+    }
+
     static func union(_ rects: [CGRect]) -> CGRect {
         rects.dropFirst().reduce(rects.first ?? .zero) { $0.union($1) }
     }
 
     /// Nhận diện tên người nói ở đầu phụ đề: "[Ashley] ...", "IAshleyl ..." (OCR đọc [ ] thành I l), "Ashley: ..."
-    static func extractSpeaker(_ text: String, filter: GameTextFilter) -> (speaker: String?, rest: String) {
+    static func extractSpeaker(_ text: String, filter: GameTextFilter) -> (speaker: String?, label: String?, rest: String) {
         let pattern = "^\\s*([\\[\\(\\{|Il1])\\s?([A-Z][A-Za-z\\.\\-']{1,20}(?: [A-Z][A-Za-z\\.\\-']{1,20})?)\\s?([\\]\\)\\}|Il1:])\\s+(.+)$"
         if let re = try? NSRegularExpression(pattern: pattern, options: [.dotMatchesLineSeparators]),
            let m = re.firstMatch(in: text, range: NSRange(text.startIndex..., in: text)),
@@ -337,17 +368,23 @@ enum PieceBuilder {
             let realBracket = open == "[" || open == "(" || open == "{"
             let known = name.split(separator: " ").allSatisfy { filter.isName(String($0)) }
             if realBracket || known {
-                return (name, String(text[r4]))
+                let label = open == "(" ? "(\(name))" : (open == "{" ? "{\(name)}" : "[\(name)]")
+                return (name, label, String(text[r4]))
             }
         }
         // "Ashley: Hello"
         if let colon = text.firstIndex(of: ":"), text.distance(from: text.startIndex, to: colon) <= 22 {
             let name = text[..<colon].trimmingCharacters(in: .whitespaces)
             if !name.isEmpty, name.split(separator: " ").allSatisfy({ filter.isName(String($0)) }) {
-                return (name, String(text[text.index(after: colon)...]).trimmingCharacters(in: .whitespaces))
+                return (name, name + ":", String(text[text.index(after: colon)...]).trimmingCharacters(in: .whitespaces))
             }
         }
-        return (nil, text)
+        return (nil, nil, text)
+    }
+
+    /// 1.13: lựa chọn câu trả lời / menu ngắn (1-4 từ, toàn từ hợp lệ) không phải chữ rác
+    static func isChoiceLike(_ a: GameTextFilter.Analysis) -> Bool {
+        a.alphaWords >= 1 && a.alphaWords <= 4 && a.validRatio >= 0.99 && a.dictionaryWords >= 1
     }
 
     static func classify(rect: CGRect, wordCount: Int, hasSpeaker: Bool) -> TextRegionCategory {
@@ -358,9 +395,11 @@ enum PieceBuilder {
     }
 
     /// Dòng -> các khối cần dịch
-    static func buildPieces(lines rawLines: [SSLine], filter: GameTextFilter, refW: CGFloat = 1280) -> [SSPiece] {
+    static func buildPieces(lines inputLines: [SSLine], filter: GameTextFilter, refW: CGFloat = 1280,
+                            isKnownText: (String) -> Bool = { _ in false }) -> [SSPiece] {
         var plainLines: [SSLine] = []
         var pieces: [SSPiece] = []
+        let rawLines = mergeRowFragments(inputLines.filter { !TranslationMemory.hasVietnameseMarks($0.text) }, refW: refW)
 
         for line in rawLines {
             guard line.confidence >= 0.45 else { continue }
@@ -379,12 +418,15 @@ enum PieceBuilder {
                 let a = filter.analyze(text)
                 let norm = TranslationMemory.normalize(text)
                 let isUI = GameVocabulary.uiDictionary[norm] != nil
-                guard a.isMeaningful || isUI else { continue }
+                let known = isKnownText(text)
+                guard a.isMeaningful || isUI || known || isChoiceLike(a) else { continue }
                 let rect = union(seg.words.map { $0.rect })
-                pieces.append(SSPiece(sourceText: text, speaker: nil, rect: rect, lineCount: 1,
-                                      category: classify(rect: rect, wordCount: a.alphaWords, hasSpeaker: false),
-                                      confidence: line.confidence, validRatio: a.validRatio,
-                                      wordCount: a.alphaWords, rightLimit: seg.rightLimit))
+                var piece = SSPiece(sourceText: text, speaker: nil, rect: rect, lineCount: 1,
+                                    category: classify(rect: rect, wordCount: a.alphaWords, hasSpeaker: false),
+                                    confidence: line.confidence, validRatio: a.validRatio,
+                                    wordCount: a.alphaWords, rightLimit: seg.rightLimit)
+                piece.knownInData = known
+                pieces.append(piece)
             }
         }
 
@@ -416,18 +458,23 @@ enum PieceBuilder {
 
         for block in blocks {
             let joined = block.map { $0.text }.joined(separator: " ")
-            let (speaker, rest) = extractSpeaker(joined, filter: filter)
+            let (speaker, label, rest) = extractSpeaker(joined, filter: filter)
             let a = filter.analyze(rest)
             let norm = TranslationMemory.normalize(rest)
-            if GameVocabulary.basicGamerWords.contains(norm) { continue }
-            if GameVocabulary.screenEffects.contains(norm) { continue }
+            let known = isKnownText(rest)
+            // Từ game cơ bản đứng một mình thì bỏ, NHƯNG lời thoại có người nói ("(Josh) No.") vẫn dịch
+            if speaker == nil && !known && GameVocabulary.basicGamerWords.contains(norm) { continue }
+            if speaker == nil && GameVocabulary.screenEffects.contains(norm) { continue }
             let isUI = GameVocabulary.uiDictionary[norm] != nil
-            guard a.isMeaningful || isUI else { continue }
+            guard a.isMeaningful || isUI || known || isChoiceLike(a) || (speaker != nil && a.dictionaryWords >= 1) else { continue }
             let rect = union(block.map { $0.rect })
             let conf = block.map { $0.confidence }.min() ?? 0
-            pieces.append(SSPiece(sourceText: rest, speaker: speaker, rect: rect, lineCount: block.count,
-                                  category: classify(rect: rect, wordCount: a.alphaWords, hasSpeaker: speaker != nil),
-                                  confidence: conf, validRatio: a.validRatio, wordCount: a.alphaWords, rightLimit: nil))
+            var piece = SSPiece(sourceText: rest, speaker: speaker, rect: rect, lineCount: block.count,
+                                category: classify(rect: rect, wordCount: a.alphaWords, hasSpeaker: speaker != nil),
+                                confidence: conf, validRatio: a.validRatio, wordCount: a.alphaWords, rightLimit: nil)
+            piece.speakerLabel = label
+            piece.knownInData = known
+            pieces.append(piece)
         }
         return pieces
     }
@@ -457,8 +504,17 @@ struct TranslationDBReport {
 final class TranslationMemory {
     private let lock = NSLock()
     private var entries: [(norm: String, tokens: [String], vi: String)] = []
-    private var exact: [String: Int] = [:]
+    private var exact: [String: [Int]] = [:]
     private var inverted: [String: [Int]] = [:]
+    /// Vị trí câu vừa khớp trong data (data giữ thứ tự kịch bản -> đoạn tiếp theo thường là câu này hoặc câu kế)
+    private var lastIndex: Int = -1
+
+    struct Match {
+        enum Kind { case exact, fuzzy, fragment }
+        let vi: String
+        let index: Int
+        let kind: Kind
+    }
     private(set) var names: Set<String> = []
     private(set) var report = TranslationDBReport()
 
@@ -557,7 +613,13 @@ final class TranslationMemory {
 
         if let c = chosen {
             rep.schema = "\(c.table)(\(c.en) → \(c.vi))"
-            query("SELECT \"\(c.en)\", \"\(c.vi)\" FROM \"\(c.table)\"") { cols in
+            let ordered = "SELECT \"\(c.en)\", \"\(c.vi)\" FROM \"\(c.table)\" ORDER BY rowid"
+            let plain = "SELECT \"\(c.en)\", \"\(c.vi)\" FROM \"\(c.table)\""
+            var useSQL = ordered
+            var probe: OpaquePointer?
+            if sqlite3_prepare_v2(conn, ordered, -1, &probe, nil) != SQLITE_OK { useSQL = plain }
+            sqlite3_finalize(probe)
+            query(useSQL) { cols in
                 rep.totalRows += 1
                 guard let en = cols[0] ?? nil, let vi = cols.count > 1 ? cols[1] : nil, !en.isEmpty, !vi.isEmpty else {
                     rep.emptyRows += 1
@@ -592,10 +654,10 @@ final class TranslationMemory {
     }
 
     private func install(entries newEntries: [(norm: String, tokens: [String], vi: String)], names: Set<String>, report rep: TranslationDBReport) {
-        var ex: [String: Int] = [:]
+        var ex: [String: [Int]] = [:]
         var inv: [String: [Int]] = [:]
         for (i, e) in newEntries.enumerated() {
-            if ex[e.norm] == nil { ex[e.norm] = i }
+            ex[e.norm, default: []].append(i)
             for t in Set(e.tokens) where t.count >= 3 {
                 inv[t, default: []].append(i)
             }
@@ -604,41 +666,121 @@ final class TranslationMemory {
         entries = newEntries
         exact = ex
         inverted = inv
+        lastIndex = -1
         self.names = names
         report = rep
         lock.unlock()
     }
 
+    /// Chữ này có nguyên văn trong data không (dùng để chắc chắn không phải chữ rác)
+    func containsExact(_ english: String) -> Bool {
+        let n = Self.normalize(english)
+        guard !n.isEmpty else { return false }
+        lock.lock(); defer { lock.unlock() }
+        return exact[n] != nil
+    }
+
     // ---- Tra cứu ----
-    func lookup(_ english: String) -> String? {
+    func lookup(_ english: String) -> String? { lookupMatch(english)?.vi }
+
+    /// 1.13: Khớp câu với data theo 3 mức:
+    ///  1. Nguyên văn (ưu tiên bản ở ngay sau câu vừa khớp nếu data có câu trùng)
+    ///  2. Gần đúng (OCR sai vài ký tự)
+    ///  3. ĐOẠN CÂU: game chia câu dài thành nhiều đoạn hiện lần lượt ("…all by yourself?")
+    ///     -> tìm câu trong data chứa liền mạch đoạn đó, ưu tiên câu vừa khớp / câu kế tiếp.
+    func lookupMatch(_ english: String) -> Match? {
         let n = Self.normalize(english)
         guard !n.isEmpty else { return nil }
         lock.lock()
         defer { lock.unlock() }
-        if let i = exact[n] { return entries[i].vi }
+        guard !entries.isEmpty else { return nil }
+        let last = lastIndex
 
-        let qTokens = n.split(separator: " ").map(String.init)
-        guard qTokens.count >= 2 else { return nil }
+        if let list = exact[n], let first = list.first {
+            let idx = list.first(where: { $0 >= last && $0 <= last + 4 }) ?? first
+            lastIndex = idx
+            return Match(vi: entries[idx].vi, index: idx, kind: .exact)
+        }
+
+        let q = n.split(separator: " ").map(String.init)
         var counts: [Int: Int] = [:]
-        for t in Set(qTokens) where t.count >= 3 {
-            if let list = inverted[t], list.count < 4000 {
+        for t in Set(q) where t.count >= 3 {
+            if let list = inverted[t], list.count < 6000 {
                 for i in list { counts[i, default: 0] += 1 }
             }
         }
-        let candidates = counts.sorted { $0.value > $1.value }.prefix(40)
-        var best: (score: Double, idx: Int) = (0, -1)
-        for (idx, _) in candidates {
-            let s = Self.similarity(qTokens, entries[idx].tokens)
-            if s > best.score { best = (s, idx) }
+        var candidates = counts.sorted { $0.value > $1.value }.prefix(80).map { $0.key }
+        if last >= 0 {
+            for k in 0...3 where last + k < entries.count { candidates.append(last + k) }
         }
-        // Khớp gần đúng (OCR sai vài ký tự) hoặc phụ đề mới hiện một phần của câu dài
-        if best.idx >= 0 && best.score >= 0.80 { return entries[best.idx].vi }
-        if best.idx >= 0 && qTokens.count >= 4 {
-            let cand = entries[best.idx].tokens
-            let covered = Double(qTokens.filter { q in cand.contains(where: { Self.tokenEqual(q, $0) }) }.count) / Double(qTokens.count)
-            if covered >= 0.92 && Double(cand.count) <= Double(qTokens.count) * 2.2 { return entries[best.idx].vi }
+        var seen = Set<Int>()
+        candidates = candidates.filter { seen.insert($0).inserted }
+
+        // 2. Gần đúng cả câu
+        if q.count >= 2 {
+            var best: (score: Double, idx: Int) = (0, -1)
+            for idx in candidates {
+                let sc = Self.similarity(q, entries[idx].tokens)
+                if sc > best.score { best = (sc, idx) }
+            }
+            if best.idx >= 0 && best.score >= 0.80 {
+                lastIndex = best.idx
+                return Match(vi: entries[best.idx].vi, index: best.idx, kind: .fuzzy)
+            }
+        }
+
+        // 3. Đoạn câu liền mạch
+        var bestFrag: (idx: Int, len: Int)?
+        var fragTranslations = Set<String>()
+        for idx in candidates {
+            let ct = entries[idx].tokens
+            guard ct.count > q.count, Self.containsRun(q, in: ct) else { continue }
+            let continuity = last >= 0 && idx >= last && idx <= last + 3
+            if continuity && (q.count >= 2 || (q.first?.count ?? 0) >= 4) {
+                lastIndex = idx
+                return Match(vi: entries[idx].vi, index: idx, kind: .fragment)
+            }
+            fragTranslations.insert(entries[idx].vi)
+            if bestFrag == nil || ct.count < bestFrag!.len { bestFrag = (idx, ct.count) }
+        }
+        if let b = bestFrag {
+            let unique = fragTranslations.count == 1
+            let ratio = Double(q.count) / Double(b.len)
+            let ok = q.count >= 5
+                || (q.count >= 3 && (unique || ratio >= 0.3))
+                || (q.count == 2 && unique && b.len <= 30)
+            if ok {
+                lastIndex = b.idx
+                return Match(vi: entries[b.idx].vi, index: b.idx, kind: .fragment)
+            }
+        }
+
+        // OCR sai vài từ giữa đoạn: phủ ≥ 90% từ
+        if q.count >= 4, let first = candidates.first {
+            let cand = entries[first].tokens
+            let covered = Double(q.filter { w in cand.contains(where: { Self.tokenEqual(w, $0) }) }.count) / Double(q.count)
+            if covered >= 0.9 && Double(cand.count) <= Double(q.count) * 3 {
+                lastIndex = first
+                return Match(vi: entries[first].vi, index: first, kind: .fragment)
+            }
         }
         return nil
+    }
+
+    /// Các từ của q xuất hiện LIỀN MẠCH trong c (cho phép 1 từ OCR sai nếu đoạn ≥ 5 từ)
+    static func containsRun(_ q: [String], in c: [String]) -> Bool {
+        guard !q.isEmpty, c.count >= q.count else { return false }
+        let allowedMiss = q.count >= 5 ? 1 : 0
+        for start in 0...(c.count - q.count) {
+            var miss = 0
+            var ok = true
+            for k in 0..<q.count where !tokenEqual(q[k], c[start + k]) {
+                miss += 1
+                if miss > allowedMiss { ok = false; break }
+            }
+            if ok { return true }
+        }
+        return false
     }
 
     static func tokenEqual(_ a: String, _ b: String) -> Bool {
@@ -867,100 +1009,205 @@ enum StyleSampler {
     }
 }
 
-// MARK: - Theo dõi khung chữ ổn định (không nhảy, không nhấp nháy)
+// MARK: - Theo dõi khung chữ ổn định (không nhảy, không chớp tắt)
 
 final class TrackedPiece {
     let id: String
+    let createdOrder: Int
     var key: String
     var piece: SSPiece
     var translation: String?
     var fromDatabase = false
+    var dbIndex: Int = -1
+    var aiPending = false
     var hits = 1
     var misses = 0
     var thumb: [UInt8] = []
     var style: SSStyle = .fallback
+    /// Lúc bản dịch bắt đầu hiện / lúc chữ gốc biến mất
+    var shownAt: Date?
+    var goneAt: Date?
+    /// Cỡ chữ đã khoá (menu, nhiệm vụ) để không nhảy to nhỏ
+    var lockedFontPx: CGFloat?
 
-    init(id: String, key: String, piece: SSPiece) {
+    init(id: String, order: Int, key: String, piece: SSPiece) {
         self.id = id
+        self.createdOrder = order
         self.key = key
         self.piece = piece
     }
 
     var requiredHits: Int {
-        if fromDatabase { return 1 }
-        if piece.wordCount <= 1 { return 3 }
+        if fromDatabase || piece.knownInData { return 1 }
+        if piece.validRatio >= 0.99 && piece.wordCount >= 1 && piece.wordCount <= 4 && piece.confidence >= 0.5 {
+            return piece.wordCount == 1 ? 2 : 1          // lựa chọn câu trả lời / menu ngắn
+        }
         if piece.confidence >= 0.8 && piece.validRatio >= 0.85 && piece.wordCount >= 3 { return 1 }
         return 2
     }
 
-    var isVisible: Bool { translation != nil && hits >= requiredHits }
+    var isConfirmed: Bool { hits >= requiredHits }
+
+    /// 1.13: Giữ chữ dịch sau khi chữ gốc biến mất.
+    /// - Data Việt hoá: hiện gần như tức thì -> chỉ giữ 0,35 giây (che khoảng trống giữa 2 đoạn phụ đề).
+    /// - Dịch AI: về chậm hơn -> giữ đủ thời gian đọc (1,6 - 4,5 giây tuỳ độ dài).
+    func holdUntil() -> Date? {
+        guard let gone = goneAt else { return nil }
+        if fromDatabase { return gone.addingTimeInterval(0.35) }
+        let chars = Double(translation?.count ?? 0)
+        let readTime = min(4.5, max(1.6, 0.8 + chars * 0.05))
+        let base = shownAt ?? gone
+        return max(gone.addingTimeInterval(1.2), base.addingTimeInterval(readTime))
+    }
+
+    func isVisible(at now: Date) -> Bool {
+        guard translation != nil, isConfirmed else { return false }
+        if let until = holdUntil() { return now < until }
+        return true
+    }
 }
 
-// MARK: - Bố cục khung dịch (neo vị trí gốc, kéo sang phải, xuống dòng, không đè)
+/// 1.13: Giữ cỡ chữ + vị trí dòng thoại ổn định (trung vị nhiều lần đo, chỉ đổi khi khác hẳn)
+final class LayoutStabilizer {
+    private var fontHistory: [CGFloat] = []
+    private var bottomHistory: [CGFloat] = []
+    private(set) var dialogueFontPx: CGFloat?
+    private(set) var dialogueBottomPx: CGFloat?
+
+    func observeDialogue(fontPx: CGFloat, bottomPx: CGFloat) {
+        fontHistory.append(fontPx)
+        if fontHistory.count > 15 { fontHistory.removeFirst() }
+        bottomHistory.append(bottomPx)
+        if bottomHistory.count > 9 { bottomHistory.removeFirst() }
+        let mf = Self.median(fontHistory)
+        if let cur = dialogueFontPx {
+            if abs(mf - cur) / cur > 0.12 { dialogueFontPx = mf.rounded() }
+        } else {
+            dialogueFontPx = mf.rounded()
+        }
+        let mb = Self.median(bottomHistory)
+        if let cur = dialogueBottomPx {
+            if abs(mb - cur) > 14 { dialogueBottomPx = mb.rounded() }
+        } else {
+            dialogueBottomPx = mb.rounded()
+        }
+    }
+
+    func reset() {
+        fontHistory.removeAll()
+        bottomHistory.removeAll()
+        dialogueFontPx = nil
+        dialogueBottomPx = nil
+    }
+
+    static func median(_ v: [CGFloat]) -> CGFloat {
+        guard !v.isEmpty else { return 0 }
+        let s = v.sorted()
+        return s[s.count / 2]
+    }
+}
+
+// MARK: - Bố cục khung dịch
 
 enum SubtitleLayoutEngine {
-    static let refW: CGFloat = 1280
     static let refH: CGFloat = 720
     static let dialogueYellow = (1.0, 0.86, 0.10)
+    static let black = (0.0, 0.0, 0.0)
 
-    static func layout(_ items: [TrackedPiece], refW: CGFloat = 1280) -> [TranslatedBox] {
+    static func measure(_ text: String, fontPx: CGFloat, width: CGFloat) -> CGSize {
+        let font = UIFont.systemFont(ofSize: fontPx, weight: .bold)
+        let b = (text as NSString).boundingRect(
+            with: CGSize(width: max(10, width), height: .greatestFiniteMagnitude),
+            options: [.usesLineFragmentOrigin, .usesFontLeading],
+            attributes: [.font: font], context: nil)
+        return CGSize(width: ceil(b.width), height: ceil(b.height))
+    }
+
+    static func layout(_ items: [TrackedPiece], refW: CGFloat = 1280, stabilizer: LayoutStabilizer) -> [TranslatedBox] {
         var out: [TranslatedBox] = []
         for item in items {
             guard let vi = item.translation else { continue }
             let p = item.piece
-            let display = p.speaker.map { "[\($0)] \(vi)" } ?? vi
-            let lineHpx = p.rect.height * refH / CGFloat(max(1, p.lineCount))
-            let baseFont = max(9, min(64, lineHpx * 0.80))
-            let isBold = item.style.isBold || p.category == .dialogue
+            let display = p.speakerLabel.map { "\($0) \(vi)" } ?? vi
+            let o = CGRect(x: p.rect.minX * refW, y: p.rect.minY * refH, width: p.rect.width * refW, height: p.rect.height * refH)
+            let observedFont = max(10, min(64, o.height / CGFloat(max(1, p.lineCount)) * 0.80))
 
-            let padX = baseFont * 0.30, padY = baseFont * 0.10
-            let originX = p.rect.minX * refW - padX
-            let originY = p.rect.minY * refH - padY
-            let minW = p.rect.width * refW + padX * 2
-            let minH = p.rect.height * refH + padY * 2
+            var boxRect: CGRect
+            var fontPx: CGFloat
+            var centered = false
 
-            // Giới hạn phải: nút bấm kế tiếp, khung khác cùng hàng, mép màn hình
-            var rightLimit = refW - 4
-            if let r = p.rightLimit { rightLimit = min(rightLimit, r * refW) }
-            var bottomLimit = refH - 2
-            for other in items where other !== item {
-                let o = other.piece.rect
-                let vOverlap = min(o.maxY, p.rect.maxY) - max(o.minY, p.rect.minY) > 0
-                if vOverlap && o.minX >= p.rect.maxX - 0.002 { rightLimit = min(rightLimit, o.minX * refW - 3) }
-                let hOverlap = min(o.maxX, p.rect.maxX) - max(o.minX, p.rect.minX) > 0
-                if hOverlap && o.minY >= p.rect.maxY - 0.002 { bottomLimit = min(bottomLimit, o.minY * refH - 2) }
+            if p.category == .dialogue {
+                // ---- Lời thoại: cỡ chữ + đáy dòng cố định, căn giữa, mọc lên trên ----
+                fontPx = stabilizer.dialogueFontPx ?? observedFont
+                let padX = fontPx * 0.35, padY = fontPx * 0.18
+                let cx = abs(p.rect.midX - 0.5) < 0.12 ? refW / 2 : o.midX
+                let maxW = min(refW * 0.9, 2 * (min(cx, refW - cx) - 6))
+                let size = measure(display, fontPx: fontPx, width: maxW - padX * 2)
+                let boxW = min(maxW, max(size.width + padX * 2 + 2, o.width + padX * 2))
+                var bottom = (stabilizer.dialogueBottomPx ?? o.maxY) + padY
+                bottom = max(bottom, o.maxY + padY)
+                let boxH = max(size.height + padY * 2, bottom - (o.minY - padY))
+                boxRect = CGRect(x: cx - boxW / 2, y: bottom - boxH, width: boxW, height: boxH)
+                centered = true
+            } else {
+                // ---- Menu / lựa chọn / nhiệm vụ: neo góc trái-trên chữ gốc, khoá cỡ chữ ----
+                if let locked = item.lockedFontPx, abs(observedFont - locked) / locked <= 0.2 {
+                    fontPx = locked
+                } else {
+                    fontPx = observedFont
+                    item.lockedFontPx = observedFont
+                }
+                let padX = fontPx * 0.32, padY = fontPx * 0.14
+                let originX = o.minX - padX, originY = o.minY - padY
+                let minW = o.width + padX * 2, minH = o.height + padY * 2
+
+                var rightLimit = refW - 4
+                if let r = p.rightLimit { rightLimit = min(rightLimit, r * refW) }
+                var bottomLimit = refH - 2
+                for other in items where other !== item {
+                    let r = other.piece.rect
+                    let vOverlap = min(r.maxY, p.rect.maxY) - max(r.minY, p.rect.minY) > 0
+                    if vOverlap && r.minX >= p.rect.maxX - 0.002 { rightLimit = min(rightLimit, r.minX * refW - 3) }
+                    let hOverlap = min(r.maxX, p.rect.maxX) - max(r.minX, p.rect.minX) > 0
+                    if hOverlap && r.minY >= p.rect.maxY - 0.002 { bottomLimit = min(bottomLimit, r.minY * refH - 2) }
+                }
+                let maxW = max(minW, rightLimit - originX)
+                let maxH = max(minH, bottomLimit - originY)
+                var scale: CGFloat = 1.0
+                var size = CGSize.zero
+                while true {
+                    size = measure(display, fontPx: fontPx * scale, width: maxW - padX * 2)
+                    if size.height + padY * 2 <= maxH + 1 || scale <= 0.7 { break }
+                    scale -= 0.1
+                }
+                fontPx *= scale
+                let boxW = min(maxW, max(minW, size.width + padX * 2 + 2))
+                let boxH = max(minH, size.height + padY * 2)
+                boxRect = CGRect(x: originX, y: originY, width: boxW, height: boxH)
             }
-            let maxW = max(minW, rightLimit - originX)
-            let maxH = max(minH, bottomLimit - originY)
 
-            var scale: CGFloat = 1.0
-            var boxW = minW, boxH = minH
-            while true {
-                let font = UIFont.systemFont(ofSize: baseFont * scale, weight: isBold ? .semibold : .medium)
-                let bounds = (display as NSString).boundingRect(
-                    with: CGSize(width: maxW - padX * 2, height: .greatestFiniteMagnitude),
-                    options: [.usesLineFragmentOrigin, .usesFontLeading],
-                    attributes: [.font: font], context: nil)
-                boxW = max(minW, ceil(bounds.width) + padX * 2 + 2)
-                boxH = max(minH, ceil(bounds.height) + padY * 2)
-                if boxH <= maxH + 1 || scale <= 0.62 { break }
-                scale -= 0.06
+            let textRGB: (Double, Double, Double)
+            if p.category == .dialogue {
+                textRGB = dialogueYellow
+            } else {
+                let c = item.style.textRGB
+                let lum = 0.299 * c.0 + 0.587 * c.1 + 0.114 * c.2
+                textRGB = lum >= 0.55 ? c : (1, 1, 1)   // nền luôn đen -> chữ tối đổi sang trắng
             }
-            boxW = min(boxW, maxW)
 
-            let textRGB = p.category == .dialogue ? dialogueYellow : item.style.textRGB
             var box = TranslatedBox(
                 text: display,
-                x: Double(originX / refW), y: Double(originY / refH),
-                w: Double(boxW / refW), h: Double(boxH / refH),
+                x: Double(boxRect.minX / refW), y: Double(boxRect.minY / refH),
+                w: Double(boxRect.width / refW), h: Double(boxRect.height / refH),
                 category: p.category.rawValue,
                 isAITranslated: !item.fromDatabase
             )
             box.stableID = item.id
-            box.fontSizeNorm = Double(baseFont * scale / refH)
+            box.fontSizeNorm = Double(fontPx / refH)
             box.textColorHex = StyleSampler.hex(textRGB)
-            box.backgroundColorHex = StyleSampler.hex(item.style.backgroundRGB)
-            box.isBold = isBold
+            box.backgroundColorHex = StyleSampler.hex(black)
+            box.isBold = true
+            box.textAlignCenter = centered
             out.append(box)
         }
         return out
@@ -979,9 +1226,10 @@ final class SmartSubtitleEngine {
     private var nextID = 1
     private var lastFrame: CGImage?
     private var busy = false
+    private let stabilizer = LayoutStabilizer()
 
     var useOnlineAI = true
-    /// 1.12: chọn bộ dịch AI (Apple Intelligence trên máy / Google online)
+    /// Bộ dịch AI (Apple Intelligence trên máy / Google online)
     var engineMode: TranslationEngineMode = .appleThenGoogle
     /// Tên game đang chơi (ngữ cảnh cho AI)
     var gameTitle: String = ""
@@ -995,6 +1243,7 @@ final class SmartSubtitleEngine {
         queue.async {
             self.filter.extraNames = self.memory.names
             self.tracked.removeAll()
+            self.stabilizer.reset()
         }
         return rep
     }
@@ -1011,28 +1260,64 @@ final class SmartSubtitleEngine {
             self.frameRefW = 720 * CGFloat(frame.width) / CGFloat(max(1, frame.height))
             let names = Array(GameVocabulary.builtInNames.union(self.memory.names)).map { $0.capitalized }
             let lines = self.ocr.recognize(cropped: cropped, roi: roi, customWords: names)
-            let pieces = PieceBuilder.buildPieces(lines: lines, filter: self.filter, refW: self.frameRefW)
+            let memory = self.memory
+            let pieces = PieceBuilder.buildPieces(lines: lines, filter: self.filter, refW: self.frameRefW,
+                                                  isKnownText: { memory.containsExact($0) })
             self.updateTracking(with: pieces, frame: frame)
-            let visible = self.tracked.filter { $0.isVisible }
-            let boxes = SubtitleLayoutEngine.layout(visible, refW: self.frameRefW)
-            let summary = visible.isEmpty
-                ? (lines.isEmpty ? "Màn hình không có chữ" : "Đã lọc \(lines.count) dòng chữ rác / chưa cần dịch")
-                : visible.map { $0.piece.sourceText }.joined(separator: " | ")
+            let visible = self.visibleItems(now: Date())
+            let boxes = SubtitleLayoutEngine.layout(visible, refW: self.frameRefW, stabilizer: self.stabilizer)
+            let present = self.tracked.filter { $0.goneAt == nil }
+            let summary: String
+            if present.isEmpty {
+                summary = lines.isEmpty ? "Màn hình không có chữ" : "Đã lọc \(lines.count) dòng chữ rác / chưa cần dịch"
+            } else {
+                summary = present.map { t in
+                    let src = t.translation == nil ? (t.aiPending ? "⏳AI" : "✗") : (t.fromDatabase ? "📗Data" : "🤖AI")
+                    return "\(src) \(t.piece.sourceText)"
+                }.joined(separator: " | ")
+            }
             completion(boxes, summary)
         }
     }
 
     func reset() {
-        queue.async { self.tracked.removeAll() }
+        queue.async {
+            self.tracked.removeAll()
+            self.stabilizer.reset()
+        }
+    }
+
+    /// Khung đang hiện: khung đã "hết chữ gốc" (đang giữ) sẽ nhường chỗ cho câu mới ở cùng vị trí
+    private func visibleItems(now: Date) -> [TrackedPiece] {
+        let candidates = tracked.filter { $0.isVisible(at: now) }.sorted { $0.createdOrder > $1.createdOrder }
+        var out: [TrackedPiece] = []
+        for t in candidates {
+            let r = t.piece.rect.insetBy(dx: -0.01, dy: -0.02)
+            let conflict = out.contains { o in
+                (o.piece.category == .dialogue && t.piece.category == .dialogue)
+                    || o.piece.rect.insetBy(dx: -0.01, dy: -0.02).intersects(r)
+            }
+            if conflict && t.goneAt != nil { continue }
+            out.append(t)
+        }
+        return out.sorted { $0.createdOrder < $1.createdOrder }
     }
 
     private func updateTracking(with pieces: [SSPiece], frame: CGImage) {
+        let now = Date()
         var matchedIDs = Set<String>()
+
         for piece in pieces {
             let key = TranslationMemory.normalize(piece.sourceText)
             guard !key.isEmpty else { continue }
             let keyTokens = key.split(separator: " ").map(String.init)
 
+            if piece.category == .dialogue {
+                let lineH = piece.rect.height * SubtitleLayoutEngine.refH / CGFloat(max(1, piece.lineCount))
+                stabilizer.observeDialogue(fontPx: max(10, min(64, lineH * 0.80)), bottomPx: piece.rect.maxY * SubtitleLayoutEngine.refH)
+            }
+
+            // (a) Cùng chữ / gần giống, cùng vị trí
             var bestMatch: TrackedPiece?
             var bestScore = 0.0
             for t in tracked where !matchedIDs.contains(t.id) {
@@ -1042,68 +1327,109 @@ final class SmartSubtitleEngine {
                 let score = sim - Double(dist)
                 if sim >= 0.6 && score > bestScore { bestScore = score; bestMatch = t }
             }
+            // Tra data chỉ khi chữ mới / chữ đổi (đỡ tốn CPU mỗi lần quét)
+            let dbMatch: TranslationMemory.Match? = (bestMatch?.key == key) ? nil : memory.lookupMatch(piece.sourceText)
+            // (b) Đoạn tiếp theo của CÙNG câu trong data -> dùng lại khung cũ (không chớp)
+            if bestMatch == nil, let m = dbMatch {
+                bestMatch = tracked.first { t in
+                    !matchedIDs.contains(t.id) && t.dbIndex == m.index && t.piece.category == piece.category
+                        && abs(t.piece.rect.midY - piece.rect.midY) < 0.2
+                }
+            }
 
             if let t = bestMatch {
                 matchedIDs.insert(t.id)
                 t.hits += 1
                 t.misses = 0
+                t.goneAt = nil
                 let r = t.piece.rect, n = piece.rect
                 let moved = abs(r.minX - n.minX) > 0.012 || abs(r.minY - n.minY) > 0.012
                     || abs(r.width - n.width) > 0.03 || abs(r.height - n.height) > 0.02
                 var updated = piece
                 if !moved { updated.rect = r }   // giữ nguyên vị trí -> khung không rung
-                let textChanged = t.key != key && TranslationMemory.similarity(keyTokens, t.key.split(separator: " ").map(String.init)) < 0.95
+                if t.piece.speakerLabel != nil && updated.speakerLabel == nil { updated.speakerLabel = t.piece.speakerLabel }
                 t.piece = updated
                 if moved { t.style = StyleSampler.sample(frame: frame, rect: piece.rect) }
                 t.thumb = StyleSampler.thumbnail(frame: frame, rect: t.piece.rect)
-                if textChanged {
+                if t.key != key {
+                    let oldTokens = t.key.split(separator: " ").map(String.init)
                     t.key = key
-                    t.translation = nil
-                    translate(t)
-                } else if t.translation == nil {
+                    if let m = dbMatch {
+                        if t.translation != m.vi { t.translation = m.vi; t.shownAt = now }
+                        t.fromDatabase = true
+                        t.dbIndex = m.index
+                    } else if TranslationMemory.similarity(keyTokens, oldTokens) < 0.95 && !t.fromDatabase {
+                        t.translation = nil
+                        t.shownAt = nil
+                        translate(t)
+                    }
+                } else if t.translation == nil && !t.aiPending {
                     translate(t)
                 }
             } else {
-                let t = TrackedPiece(id: "ss\(nextID)", key: key, piece: piece)
+                let t = TrackedPiece(id: "ss\(nextID)", order: nextID, key: key, piece: piece)
                 nextID += 1
                 t.style = StyleSampler.sample(frame: frame, rect: piece.rect)
                 t.thumb = StyleSampler.thumbnail(frame: frame, rect: piece.rect)
-                translate(t)
+                if let m = dbMatch {
+                    t.translation = m.vi
+                    t.fromDatabase = true
+                    t.dbIndex = m.index
+                    t.shownAt = now
+                } else {
+                    translate(t)
+                }
                 tracked.append(t)
                 matchedIDs.insert(t.id)
             }
         }
 
-        // Khung không còn thấy trong lần quét này
-        tracked.removeAll { t in
-            guard !matchedIDs.contains(t.id) else { return false }
+        // Khung không còn thấy chữ gốc trong lần quét này
+        for t in tracked where !matchedIDs.contains(t.id) {
             t.misses += 1
-            let now = StyleSampler.thumbnail(frame: frame, rect: t.piece.rect)
-            let vanished = StyleSampler.thumbDiff(now, t.thumb) > 16
-            return vanished || t.misses >= 2 || !t.isVisible
+            if t.goneAt == nil {
+                let now2 = StyleSampler.thumbnail(frame: frame, rect: t.piece.rect)
+                let vanished = StyleSampler.thumbDiff(now2, t.thumb) > 16
+                if vanished || t.misses >= 2 { t.goneAt = now }
+            }
+        }
+        tracked.removeAll { t in
+            if matchedIDs.contains(t.id) { return false }
+            guard let gone = t.goneAt else { return false }
+            if t.translation == nil {
+                // Đang chờ AI: giữ tối đa 3 giây để bản dịch về kịp hiện
+                return !(t.aiPending && now.timeIntervalSince(gone) < 3.0)
+            }
+            if !t.isConfirmed { return true }
+            return !t.isVisible(at: now)
         }
     }
 
     private func translate(_ t: TrackedPiece) {
         let src = t.piece.sourceText
-        if let vi = memory.lookup(src) {
-            t.translation = vi
+        if let m = memory.lookupMatch(src) {
+            t.translation = m.vi
             t.fromDatabase = true
+            t.dbIndex = m.index
+            t.shownAt = Date()
             return
         }
         if let vi = GameVocabulary.uiDictionary[t.key] {
             t.translation = vi
             t.fromDatabase = true
+            t.shownAt = Date()
             return
         }
         let aiKey = "ai|" + t.key
         let preferApple = engineMode == .appleThenGoogle || engineMode == .appleOnly
         if preferApple, let vi = online.cached(aiKey) {
             t.translation = vi
+            t.shownAt = Date()
             return
         }
         if engineMode != .appleOnly, let vi = online.cached(t.key) {
             t.translation = vi
+            t.shownAt = Date()
             return
         }
         guard useOnlineAI, engineMode != .offline else { return }
@@ -1116,16 +1442,19 @@ final class SmartSubtitleEngine {
             }
         }
         let key = t.key
+        t.aiPending = true
         let deliver: (String) -> Void = { [weak self] vi in
             guard let self = self else { return }
             self.queue.async {
                 var changed = false
                 for item in self.tracked where item.key == key && item.translation == nil {
                     item.translation = vi
+                    item.aiPending = false
+                    item.shownAt = Date()
                     changed = true
                 }
                 if changed {
-                    let boxes = SubtitleLayoutEngine.layout(self.tracked.filter { $0.isVisible }, refW: self.frameRefW)
+                    let boxes = SubtitleLayoutEngine.layout(self.visibleItems(now: Date()), refW: self.frameRefW, stabilizer: self.stabilizer)
                     self.onAsyncUpdate?(boxes)
                 }
             }
@@ -1153,6 +1482,8 @@ final class SmartSubtitleEngine {
                     deliver(vi)
                 } else if mode == .appleThenGoogle {
                     google()
+                } else {
+                    self?.queue.async { for item in self?.tracked ?? [] where item.key == key { item.aiPending = false } }
                 }
             }
         } else if engineMode != .appleOnly {
