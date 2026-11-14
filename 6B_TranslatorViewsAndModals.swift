@@ -1,6 +1,6 @@
 // ============================================================================
 // FILE 6B: 6B_TranslatorViewsAndModals.swift (TÁCH TỪ FILE 6 - PHẦN 2/2)
-// PHIÊN BẢN: PS5Translator 1.07 (ĐỒNG BỘ COOKIE DEFAULT & NÚT REPLAYKIT LIVE)
+// PHIÊN BẢN: PS5Translator 1.12 (TAB YOUTUBE, XOAY NGANG, THƯ VIỆN GAME)
 // ============================================================================
 
 import SwiftUI
@@ -12,6 +12,7 @@ import UniformTypeIdentifiers
 // ============================================================================
 struct MainTranslatorView: View {
     @StateObject private var coord = PipelineCoordinator()
+    @StateObject private var youtube = YouTubeTranslatorModel()
     @State private var showPS5ConnectSheet = false
     @State private var showGameProfilesSheet = false
     @State private var showROICalibrationPanel = false
@@ -29,24 +30,68 @@ struct MainTranslatorView: View {
             )
             .ignoresSafeArea()
 
-            ScrollView(.vertical, showsIndicators: false) {
-                VStack(spacing: 11) {
-                    topPlayStationBar
-                    ps5ScreenViewport
-                    liveOCRAndTVTestStrip
-                    bottomDualSenseControlBar
+            // 1.12: 2 tab (Remote PS5 / Dịch YouTube) + chế độ xoay ngang toàn màn hình
+            VStack(spacing: 0) {
+                if !coord.isLandscapeFullscreen {
+                    appTabPicker
                 }
-                .padding(.top, 6)
-                .padding(.bottom, 16)
+                if coord.activeTab == .youtube {
+                    YouTubeTranslatorTab(model: youtube, coord: coord)
+                        .ignoresSafeArea(edges: coord.isLandscapeFullscreen ? .all : [])
+                } else if coord.isLandscapeFullscreen {
+                    PS5FullscreenView(coord: coord, videoMgr: coord.videoMgr)
+                } else {
+                    ScrollView(.vertical, showsIndicators: false) {
+                        VStack(spacing: 11) {
+                            topPlayStationBar
+                            ps5ScreenViewport
+                            liveOCRAndTVTestStrip
+                            bottomDualSenseControlBar
+                        }
+                        .padding(.top, 6)
+                        .padding(.bottom, 16)
+                    }
+                }
             }
         }
         .preferredColorScheme(.dark)
+        .statusBarHidden(coord.isLandscapeFullscreen)
         .sheet(isPresented: $showPS5ConnectSheet) {
             PS5ConnectionWizardView(coord: coord)
         }
         .sheet(isPresented: $showGameProfilesSheet) {
-            GameProfileFolderManagerView(coord: coord)
+            GameLibraryView(coord: coord)
         }
+    }
+
+    private var appTabPicker: some View {
+        HStack(spacing: 6) {
+            ForEach(AppTab.allCases) { tab in
+                Button(action: {
+                    withAnimation(.easeInOut(duration: 0.15)) { coord.activeTab = tab }
+                }) {
+                    Label(tab.title, systemImage: tab.icon)
+                        .font(.system(size: 13, weight: .bold))
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 8)
+                        .background(coord.activeTab == tab ? psNeonAccent : Color.white.opacity(0.06))
+                        .foregroundColor(.white)
+                        .cornerRadius(10)
+                }
+                .buttonStyle(.plain)
+            }
+            Button(action: { showGameProfilesSheet = true }) {
+                Image(systemName: "books.vertical.fill")
+                    .font(.system(size: 14, weight: .bold))
+                    .padding(9)
+                    .background(Color.white.opacity(0.08))
+                    .foregroundColor(.cyan)
+                    .cornerRadius(10)
+            }
+            .buttonStyle(.plain)
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 6)
     }
 
     private var topPlayStationBar: some View {
@@ -217,6 +262,15 @@ struct MainTranslatorView: View {
 
             Spacer()
 
+            Button(action: { coord.isLandscapeFullscreen = true }) {
+                Image(systemName: "arrow.up.left.and.arrow.down.right")
+                    .font(.system(size: 12, weight: .bold))
+                    .padding(6)
+                    .background(Color.white.opacity(0.12))
+                    .foregroundColor(.white)
+                    .cornerRadius(7)
+            }
+
             Button(action: {
                 coord.triggerTVTestSentence()
             }) {
@@ -321,10 +375,10 @@ struct MainTranslatorView: View {
                 Image(systemName: "sparkles")
                     .foregroundColor(.yellow)
                 VStack(alignment: .leading, spacing: 1) {
-                    Text("Dịch AI online (giữ nguyên tên riêng)")
+                    Text("Dịch AI: \(coord.translationEngineMode.title)")
                         .font(.system(size: 12, weight: .bold))
                         .foregroundColor(.white)
-                    Text("Dịch câu chưa có trong data Việt hoá (Google Dịch, cần Internet, lưu bộ nhớ đệm)")
+                    Text("Dịch câu chưa có trong data Việt hoá. Đổi bộ dịch trong Thư viện game.")
                         .font(.system(size: 10))
                         .foregroundColor(.white.opacity(0.7))
                 }
@@ -361,7 +415,7 @@ struct MainTranslatorView: View {
                     HStack {
                         Image(systemName: "folder.fill.badge.gearshape")
                         VStack(alignment: .leading, spacing: 2) {
-                            Text("Hồ sơ game")
+                            Text("Thư viện game")
                                 .font(.system(size: 13, weight: .bold))
                             Text("\(coord.activeProfileFolderName) (\(coord.loadedLineCount) câu)")
                                 .font(.system(size: 10))
@@ -1375,6 +1429,9 @@ struct LinkedPS5ProfilesSection: View {
 
 @main
 struct PS5TranslatorApp: App {
+    // 1.12: điều khiển xoay ngang toàn màn hình
+    @UIApplicationDelegateAdaptor(AppOrientationDelegate.self) var orientationDelegate
+
     var body: some Scene {
         WindowGroup {
             MainTranslatorView()

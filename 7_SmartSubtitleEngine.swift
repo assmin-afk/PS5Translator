@@ -1,6 +1,6 @@
 // ============================================================================
 // FILE 7: 7_SmartSubtitleEngine.swift
-// PHIÊN BẢN: PS5Translator 1.11 (BỘ MÁY QUÉT CHỮ THÔNG MINH)
+// PHIÊN BẢN: PS5Translator 1.12 (QUÉT CHỮ THÔNG MINH + YOUTUBE + APPLE INTELLIGENCE)
 //
 // Luồng xử lý mỗi lần quét:
 //  1. OCR Apple Vision (.accurate) -> lấy từng DÒNG + toạ độ TỪNG TỪ.
@@ -293,7 +293,7 @@ enum PieceBuilder {
     }
 
     /// Chia 1 dòng thành các đoạn chữ nằm giữa các nút bấm / khoảng trống chứa icon
-    static func segments(of line: SSLine) -> [(words: [SSWord], rightLimit: CGFloat?)] {
+    static func segments(of line: SSLine, refW: CGFloat = 1280) -> [(words: [SSWord], rightLimit: CGFloat?)] {
         let words = line.words.sorted { $0.rect.minX < $1.rect.minX }
         let lineHpx = line.rect.height * refH
         var result: [(words: [SSWord], rightLimit: CGFloat?)] = []
@@ -358,7 +358,7 @@ enum PieceBuilder {
     }
 
     /// Dòng -> các khối cần dịch
-    static func buildPieces(lines rawLines: [SSLine], filter: GameTextFilter) -> [SSPiece] {
+    static func buildPieces(lines rawLines: [SSLine], filter: GameTextFilter, refW: CGFloat = 1280) -> [SSPiece] {
         var plainLines: [SSLine] = []
         var pieces: [SSPiece] = []
 
@@ -368,7 +368,7 @@ enum PieceBuilder {
             let hPx = line.rect.height * refH
             guard hPx >= 9, hPx <= 90 else { continue }   // quá nhỏ (số HUD) hoặc quá to (vệt sáng)
 
-            let segs = segments(of: line)
+            let segs = segments(of: line, refW: refW)
             if segs.count == 1 && segs[0].rightLimit == nil && segs[0].words.count == line.words.count {
                 plainLines.append(line)
                 continue
@@ -677,6 +677,7 @@ final class TranslationMemory {
 // MARK: - Dịch AI online (dự phòng) - GIỮ NGUYÊN TÊN RIÊNG
 
 final class OnlineFallbackTranslator {
+    static let shared = OnlineFallbackTranslator()
     private let lock = NSLock()
     private var cache: [String: String] = [:]
     private var pending: Set<String> = []
@@ -754,6 +755,13 @@ final class OnlineFallbackTranslator {
         if shouldSave, let data = try? JSONEncoder().encode(snapshot) {
             try? data.write(to: cacheURL, options: .atomic)
         }
+    }
+
+    func store(key: String, value: String) {
+        lock.lock()
+        cache[key] = value
+        dirty = true
+        lock.unlock()
     }
 
     func persist() {
@@ -895,7 +903,7 @@ enum SubtitleLayoutEngine {
     static let refH: CGFloat = 720
     static let dialogueYellow = (1.0, 0.86, 0.10)
 
-    static func layout(_ items: [TrackedPiece]) -> [TranslatedBox] {
+    static func layout(_ items: [TrackedPiece], refW: CGFloat = 1280) -> [TranslatedBox] {
         var out: [TranslatedBox] = []
         for item in items {
             guard let vi = item.translation else { continue }
@@ -963,7 +971,7 @@ enum SubtitleLayoutEngine {
 
 final class SmartSubtitleEngine {
     let memory = TranslationMemory()
-    let online = OnlineFallbackTranslator()
+    let online = OnlineFallbackTranslator.shared
     private let filter = GameTextFilter()
     private let ocr = SmartOCREngine()
     private let queue = DispatchQueue(label: "ps5translator.smartsubtitle", qos: .userInitiated)
@@ -973,6 +981,12 @@ final class SmartSubtitleEngine {
     private var busy = false
 
     var useOnlineAI = true
+    /// 1.12: chọn bộ dịch AI (Apple Intelligence trên máy / Google online)
+    var engineMode: TranslationEngineMode = .appleThenGoogle
+    /// Tên game đang chơi (ngữ cảnh cho AI)
+    var gameTitle: String = ""
+    private var frameRefW: CGFloat = 1280
+    private var recentDialogue: [String] = []
     /// Gọi khi bản dịch AI về muộn -> cập nhật khung ngay không đợi lần quét sau
     var onAsyncUpdate: (([TranslatedBox]) -> Void)?
 
@@ -993,12 +1007,14 @@ final class SmartSubtitleEngine {
         queue.async {
             defer { self.busy = false }
             self.lastFrame = frame
+            // Hệ toạ độ tham chiếu cao 720, rộng theo tỉ lệ khung hình (YouTube có video dọc / vuông)
+            self.frameRefW = 720 * CGFloat(frame.width) / CGFloat(max(1, frame.height))
             let names = Array(GameVocabulary.builtInNames.union(self.memory.names)).map { $0.capitalized }
             let lines = self.ocr.recognize(cropped: cropped, roi: roi, customWords: names)
-            let pieces = PieceBuilder.buildPieces(lines: lines, filter: self.filter)
+            let pieces = PieceBuilder.buildPieces(lines: lines, filter: self.filter, refW: self.frameRefW)
             self.updateTracking(with: pieces, frame: frame)
             let visible = self.tracked.filter { $0.isVisible }
-            let boxes = SubtitleLayoutEngine.layout(visible)
+            let boxes = SubtitleLayoutEngine.layout(visible, refW: self.frameRefW)
             let summary = visible.isEmpty
                 ? (lines.isEmpty ? "Màn hình không có chữ" : "Đã lọc \(lines.count) dòng chữ rác / chưa cần dịch")
                 : visible.map { $0.piece.sourceText }.joined(separator: " | ")
@@ -1080,11 +1096,17 @@ final class SmartSubtitleEngine {
             t.fromDatabase = true
             return
         }
-        if let vi = online.cached(t.key) {
+        let aiKey = "ai|" + t.key
+        let preferApple = engineMode == .appleThenGoogle || engineMode == .appleOnly
+        if preferApple, let vi = online.cached(aiKey) {
             t.translation = vi
             return
         }
-        guard useOnlineAI else { return }
+        if engineMode != .appleOnly, let vi = online.cached(t.key) {
+            t.translation = vi
+            return
+        }
+        guard useOnlineAI, engineMode != .offline else { return }
         // Tên riêng: tên có sẵn + từ viết hoa giữa câu không có trong từ điển tiếng Anh
         var protected: [String] = []
         let words = src.split(separator: " ").map { String($0).trimmingCharacters(in: .punctuationCharacters) }
@@ -1094,7 +1116,7 @@ final class SmartSubtitleEngine {
             }
         }
         let key = t.key
-        online.request(text: src, key: key, protectedWords: protected) { [weak self] vi in
+        let deliver: (String) -> Void = { [weak self] vi in
             guard let self = self else { return }
             self.queue.async {
                 var changed = false
@@ -1103,10 +1125,38 @@ final class SmartSubtitleEngine {
                     changed = true
                 }
                 if changed {
-                    let boxes = SubtitleLayoutEngine.layout(self.tracked.filter { $0.isVisible })
+                    let boxes = SubtitleLayoutEngine.layout(self.tracked.filter { $0.isVisible }, refW: self.frameRefW)
                     self.onAsyncUpdate?(boxes)
                 }
             }
+        }
+        let google: () -> Void = { [weak self] in
+            self?.online.request(text: src, key: key, protectedWords: protected, completion: deliver)
+        }
+
+        if preferApple && OnDeviceAITranslator.shared.isAvailable {
+            let context = AITranslationContext(
+                gameTitle: gameTitle,
+                category: t.piece.category,
+                speaker: t.piece.speaker,
+                protectedWords: protected + Array(memory.names.prefix(40)).map { $0.capitalized },
+                previousLines: recentDialogue
+            )
+            if t.piece.category == .dialogue {
+                recentDialogue.append(src)
+                if recentDialogue.count > 3 { recentDialogue.removeFirst() }
+            }
+            let mode = engineMode
+            OnDeviceAITranslator.shared.translate(src, key: aiKey, context: context) { [weak self] vi in
+                if let vi = vi {
+                    self?.online.store(key: aiKey, value: vi)
+                    deliver(vi)
+                } else if mode == .appleThenGoogle {
+                    google()
+                }
+            }
+        } else if engineMode != .appleOnly {
+            google()
         }
     }
 }

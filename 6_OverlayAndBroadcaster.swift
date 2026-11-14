@@ -22,7 +22,7 @@ import SQLite3
 // 1. THÔNG SỐ CẤU HÌNH PHIÊN BẢN PS5TRANSLATOR 1.02 (Đặt ở đầu file)
 // ============================================================================
 struct TranslatorV102Config {
-    static let appVersionName = "PS5Translator 1.11"
+    static let appVersionName = "PS5Translator 1.12"
     static let tvTestSentence = "phụ đề tiếng Việt như thế này"
     static let defaultScanFPS: Double = 6.0
     static let minScanFPS: Double = 1.0
@@ -540,8 +540,38 @@ class PipelineCoordinator: ObservableObject {
     @Published var loadedLineCount: Int = 0
 
     @Published var enableAppleIntelligenceFallback: Bool = true {
-        didSet { smartEngine.useOnlineAI = enableAppleIntelligenceFallback }
+        didSet {
+            smartEngine.useOnlineAI = enableAppleIntelligenceFallback
+            youtubeEngine.useOnlineAI = enableAppleIntelligenceFallback
+        }
     }
+    /// 1.12: Bộ dịch AI (Apple Intelligence trên iPhone / Google online)
+    @Published var translationEngineMode: TranslationEngineMode =
+        TranslationEngineMode(rawValue: UserDefaults.standard.string(forKey: "translation_engine_v112") ?? "") ?? .appleThenGoogle {
+        didSet {
+            UserDefaults.standard.set(translationEngineMode.rawValue, forKey: "translation_engine_v112")
+            smartEngine.engineMode = translationEngineMode
+            youtubeEngine.engineMode = translationEngineMode
+            smartEngine.reset()
+            youtubeEngine.reset()
+        }
+    }
+    /// 1.12: Tab đang mở (Remote PS5 / Dịch YouTube)
+    @Published var activeTab: AppTab = .ps5 {
+        didSet {
+            if activeTab != .ps5 { translatedBoxes = [] }
+            if activeTab != .youtube { youtubeBoxes = [] }
+        }
+    }
+    /// 1.12: Xoay ngang toàn màn hình (dùng chung cho PS5 và YouTube)
+    @Published var isLandscapeFullscreen: Bool = false {
+        didSet { OrientationController.setLandscape(isLandscapeFullscreen) }
+    }
+    @Published var youtubeBoxes: [TranslatedBox] = []
+    @Published var youtubeSummary: String = "—"
+    /// Số câu Việt hoá dùng được của từng game (đã kiểm tra)
+    @Published var profileStats: [String: Int] = (UserDefaults.standard.dictionary(forKey: "profile_stats_v112") as? [String: Int]) ?? [:]
+    @Published var importMessage: String?
     /// 1.11: Kết quả kiểm tra data Việt hoá đang dùng (hiện trong Hồ sơ game)
     @Published var databaseReport: String = "Chưa có data Việt hoá"
 
@@ -549,6 +579,9 @@ class PipelineCoordinator: ObservableObject {
     @Published var lastRecognizedEnglish: String = "Đang quét chữ thời gian thực..."
 
     private let smartEngine = SmartSubtitleEngine()
+    private let youtubeEngine = SmartSubtitleEngine()
+    private var isYouTubeProcessing = false
+    var isYouTubeOCRBusy: Bool { isYouTubeProcessing }
     private var cancellables = Set<AnyCancellable>()
     private var tvTestWorkItem: DispatchWorkItem?
 
@@ -557,6 +590,14 @@ class PipelineCoordinator: ObservableObject {
 
     init() {
         throttler.targetScanFPS = TranslatorV102Config.defaultScanFPS
+        smartEngine.engineMode = translationEngineMode
+        youtubeEngine.engineMode = translationEngineMode
+        youtubeEngine.onAsyncUpdate = { [weak self] boxes in
+            DispatchQueue.main.async {
+                guard let self = self, self.activeTab == .youtube else { return }
+                self.youtubeBoxes = boxes
+            }
+        }
         smartEngine.onAsyncUpdate = { [weak self] boxes in
             DispatchQueue.main.async {
                 guard let self = self, !self.isShowingTVTestSentence else { return }
@@ -670,8 +711,62 @@ class PipelineCoordinator: ObservableObject {
     /// 1.11: Nạp data Việt hoá bằng bộ đọc mới (tự nhận cấu trúc, báo lỗi data)
     private func loadTranslationDatabase(_ url: URL) {
         let report = smartEngine.loadDatabase(url: url)
+        _ = youtubeEngine.loadDatabase(url: url)
         loadedLineCount = report.validPairs
         databaseReport = report.summary
+        smartEngine.gameTitle = activeProfileFolderName
+        youtubeEngine.gameTitle = activeProfileFolderName
+        profileStats[activeProfileFolderName] = report.validPairs
+        UserDefaults.standard.set(profileStats, forKey: "profile_stats_v112")
+    }
+
+    /// 1.12: Nạp data Việt hoá: .sqlite/.db chép thẳng, .csv/.tsv/.txt tự chuyển sang SQLite chuẩn
+    func importDataIntoProfileFolder(folderName: String, sourceURL: URL) {
+        let ext = sourceURL.pathExtension.lowercased()
+        if ext == "sqlite" || ext == "db" || ext == "sqlite3" {
+            importSQLiteIntoProfileFolder(folderName: folderName, sourceURL: sourceURL)
+            importMessage = "✅ Đã nạp \(sourceURL.lastPathComponent) cho \(folderName). \(databaseReport)"
+            return
+        }
+        let secured = sourceURL.startAccessingSecurityScopedResource()
+        defer { if secured { sourceURL.stopAccessingSecurityScopedResource() } }
+        let fm = FileManager.default
+        let folderURL = profilesRootURL.appendingPathComponent(folderName, isDirectory: true)
+        try? fm.createDirectory(at: folderURL, withIntermediateDirectories: true)
+        do {
+            let pairs = try DataImporter.readPairs(from: sourceURL)
+            if let oldFiles = try? fm.contentsOfDirectory(atPath: folderURL.path) {
+                for old in oldFiles where old.hasSuffix(".sqlite") || old.hasSuffix(".db") {
+                    try? fm.removeItem(at: folderURL.appendingPathComponent(old))
+                }
+            }
+            let count = try DataImporter.writeSQLite(pairs: pairs, to: folderURL.appendingPathComponent("game_data.sqlite"))
+            activateGameProfileFolder(folderName: folderName)
+            importMessage = "✅ Đã chuyển \(sourceURL.lastPathComponent) thành data: \(count) cặp Anh → Việt."
+        } catch {
+            importMessage = "⚠️ Không nạp được \(sourceURL.lastPathComponent): \(error.localizedDescription)"
+            refreshGameProfileFolders()
+        }
+    }
+
+    func processYouTubeFrame(_ frame: CGImage) {
+        guard activeTab == .youtube, !isYouTubeProcessing else { return }
+        isYouTubeProcessing = true
+        youtubeEngine.useOnlineAI = enableAppleIntelligenceFallback
+        youtubeEngine.process(frame: frame, cropped: frame, roi: CGRect(x: 0, y: 0, width: 1, height: 1)) { [weak self] boxes, summary in
+            DispatchQueue.main.async {
+                guard let self = self else { return }
+                self.isYouTubeProcessing = false
+                guard self.activeTab == .youtube else { return }
+                self.youtubeSummary = summary
+                if boxes != self.youtubeBoxes { self.youtubeBoxes = boxes }
+            }
+        }
+    }
+
+    func resetYouTubeTracking() {
+        youtubeEngine.reset()
+        youtubeBoxes = []
     }
 
     func createNewGameProfileFolder(folderName: String) {
@@ -709,12 +804,17 @@ class PipelineCoordinator: ObservableObject {
         let folderURL = profilesRootURL.appendingPathComponent(folderName, isDirectory: true)
         let contents = (try? fm.contentsOfDirectory(atPath: folderURL.path)) ?? []
 
+        activeProfileFolderName = folderName
         if let sqliteFile = contents.first(where: { $0.hasSuffix(".sqlite") || $0.hasSuffix(".db") }) {
             let sourceSQLiteURL = folderURL.appendingPathComponent(sqliteFile)
             loadTranslationDatabase(sourceSQLiteURL)
+        } else {
+            loadedLineCount = 0
+            databaseReport = "Game này chưa có data Việt hoá → dịch bằng AI"
+            smartEngine.gameTitle = folderName
+            youtubeEngine.gameTitle = folderName
         }
 
-        activeProfileFolderName = folderName
         UserDefaults.standard.set(folderName, forKey: "active_profile_folder_v102")
         refreshGameProfileFolders()
     }
@@ -727,7 +827,7 @@ class PipelineCoordinator: ObservableObject {
 
     // MARK: - 1.11: Luồng quét chữ thông minh (lọc rác, giữ khung ổn định, khớp kiểu chữ gốc)
     private func processFrameRealtime(_ frame: CGImage) {
-        guard !isShowingTVTestSentence else { return }
+        guard !isShowingTVTestSentence, activeTab == .ps5 else { return }
         guard !isOCRProcessing, !smartEngine.isBusy else { return }
 
         let now = Date().timeIntervalSince1970
