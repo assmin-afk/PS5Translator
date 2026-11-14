@@ -1,4 +1,4 @@
-name: Dong goi App iPhone (.ipa) PS5Translator 1.15
+name: Dong goi App iPhone (.ipa) PS5Translator 1.19
 
 on:
   push:
@@ -100,6 +100,11 @@ jobs:
                   print(f"Successfully hooked C-Bridge into {path}")
           PYEOF
 
+          # 1.18: ma nguon app TV Samsung di kem app iPhone (cai TV truc tiep tu iPhone)
+          if [ -d "TVApp" ]; then
+            cp TVApp/* Sources/
+          fi
+
           if [ -f "icon.png" ]; then
             cp icon.png Sources/icon.png
             mkdir -p Sources/Assets.xcassets/AppIcon.appiconset
@@ -120,6 +125,11 @@ jobs:
             }
           }
           EOF
+          fi
+
+          # 1.19: logo MQ tren thanh dau app
+          if [ -f "app_logo.png" ]; then
+            cp app_logo.png Sources/app_logo.png
           fi
 
           if [ -f "game_data.sqlite" ]; then
@@ -149,6 +159,8 @@ jobs:
                     - UIInterfaceOrientationLandscapeLeft
                     - UIInterfaceOrientationLandscapeRight
                   NSLocalNetworkUsageDescription: "Cho phep ket noi Wi-Fi noi bo voi PS5 va TV Samsung de truyen phu de."
+                  NSAppTransportSecurity:
+                    NSAllowsLocalNetworking: true
                   UIBackgroundModes:
                     - audio
               settings:
