@@ -1,6 +1,6 @@
 // ============================================================================
 // FILE 6B: 6B_TranslatorViewsAndModals.swift (TÁCH TỪ FILE 6 - PHẦN 2/2)
-// PHIÊN BẢN: PS5Translator 1.19 (GIAO DIỆN MỚI: TRANG CHỦ · GAME · THƯ VIỆN GAME, LOG QUÉT CHỮ)
+// PHIÊN BẢN: PS5Translator 1.21 (GIAO DIỆN MỚI: TRANG CHỦ · GAME · THƯ VIỆN GAME, LOG QUÉT CHỮ)
 // ============================================================================
 
 import SwiftUI
@@ -316,11 +316,11 @@ struct MainTranslatorView: View {
                     .font(.system(size: 16, weight: .semibold))
                     .frame(width: 22)
                 VStack(alignment: .leading, spacing: 2) {
-                    Text("Dịch AI: \(coord.translationEngineMode.title)")
+                    Text("Dịch AI: Tất cả (khuyên dùng)")
                         .font(.system(size: 14, weight: .semibold))
                         .lineLimit(1)
                         .minimumScaleFactor(0.8)
-                    Text("Dịch câu chưa có trong data Việt hoá. Đổi bộ dịch ở tab Game.")
+                    Text("Câu chưa có trong data Việt hoá: Apple AI dịch trước, không được thì Google.")
                         .font(.system(size: 12))
                         .foregroundColor(MQTheme.tertiary)
                         .lineLimit(2)
@@ -328,7 +328,7 @@ struct MainTranslatorView: View {
                 Spacer(minLength: 6)
                 Toggle("", isOn: $coord.enableAppleIntelligenceFallback)
                     .labelsHidden()
-                    .tint(Color(white: 0.75))
+                    .tint(MQTheme.toggleOn)
             }
             .padding(.vertical, 10)
         }
@@ -526,234 +526,207 @@ struct PS5ConnectionWizardView: View {
     @Environment(\.presentationMode) var presentationMode
     @State private var showPSNWebLogin = false
 
-    private let psBlue = Color(red: 0.0, green: 0.44, blue: 0.82)
-
     var body: some View {
+        // 1.21: giao diện đen mờ & trắng, bo tròn (đồng bộ với app)
+        MQObserve(coord.videoMgr) { videoMgr in
+            content(videoMgr)
+        }
+    }
+
+    private func content(_ videoMgr: VideoSourceManager) -> some View {
         NavigationView {
             ScrollView {
-                VStack(alignment: .leading, spacing: 16) {
-                    // Khung trạng thái phản hồi từ Lõi Chiaki
-                    HStack(spacing: 12) {
-                        Image(systemName: coord.videoMgr.isConnectedToPS5 ? "checkmark.seal.fill" : "gamecontroller.fill")
-                            .font(.system(size: 28))
-                            .foregroundColor(.white)
-                            .padding(14)
-                            .background(coord.videoMgr.isConnectedToPS5 ? Color.green : psBlue)
-                            .clipShape(Circle())
-
+                VStack(alignment: .leading, spacing: 14) {
+                    // Trạng thái lõi Chiaki
+                    HStack(spacing: 14) {
+                        Image(systemName: videoMgr.isConnectedToPS5 ? "checkmark.seal.fill" : "gamecontroller.fill")
+                            .font(.system(size: 24, weight: .semibold))
+                            .foregroundColor(videoMgr.isConnectedToPS5 ? MQTheme.ink : .white)
+                            .frame(width: 56, height: 56)
+                            .background(
+                                Circle().fill(videoMgr.isConnectedToPS5 ? MQTheme.pearl : Color.white.opacity(0.10))
+                            )
+                            .overlay(Circle().stroke(MQTheme.hairline, lineWidth: 1))
                         VStack(alignment: .leading, spacing: 4) {
-                            Text("Lõi C Chiaki-NG PS5 Remote Play")
-                                .font(.headline)
+                            Text("Lõi Chiaki-NG PS5 Remote Play")
+                                .font(.system(size: 16, weight: .bold))
                                 .foregroundColor(.white)
-                            Text(coord.videoMgr.statusLog)
-                                .font(.caption)
-                                .foregroundColor(coord.videoMgr.statusLog.contains("❌") || coord.videoMgr.statusLog.contains("⚠️") ? .yellow : .cyan)
+                            Text(videoMgr.statusLog)
+                                .font(.system(size: 13))
+                                .foregroundColor(videoMgr.statusLog.contains("❌") || videoMgr.statusLog.contains("⚠️") ? .orange : MQTheme.secondary)
                         }
+                        Spacer(minLength: 0)
                     }
-                    .padding()
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .background(Color(red: 0.06, green: 0.13, blue: 0.28))
-                    .cornerRadius(14)
+                    .padding(14)
+                    .mqGlass(24)
 
-                    // BƯỚC 1: ĐỊA CHỈ IP MÁY PS5
-                    VStack(alignment: .leading, spacing: 10) {
-                        Label("BƯỚC 1: Địa chỉ IP của máy PS5", systemImage: "1.circle.fill")
-                            .font(.subheadline.bold())
-                            .foregroundColor(.cyan)
-
-                        HStack {
+                    // BƯỚC 1: IP PS5
+                    stepCard(1, "Địa chỉ IP của máy PS5") {
+                        HStack(spacing: 8) {
                             TextField("VD: 192.168.2.23", text: $coord.videoMgr.ps5HostIP)
                                 .keyboardType(.numbersAndPunctuation)
-                                .padding(10)
-                                .background(Color.black.opacity(0.35))
-                                .cornerRadius(8)
-                                .foregroundColor(.white)
-
-                            Button(action: { coord.videoMgr.scanForPS5OnLAN() }) {
-                                HStack(spacing: 4) {
-                                    Image(systemName: "dot.radiowaves.left.and.right")
-                                    Text("Quét tìm PS5")
-                                        .font(.caption.bold())
-                                }
-                                .padding(.horizontal, 12)
-                                .padding(.vertical, 10)
-                                .background(psBlue)
-                                .foregroundColor(.white)
-                                .cornerRadius(8)
+                                .font(.system(size: 17, weight: .medium))
+                                .modifier(MQField())
+                            Button(action: { videoMgr.scanForPS5OnLAN() }) {
+                                Label("Quét tìm", systemImage: "dot.radiowaves.left.and.right")
+                                    .font(.system(size: 13, weight: .bold))
+                                    .padding(.horizontal, 14)
+                                    .frame(height: 46)
+                                    .mqPill(true)
                             }
+                            .buttonStyle(.plain)
                         }
                     }
-                    .padding()
-                    .background(Color.white.opacity(0.06))
-                    .cornerRadius(14)
 
-                    // BƯỚC 2: TÀI KHOẢN PSN (CƠ CHẾ CONSOLE TRANSLATOR: KHUYÊN DÙNG TÀI KHOẢN PHỤ)
-                    VStack(alignment: .leading, spacing: 10) {
-                        HStack {
-                            Label("BƯỚC 2: Tài khoản PSN", systemImage: "2.circle.fill")
-                                .font(.subheadline.bold())
-                                .foregroundColor(.cyan)
-                            Spacer()
-                            if coord.videoMgr.isAccountRemembered {
-                                Label("Đã ghi nhớ", systemImage: "checkmark.shield.fill")
-                                    .font(.caption.bold())
-                                    .foregroundColor(.green)
+                    // BƯỚC 2: TÀI KHOẢN PSN
+                    stepCard(2, "Tài khoản PSN", trailing: videoMgr.isAccountRemembered ? "Đã ghi nhớ" : nil) {
+                        Text("Màn hình lấy mã PIN 8 số trên PS5 đang mở ở User nào thì nhập đúng tài khoản PSN của User đó.")
+                            .font(.system(size: 12))
+                            .foregroundColor(MQTheme.tertiary)
+
+                        HStack(spacing: 8) {
+                            TextField("Online ID PSN (VD: Maivy1125)", text: $coord.videoMgr.psnUsername)
+                                .autocorrectionDisabled()
+                                .textInputAutocapitalization(.never)
+                                .font(.system(size: 17, weight: .medium))
+                                .modifier(MQField())
+                            Button(action: { videoMgr.lookupAccountIDByPSNUsername() }) {
+                                Label("Tự lấy ID", systemImage: "magnifyingglass")
+                                    .font(.system(size: 13, weight: .bold))
+                                    .padding(.horizontal, 14)
+                                    .frame(height: 46)
+                                    .mqPill(false)
                             }
+                            .buttonStyle(.plain)
                         }
 
-                        Text("Lưu ý: Màn hình lấy mã PIN 8 số trên PS5 đang mở ở User nào thì bạn nhập đúng tài khoản PSN của User đó ở đây:")
-                            .font(.caption)
-                            .foregroundColor(.gray)
-
-                        HStack {
-                            TextField("Online ID tài khoản PSN (VD: Maivy1125)", text: $coord.videoMgr.psnUsername)
-                                .padding(10)
-                                .background(Color.black.opacity(0.35))
-                                .cornerRadius(8)
-                                .foregroundColor(.white)
-
-                            Button(action: {
-                                coord.videoMgr.lookupAccountIDByPSNUsername()
-                            }) {
-                                HStack(spacing: 4) {
-                                    Image(systemName: "magnifyingglass")
-                                    Text("Tự lấy ID")
-                                        .font(.caption.bold())
-                                }
-                                .padding(.horizontal, 10)
-                                .padding(.vertical, 10)
-                                .background(Color.cyan.opacity(0.25))
-                                .foregroundColor(.cyan)
-                                .cornerRadius(8)
-                            }
-                        }
-
-                        HStack {
-                            TextField("Mã Account ID 8-byte Base64 (Hoặc dán số ID 19 chữ số)", text: $coord.videoMgr.psnAccountIDBase64)
-                                .font(.caption.monospaced())
-                                .padding(10)
-                                .background(Color.black.opacity(0.35))
-                                .cornerRadius(8)
-                                .foregroundColor(.yellow)
-
+                        HStack(spacing: 8) {
+                            TextField("Account ID Base64 (hoặc số ID 19 chữ số)", text: $coord.videoMgr.psnAccountIDBase64)
+                                .font(.system(size: 14, design: .monospaced))
+                                .autocorrectionDisabled()
+                                .textInputAutocapitalization(.never)
+                                .modifier(MQField())
                             Button(action: { showPSNWebLogin = true }) {
-                                HStack(spacing: 4) {
-                                    Image(systemName: "person.badge.key.fill")
-                                    Text("Đăng nhập Sony")
-                                        .font(.caption.bold())
-                                }
-                                .padding(.horizontal, 12)
-                                .padding(.vertical, 10)
-                                .background(psBlue)
-                                .foregroundColor(.white)
-                                .cornerRadius(8)
+                                Label("Đăng nhập Sony", systemImage: "person.badge.key.fill")
+                                    .font(.system(size: 13, weight: .bold))
+                                    .padding(.horizontal, 14)
+                                    .frame(height: 46)
+                                    .mqPill(true)
                             }
+                            .buttonStyle(.plain)
                         }
 
-                        if coord.videoMgr.isAccountRemembered {
-                            HStack {
-                                Text("Online ID: \(coord.videoMgr.psnUsername) • Số ID: \(coord.videoMgr.psnNumericAccountID) • Base64: \(coord.videoMgr.psnAccountIDBase64)")
-                                    .font(.caption2)
-                                    .foregroundColor(.green)
+                        if videoMgr.isAccountRemembered {
+                            HStack(alignment: .top) {
+                                Text("Online ID: \(videoMgr.psnUsername) · Số ID: \(videoMgr.psnNumericAccountID)")
+                                    .font(.system(size: 12))
+                                    .foregroundColor(MQTheme.secondary)
                                 Spacer()
-                                Button("Xoá & Đổi TK") {
-                                    coord.videoMgr.clearRememberedAccount()
-                                }
-                                .font(.caption2.bold())
-                                .foregroundColor(.orange)
+                                Button("Xoá & đổi TK") { videoMgr.clearRememberedAccount() }
+                                    .font(.system(size: 12, weight: .bold))
+                                    .foregroundColor(.orange)
                             }
                         }
                     }
-                    .padding()
-                    .background(Color.white.opacity(0.06))
-                    .cornerRadius(14)
 
-                    // 1.10: TÀI KHOẢN ĐÃ LIÊN KẾT (GHI NHỚ) + TỰ KẾT NỐI LẠI + GIỮ KẾT NỐI KHI RA NGOÀI
+                    // Tài khoản đã liên kết + tự kết nối lại
                     LinkedPS5ProfilesSection(videoMgr: coord.videoMgr)
 
-                    // BƯỚC 3: MÃ PIN 8 CHỮ SỐ TRÊN MÀN HÌNH PS5
-                    VStack(alignment: .leading, spacing: 10) {
-                        Label("BƯỚC 3: Mã PIN 8 số liên kết thiết bị (Chỉ cần nhập lần đầu)", systemImage: "3.circle.fill")
-                            .font(.subheadline.bold())
-                            .foregroundColor(.cyan)
-
-                        Text("Trên PS5 (ở đúng tài khoản PSN vừa chọn): Cài đặt -> Hệ thống -> Chơi từ xa -> Liên kết thiết bị:")
-                            .font(.caption)
-                            .foregroundColor(.gray)
-
-                        TextField("Nhập 8 chữ số trên TV (VD: 4326 2954)", text: $coord.videoMgr.psnPinCode)
-                            .font(.system(size: 22, weight: .bold, design: .monospaced))
+                    // BƯỚC 3: PIN 8 SỐ
+                    stepCard(3, "Mã PIN 8 số (chỉ cần lần đầu)") {
+                        Text("Trên PS5 (đúng tài khoản PSN vừa chọn): Cài đặt → Hệ thống → Chơi từ xa → Liên kết thiết bị.")
+                            .font(.system(size: 12))
+                            .foregroundColor(MQTheme.tertiary)
+                        TextField("4326 2954", text: $coord.videoMgr.psnPinCode)
+                            .font(.system(size: 26, weight: .bold, design: .monospaced))
                             .multilineTextAlignment(.center)
                             .keyboardType(.numberPad)
-                            .padding(12)
-                            .background(Color.black.opacity(0.5))
-                            .overlay(
-                                RoundedRectangle(cornerRadius: 10)
-                                    .stroke(psBlue, lineWidth: 1.5)
-                            )
-                            .cornerRadius(10)
-                            .foregroundColor(.yellow)
+                            .modifier(MQField(height: 58))
                     }
-                    .padding()
-                    .background(Color.white.opacity(0.06))
-                    .cornerRadius(14)
 
                     Button(action: {
-                        coord.videoMgr.pairAndConnectToPS5(
-                            username: coord.videoMgr.psnUsername,
-                            accountIDBase64: coord.videoMgr.psnAccountIDBase64,
-                            pinCode: coord.videoMgr.psnPinCode,
-                            ip: coord.videoMgr.ps5HostIP
+                        videoMgr.pairAndConnectToPS5(
+                            username: videoMgr.psnUsername,
+                            accountIDBase64: videoMgr.psnAccountIDBase64,
+                            pinCode: videoMgr.psnPinCode,
+                            ip: videoMgr.ps5HostIP
                         )
                     }) {
-                        HStack {
-                            Spacer()
-                            Image(systemName: "link.circle.fill")
-                                .font(.title3)
-                            Text("LIÊN KẾT CHIAKI & GHI NHỚ TÀI KHOẢN")
-                                .font(.system(size: 15, weight: .bold))
-                            Spacer()
-                        }
-                        .padding(.vertical, 14)
-                        .background(psBlue)
-                        .foregroundColor(.white)
-                        .cornerRadius(12)
+                        Label("Liên kết & ghi nhớ tài khoản", systemImage: "link")
+                            .font(.system(size: 16, weight: .bold))
+                            .frame(maxWidth: .infinity)
+                            .frame(height: 54)
+                            .mqPill(true)
                     }
+                    .buttonStyle(.plain)
 
-                    if coord.videoMgr.isConnectedToPS5 {
-                        Button(action: {
-                            coord.videoMgr.disconnectPS5()
-                        }) {
-                            HStack {
-                                Spacer()
-                                Text("Ngắt kết nối PS5 hiện tại")
-                                    .font(.subheadline.bold())
-                                Spacer()
-                            }
-                            .padding(.vertical, 10)
-                            .background(Color.red.opacity(0.25))
-                            .foregroundColor(.red)
-                            .cornerRadius(10)
+                    if videoMgr.isConnectedToPS5 {
+                        Button(action: { videoMgr.disconnectPS5() }) {
+                            Text("Ngắt kết nối PS5 hiện tại")
+                                .font(.system(size: 15, weight: .bold))
+                                .foregroundColor(.red)
+                                .frame(maxWidth: .infinity)
+                                .frame(height: 48)
+                                .background(Capsule().fill(Color.red.opacity(0.14)))
                         }
+                        .buttonStyle(.plain)
                     }
                 }
-                .padding()
+                .padding(16)
             }
-            .background(Color(red: 0.03, green: 0.05, blue: 0.12).ignoresSafeArea())
-            .navigationTitle("Kết nối PS5 Remote Play")
+            .background(MQBackground())
+            .navigationTitle("Kết nối PS5")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .navigationBarTrailing) {
-                    Button("Đóng") {
-                        presentationMode.wrappedValue.dismiss()
-                    }
+                    Button("Xong") { presentationMode.wrappedValue.dismiss() }
                 }
             }
             .sheet(isPresented: $showPSNWebLogin) {
                 PSNWebLoginHelperView(coord: coord)
             }
         }
+        .navigationViewStyle(.stack)
         .preferredColorScheme(.dark)
+        .tint(.white)
+    }
+
+    private func stepCard<Content: View>(_ n: Int, _ title: String, trailing: String? = nil,
+                                         @ViewBuilder content: () -> Content) -> some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(spacing: 10) {
+                Text("\(n)")
+                    .font(.system(size: 13, weight: .heavy))
+                    .foregroundColor(MQTheme.ink)
+                    .frame(width: 24, height: 24)
+                    .background(Circle().fill(MQTheme.pearl))
+                Text(title)
+                    .font(.system(size: 16, weight: .bold))
+                    .foregroundColor(.white)
+                Spacer()
+                if let t = trailing {
+                    Label(t, systemImage: "checkmark.shield.fill")
+                        .font(.system(size: 12, weight: .bold))
+                        .foregroundColor(MQTheme.secondary)
+                }
+            }
+            content()
+        }
+        .padding(14)
+        .mqGlass(24)
+    }
+}
+
+/// 1.21: ô nhập liệu bo tròn kiểu đen mờ
+struct MQField: ViewModifier {
+    var height: CGFloat = 46
+    func body(content: Content) -> some View {
+        content
+            .foregroundColor(.white)
+            .padding(.horizontal, 14)
+            .frame(height: height)
+            .background(RoundedRectangle(cornerRadius: 16, style: .continuous).fill(Color.black.opacity(0.4)))
+            .overlay(RoundedRectangle(cornerRadius: 16, style: .continuous).stroke(MQTheme.hairline, lineWidth: 1))
     }
 }
 
@@ -1182,76 +1155,86 @@ extension Color {
 // 1.10: Danh sách tài khoản PS5 đã liên kết + tuỳ chọn tự kết nối lại / chạy nền
 struct LinkedPS5ProfilesSection: View {
     @ObservedObject var videoMgr: VideoSourceManager
-    private let psBlue = Color(red: 0.0, green: 0.44, blue: 0.82)
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            Label("Tài khoản đã liên kết (chạm để kết nối, không cần PIN)", systemImage: "person.2.fill")
-                .font(.subheadline.bold())
-                .foregroundColor(.cyan)
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(spacing: 10) {
+                Image(systemName: "person.2.fill")
+                    .font(.system(size: 13, weight: .bold))
+                    .foregroundColor(MQTheme.ink)
+                    .frame(width: 24, height: 24)
+                    .background(Circle().fill(MQTheme.pearl))
+                Text("Tài khoản đã liên kết")
+                    .font(.system(size: 16, weight: .bold))
+                    .foregroundColor(.white)
+            }
+            Text("Chạm để kết nối, không cần PIN.")
+                .font(.system(size: 12))
+                .foregroundColor(MQTheme.tertiary)
 
             if videoMgr.linkedProfiles.isEmpty {
-                Text("Chưa có tài khoản nào. Ghép đôi bằng mã PIN 8 số ở BƯỚC 3 (mỗi tài khoản PSN ghép đôi 1 lần).")
-                    .font(.caption)
-                    .foregroundColor(.gray)
+                Text("Chưa có tài khoản nào. Ghép đôi bằng mã PIN 8 số ở bước 3 (mỗi tài khoản PSN ghép 1 lần).")
+                    .font(.system(size: 13))
+                    .foregroundColor(MQTheme.secondary)
             } else {
                 ForEach(videoMgr.linkedProfiles) { profile in
+                    let isCurrent = profile.accountBase64 == videoMgr.psnAccountIDBase64
                     HStack(spacing: 10) {
-                        Button(action: {
-                            videoMgr.connectWithProfile(profile)
-                        }) {
-                            HStack {
-                                Image(systemName: profile.accountBase64 == videoMgr.psnAccountIDBase64 ? "checkmark.circle.fill" : "person.circle")
-                                    .foregroundColor(profile.accountBase64 == videoMgr.psnAccountIDBase64 ? .green : .white)
-                                VStack(alignment: .leading, spacing: 2) {
-                                    Text(profile.username.isEmpty ? profile.accountBase64 : profile.username)
-                                        .font(.subheadline.bold())
-                                        .foregroundColor(.white)
-                                    Text("PS5: \(profile.host)")
-                                        .font(.caption2)
-                                        .foregroundColor(.gray)
-                                }
-                                Spacer()
-                                Text("Kết nối")
-                                    .font(.caption.bold())
-                                    .foregroundColor(.white)
-                                    .padding(.horizontal, 10)
-                                    .padding(.vertical, 6)
-                                    .background(psBlue)
-                                    .cornerRadius(8)
-                            }
+                        Image(systemName: isCurrent ? "checkmark.circle.fill" : "person.crop.circle")
+                            .font(.system(size: 22))
+                            .foregroundColor(.white)
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(profile.username.isEmpty ? profile.accountBase64 : profile.username)
+                                .font(.system(size: 15, weight: .bold))
+                                .foregroundColor(.white)
+                            Text("PS5: \(profile.host)")
+                                .font(.system(size: 12))
+                                .foregroundColor(MQTheme.tertiary)
                         }
-                        Button(action: {
-                            videoMgr.removeProfile(profile)
-                        }) {
+                        Spacer()
+                        Button(action: { videoMgr.connectWithProfile(profile) }) {
+                            Text("Kết nối")
+                                .font(.system(size: 13, weight: .bold))
+                                .padding(.horizontal, 14)
+                                .frame(height: 34)
+                                .mqPill(true)
+                        }
+                        .buttonStyle(.plain)
+                        Button(action: { videoMgr.removeProfile(profile) }) {
                             Image(systemName: "trash")
-                                .foregroundColor(.red.opacity(0.8))
+                                .font(.system(size: 14, weight: .semibold))
+                                .foregroundColor(.red.opacity(0.85))
+                                .frame(width: 34, height: 34)
+                                .background(Circle().fill(Color.white.opacity(0.06)))
                         }
+                        .buttonStyle(.plain)
                     }
                     .padding(10)
-                    .background(Color.black.opacity(0.35))
-                    .cornerRadius(10)
+                    .background(RoundedRectangle(cornerRadius: 18, style: .continuous).fill(MQTheme.rowFill))
                 }
             }
+
+            Rectangle().fill(MQTheme.hairline).frame(height: 1)
 
             Toggle(isOn: $videoMgr.autoReconnectEnabled) {
                 VStack(alignment: .leading, spacing: 2) {
-                    Text("Tự kết nối lại").font(.subheadline.bold()).foregroundColor(.white)
+                    Text("Tự kết nối lại").font(.system(size: 15, weight: .semibold)).foregroundColor(.white)
                     Text("Khi mở app, khi quay lại app, hoặc khi PS5 ngắt phiên (đổi tài khoản bằng nút PS)")
-                        .font(.caption2).foregroundColor(.gray)
+                        .font(.system(size: 12)).foregroundColor(MQTheme.tertiary)
                 }
             }
+            .tint(MQTheme.toggleOn)
             Toggle(isOn: $videoMgr.keepAliveInBackground) {
                 VStack(alignment: .leading, spacing: 2) {
-                    Text("Giữ kết nối khi thoát app ra ngoài").font(.subheadline.bold()).foregroundColor(.white)
+                    Text("Giữ kết nối khi thoát app ra ngoài").font(.system(size: 15, weight: .semibold)).foregroundColor(.white)
                     Text("App tiếp tục chạy nền để không mất Remote Play (tốn pin hơn)")
-                        .font(.caption2).foregroundColor(.gray)
+                        .font(.system(size: 12)).foregroundColor(MQTheme.tertiary)
                 }
             }
+            .tint(MQTheme.toggleOn)
         }
-        .padding()
-        .background(Color.white.opacity(0.06))
-        .cornerRadius(14)
+        .padding(14)
+        .mqGlass(24)
     }
 }
 

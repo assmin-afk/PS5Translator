@@ -1,6 +1,6 @@
 // ============================================================================
 // FILE 12: 12_ModernUI.swift
-// PHIÊN BẢN: PS5Translator 1.19
+// PHIÊN BẢN: PS5Translator 1.21
 //
 // GIAO DIỆN MỚI (lấy cảm hứng iOS 27 – kính mờ, đen mờ & trắng, bo tròn):
 // - Bộ màu / nền / kiểu kính dùng chung (MQTheme, .mqGlass, .mqPill)
@@ -22,6 +22,8 @@ enum MQTheme {
     static let tertiary = Color.white.opacity(0.40)
     static let hairline = Color.white.opacity(0.10)
     static let rowFill = Color.black.opacity(0.32)
+    /// 1.21: màu công tắc khi bật (xám bạc) để nút gạt trắng luôn nhìn thấy
+    static let toggleOn = Color(white: 0.52)
 }
 
 struct MQBackground: View {
@@ -437,7 +439,7 @@ struct ScanLogHistorySheet: View {
                         Text("Hiện chữ rác bị bỏ qua")
                             .font(.system(size: 14, weight: .semibold))
                     }
-                    .tint(.white)
+                    .tint(MQTheme.toggleOn)
                     .padding(12)
                     .mqGlass(18)
 
@@ -544,39 +546,55 @@ struct GamePlayingView: View {
             .padding(.top, 4)
     }
 
+    private var activeProfile: GameProfileFolder? {
+        coord.gameProfiles.first { $0.folderName == coord.activeProfileFolderName }
+    }
+
     private var gameCard: some View {
         VStack(alignment: .leading, spacing: 12) {
             ZStack(alignment: .bottomLeading) {
-                LinearGradient(colors: [Color(white: 0.24), Color(white: 0.08), Color(white: 0.14)],
-                               startPoint: .topLeading, endPoint: .bottomTrailing)
-                HStack {
-                    Spacer()
-                    GameMonogram(name: coord.activeProfileFolderName, size: 74)
-                        .opacity(0.9)
-                        .padding(14)
+                if let p = activeProfile {
+                    GameCoverBackdrop(name: p.folderName, folderURL: p.folderURL)
+                } else {
+                    LinearGradient(colors: [Color(white: 0.24), Color(white: 0.08), Color(white: 0.14)],
+                                   startPoint: .topLeading, endPoint: .bottomTrailing)
                 }
-                .frame(maxHeight: .infinity, alignment: .top)
-                VStack(alignment: .leading, spacing: 3) {
-                    Label("Đang kích hoạt", systemImage: "circle.fill")
-                        .font(.system(size: 11, weight: .bold))
-                        .padding(.horizontal, 9)
-                        .padding(.vertical, 4)
-                        .background(Capsule().fill(Color.white.opacity(0.9)))
-                        .foregroundColor(MQTheme.ink)
-                        .padding(.bottom, 6)
-                    Text(coord.activeProfileFolderName)
-                        .font(.system(size: 26, weight: .heavy))
-                        .foregroundColor(.white)
-                        .lineLimit(2)
-                    Text(coord.databaseReport)
-                        .font(.system(size: 12))
-                        .foregroundColor(MQTheme.secondary)
-                        .lineLimit(2)
+                HStack(alignment: .bottom, spacing: 14) {
+                    // 1.21: ảnh bìa game (avatar)
+                    Group {
+                        if let p = activeProfile {
+                            CoverPhotoPicker(name: p.folderName, folderURL: p.folderURL) {
+                                GameCoverView(name: p.folderName, folderURL: p.folderURL, size: 112, cornerRatio: 0.2)
+                                    .shadow(color: Color.black.opacity(0.5), radius: 12, x: 0, y: 6)
+                            }
+                            .buttonStyle(.plain)
+                        } else {
+                            GameMonogram(name: coord.activeProfileFolderName, size: 112)
+                        }
+                    }
+                    VStack(alignment: .leading, spacing: 4) {
+                        Label("Đang kích hoạt", systemImage: "circle.fill")
+                            .font(.system(size: 10, weight: .bold))
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 3)
+                            .background(Capsule().fill(Color.white.opacity(0.9)))
+                            .foregroundColor(MQTheme.ink)
+                        Text(coord.activeProfileFolderName)
+                            .font(.system(size: 22, weight: .heavy))
+                            .foregroundColor(.white)
+                            .lineLimit(3)
+                            .minimumScaleFactor(0.75)
+                        Text(coord.databaseReport)
+                            .font(.system(size: 12))
+                            .foregroundColor(MQTheme.secondary)
+                            .lineLimit(2)
+                    }
+                    Spacer(minLength: 0)
                 }
                 .padding(14)
             }
-            .frame(height: 170)
-            .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
+            .frame(height: 190)
+            .clipShape(RoundedRectangle(cornerRadius: 20, style: .continuous))
 
             HStack(spacing: 8) {
                 statTile(coord.loadedLineCount.formatted(), "câu trong data")
@@ -625,43 +643,26 @@ struct GamePlayingView: View {
         .background(RoundedRectangle(cornerRadius: 14, style: .continuous).fill(MQTheme.rowFill))
     }
 
+    /// 1.21: chỉ dùng chế độ "Tất cả" (đã bỏ nút Apple AI / Google / Chỉ data)
     private var enginePicker: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            HStack(spacing: 4) {
-                ForEach(TranslationEngineMode.allCases) { mode in
-                    Button(action: { coord.translationEngineMode = mode }) {
-                        Text(mode.shortTitle)
-                            .font(.system(size: 13, weight: .semibold))
-                            .lineLimit(1)
-                            .minimumScaleFactor(0.8)
-                            .frame(maxWidth: .infinity)
-                            .frame(height: 36)
-                            .foregroundColor(coord.translationEngineMode == mode ? MQTheme.ink : MQTheme.secondary)
-                            .background(
-                                Group {
-                                    if coord.translationEngineMode == mode {
-                                        Capsule().fill(MQTheme.pearl)
-                                    }
-                                }
-                            )
-                            .contentShape(Capsule())
-                    }
-                    .buttonStyle(.plain)
-                }
+        HStack(spacing: 12) {
+            Image(systemName: "sparkles")
+                .font(.system(size: 15, weight: .semibold))
+                .foregroundColor(MQTheme.ink)
+                .frame(width: 34, height: 34)
+                .background(RoundedRectangle(cornerRadius: 10, style: .continuous).fill(MQTheme.pearl))
+            VStack(alignment: .leading, spacing: 3) {
+                Text("Tất cả: Data Việt hoá → Apple AI → Google")
+                    .font(.system(size: 14, weight: .semibold))
+                    .foregroundColor(.white)
+                Text(OnDeviceAITranslator.shared.statusText)
+                    .font(.system(size: 11))
+                    .foregroundColor(MQTheme.tertiary)
             }
-            .padding(4)
-            .background(Capsule().fill(Color.white.opacity(0.07)))
-            .overlay(Capsule().stroke(MQTheme.hairline, lineWidth: 1))
-
-            Text(coord.translationEngineMode.detail)
-                .font(.system(size: 12))
-                .foregroundColor(MQTheme.secondary)
-                .padding(.horizontal, 6)
-            Text(OnDeviceAITranslator.shared.statusText)
-                .font(.system(size: 11))
-                .foregroundColor(MQTheme.tertiary)
-                .padding(.horizontal, 6)
+            Spacer(minLength: 0)
         }
+        .padding(12)
+        .mqGlass(22)
     }
 
     private var settingsList: some View {
@@ -675,12 +676,12 @@ struct GamePlayingView: View {
             divider
             settingRow(icon: "line.3.horizontal.decrease", title: "Bộ lọc chữ rác",
                        subtitle: "Hiện chữ bị bỏ qua (nút HUD, ký tự lạ, số đếm) trong log") {
-                Toggle("", isOn: $coord.showTrashInLog).labelsHidden().tint(.white)
+                Toggle("", isOn: $coord.showTrashInLog).labelsHidden().tint(MQTheme.toggleOn)
             }
             divider
             settingRow(icon: "doc.text", title: "Không dịch chữ trên giấy",
                        subtitle: "Bỏ qua thư, ghi chú, biển báo (mực tối trên nền sáng)") {
-                Toggle("", isOn: $coord.skipPaperText).labelsHidden().tint(.white)
+                Toggle("", isOn: $coord.skipPaperText).labelsHidden().tint(MQTheme.toggleOn)
             }
             divider
             settingRow(icon: "clock.arrow.circlepath", title: "Lịch sử câu đã dịch",
@@ -808,11 +809,11 @@ struct MQSettingsSheet: View {
                         Toggle(isOn: $videoMgr.autoReconnectEnabled) {
                             toggleLabel("Tự kết nối lại", "Khi mở app, khi quay lại app, hoặc khi PS5 ngắt phiên")
                         }
-                        .tint(.white)
+                        .tint(MQTheme.toggleOn)
                         Toggle(isOn: $videoMgr.keepAliveInBackground) {
                             toggleLabel("Giữ kết nối khi thoát app ra ngoài", "App tiếp tục chạy nền (tốn pin hơn)")
                         }
-                        .tint(.white)
+                        .tint(MQTheme.toggleOn)
                     }
 
                     group("Data Việt hoá nhận được") {

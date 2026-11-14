@@ -1,6 +1,6 @@
 // ============================================================================
 // FILE 7: 7_SmartSubtitleEngine.swift
-// PHIÊN BẢN: PS5Translator 1.17 (BỎ CHỮ TRÊN GIẤY / THƯ / BIỂN BÁO: MỰC TỐI TRÊN NỀN SÁNG)
+// PHIÊN BẢN: PS5Translator 1.20 (GIỮ TÊN NGƯỜI NÓI, THOẠI LUÔN VÀNG, BỎ BẢN DỊCH VỀ TRỄ SAU CẮT CẢNH)
 //
 // Luồng xử lý mỗi lần quét:
 //  1. OCR Apple Vision (.accurate) -> lấy từng DÒNG + toạ độ TỪNG TỪ.
@@ -388,10 +388,11 @@ enum PieceBuilder {
                 return sameRow && similarH && gapPx > -h * refH * 0.5 && gapPx < max(48, h * refH * 3.5)
             }) {
                 var row = rows[i]
+                // 1.20: độ tin cậy theo mảnh DÀI hơn: nhãn "(Sam)" ngắn hay bị chấm thấp, không được kéo cả câu xuống
+                row.confidence = row.text.count >= line.text.count ? row.confidence : line.confidence
                 row.text = row.text + " " + line.text
                 row.rect = row.rect.union(line.rect)
                 row.words += line.words
-                row.confidence = min(row.confidence, line.confidence)
                 rows[i] = row
             } else {
                 rows.append(line)
@@ -430,6 +431,32 @@ enum PieceBuilder {
         return (nil, nil, text)
     }
 
+    /// 1.20: mảnh chữ CHỈ là nhãn người nói "(Sam)", "[Ashley]", "Chris:" (Vision hay tách riêng khỏi lời thoại)
+    static func speakerLabelOnly(_ text: String, filter: GameTextFilter) -> (name: String, label: String)? {
+        let t = text.trimmingCharacters(in: .whitespaces)
+        let pattern = "^([\\[\\(\\{])\\s?([A-Z][A-Za-z\\.\\-']{1,20}(?: [A-Z][A-Za-z\\.\\-']{1,20})?)\\s?([\\]\\)\\}|Il1])?$"
+        if let re = try? NSRegularExpression(pattern: pattern),
+           let m = re.firstMatch(in: t, range: NSRange(t.startIndex..., in: t)),
+           let r1 = Range(m.range(at: 1), in: t), let r2 = Range(m.range(at: 2), in: t) {
+            let open = String(t[r1]), name = String(t[r2])
+            let parts = name.split(separator: " ").map(String.init)
+            // "(Options)", "[Back]" là chữ menu, không phải tên người nói
+            let known = parts.allSatisfy { filter.isName($0) || ["dr.", "mr.", "mrs.", "ms."].contains($0.lowercased()) }
+            guard known || !parts.contains(where: { filter.isEnglishWord($0.lowercased()) }) else { return nil }
+            let label = open == "(" ? "(\(name))" : (open == "{" ? "{\(name)}" : "[\(name)]")
+            return (name, label)
+        }
+        // "Sam)" (OCR làm mất ngoặc mở) hoặc "Sam:" -> chỉ nhận khi là tên đã biết
+        if t.hasSuffix(")") || t.hasSuffix("]") || t.hasSuffix(":") {
+            let name = String(t.dropLast()).trimmingCharacters(in: CharacterSet(charactersIn: "([{ "))
+            if !name.isEmpty, name.split(separator: " ").count <= 2,
+               name.split(separator: " ").allSatisfy({ filter.isName(String($0)) }) {
+                return (name, t.hasSuffix(":") ? name + ":" : "(\(name))")
+            }
+        }
+        return nil
+    }
+
     /// 1.16: dòng chỉ gồm tên riêng ("SAM", "Hannah", "Dr. Hill") -> không cần dịch
     static func isNamesOnly(_ text: String, filter: GameTextFilter) -> Bool {
         let words = text.split(separator: " ").map { GameTextFilter.stripPossessive(String($0).trimmingCharacters(in: .punctuationCharacters)) }
@@ -457,9 +484,16 @@ enum PieceBuilder {
                             isKnownText: (String) -> Bool = { _ in false }) -> [SSPiece] {
         var plainLines: [SSLine] = []
         var pieces: [SSPiece] = []
+        /// 1.20: nhãn người nói đứng riêng -> gắn lại vào lời thoại cùng hàng (KHÔNG bỏ đi như bản 1.16)
+        var labels: [(name: String, label: String, rect: CGRect)] = []
         let rawLines = mergeRowFragments(inputLines.filter { !TranslationMemory.hasVietnameseMarks($0.text) }, refW: refW)
 
         for line in rawLines {
+            // 1.20: nhãn người nói "(Sam)" -> giữ lại để gắn vào lời thoại (OCR hay chấm điểm thấp cho chữ ngắn)
+            if line.confidence >= 0.3, let sp = speakerLabelOnly(line.text, filter: filter) {
+                labels.append((sp.name, sp.label, line.rect))
+                continue
+            }
             guard line.confidence >= 0.45 else { continue }
             if TranslationMemory.hasVietnameseMarks(line.text) { continue }   // đã là tiếng Việt
             let hPx = line.rect.height * refH
@@ -481,6 +515,10 @@ enum PieceBuilder {
                 let norm = TranslationMemory.normalize(text)
                 let isUI = GameVocabulary.uiDictionary[norm] != nil
                 let known = isKnownText(text)
+                if let sp = speakerLabelOnly(text, filter: filter) {
+                    labels.append((sp.name, sp.label, union(seg.words.map { $0.rect })))
+                    continue
+                }
                 if isNamesOnly(text, filter: filter) { continue }
                 guard a.isMeaningful || isUI || known || isChoiceLike(a) else { continue }
                 let rect = union(seg.words.map { $0.rect })
@@ -540,7 +578,32 @@ enum PieceBuilder {
             piece.knownInData = known
             pieces.append(piece)
         }
+        attachSpeakerLabels(labels, to: &pieces, refW: refW)
         return pieces
+    }
+
+    /// 1.20: "(Sam)" + "Creepy." bị OCR tách thành 2 mảnh -> gộp lại thành 1 câu thoại có người nói.
+    /// Khung dịch phủ cả nhãn "(Sam)" và hiện "(Sam) Rùng rợn." màu vàng như mọi câu thoại khác.
+    static func attachSpeakerLabels(_ labels: [(name: String, label: String, rect: CGRect)], to pieces: inout [SSPiece], refW: CGFloat) {
+        for lb in labels {
+            let h = lb.rect.height
+            var best: Int?
+            var bestGap = CGFloat.greatestFiniteMagnitude
+            for (i, p) in pieces.enumerated() where p.speaker == nil {
+                let lineH = p.rect.height / CGFloat(max(1, p.lineCount))
+                let firstMidY = p.rect.minY + lineH / 2
+                guard abs(firstMidY - lb.rect.midY) < max(h, lineH) * 0.6 else { continue }
+                guard abs(lineH - h) < max(lineH, h) * 0.6 else { continue }
+                let gapPx = (p.rect.minX - lb.rect.maxX) * refW
+                guard gapPx > -h * refH * 0.5, gapPx < max(90, h * refH * 7) else { continue }
+                if gapPx < bestGap { bestGap = gapPx; best = i }
+            }
+            guard let i = best else { continue }
+            pieces[i].speaker = lb.name
+            pieces[i].speakerLabel = lb.label
+            pieces[i].rect = pieces[i].rect.union(lb.rect)
+            pieces[i].category = .dialogue
+        }
     }
 }
 
@@ -1251,8 +1314,16 @@ final class TrackedPiece {
         self.piece = piece
     }
 
+    /// 1.20: cảnh game đã chuyển (cắt cảnh) -> khung này không còn liên quan, tắt ngay không giữ thêm
+    var sceneCut = false
+
     var requiredHits: Int {
         if fromDatabase || piece.knownInData { return 1 }
+        // 1.20: lời thoại có người nói "(Sam) Creepy." -> hiện ngay
+        if piece.speaker != nil && piece.confidence >= 0.5 { return 1 }
+        // 1.20: chữ ngoài phụ đề, không có trong data, OCR chưa chắc chắn (chữ viết tay trên bảng, hoạ tiết)
+        // -> phải đọc được ở 2 lần quét, đứng yên (chữ trôi theo máy quay sẽ bị coi là chữ trên vật thể)
+        if piece.category != .dialogue && piece.confidence < 0.95 { return 2 }
         if piece.validRatio >= 0.99 && piece.wordCount >= 1 && piece.wordCount <= 4 && piece.confidence >= 0.5 {
             return piece.wordCount == 1 ? 2 : 1          // lựa chọn câu trả lời / menu ngắn
         }
@@ -1267,15 +1338,22 @@ final class TrackedPiece {
     /// - Dịch AI: về chậm hơn -> giữ đủ thời gian đọc (1,6 - 4,5 giây tuỳ độ dài).
     func holdUntil() -> Date? {
         guard let gone = goneAt else { return nil }
+        if sceneCut { return gone }
+        // 1.20: bản dịch về SAU khi chữ gốc đã biến mất (AI chậm, đã qua cảnh khác) -> không hiện.
+        // Đây là lỗi hiện "CỐT TRUYỆN CỦA CHÚNG TA" ở cảnh không có chữ tiếng Anh nào.
+        // Riêng lời thoại ngắn: AI về trễ dưới 1,5 giây vẫn hiện (nhường chỗ ngay khi có câu thoại mới).
+        guard let shown = shownAt else { return gone }
+        if shown > gone {
+            guard piece.category == .dialogue, shown.timeIntervalSince(gone) < 1.5 else { return gone }
+        }
         if fromDatabase { return gone.addingTimeInterval(0.35) }
         let chars = Double(translation?.count ?? 0)
         let readTime = min(4.5, max(1.6, 0.8 + chars * 0.05))
-        let base = shownAt ?? gone
-        return max(gone.addingTimeInterval(1.2), base.addingTimeInterval(readTime))
+        return max(gone.addingTimeInterval(1.2), shown.addingTimeInterval(readTime))
     }
 
     func isVisible(at now: Date) -> Bool {
-        guard translation != nil, isConfirmed, !isWorldText else { return false }
+        guard translation != nil, isConfirmed, !isWorldText, !sceneCut else { return false }
         if let until = holdUntil() { return now < until }
         return true
     }
@@ -1459,6 +1537,21 @@ final class SmartSubtitleEngine {
     var skipPaperText = true
     private var frameRefW: CGFloat = 1280
     private var recentDialogue: [String] = []
+    /// 1.20: ảnh xám thu nhỏ của cả khung hình lần quét trước (phát hiện cắt cảnh)
+    private var lastSceneThumb: [UInt8] = []
+
+    /// 1.20: chữ nằm đúng dòng phụ đề quen thuộc (cùng đáy dòng, cùng cỡ chữ, gần giữa màn hình)
+    /// -> là lời thoại kể cả khi chỉ 1-2 từ ("Creepy.") hoặc OCR tách mất tên người nói
+    private func isSubtitleZone(_ p: SSPiece) -> Bool {
+        guard let sb = stabilizer.dialogueBottomPx, let sf = stabilizer.dialogueFontPx else { return false }
+        guard !Self.isAllCaps(p.sourceText), p.rightLimit == nil else { return false }
+        let refH = SubtitleLayoutEngine.refH
+        let lineH = p.rect.height * refH / CGFloat(max(1, p.lineCount))
+        let font = lineH * 0.80
+        guard abs(font - sf) / sf < 0.3 else { return false }
+        guard abs(p.rect.maxY * refH - sb) < lineH * 1.3 else { return false }
+        return abs(p.rect.midX - 0.5) < 0.3 && p.rect.midY >= 0.6
+    }
     /// Gọi khi bản dịch AI về muộn -> cập nhật khung ngay không đợi lần quét sau
     var onAsyncUpdate: (([TranslatedBox]) -> Void)?
     /// 1.19: Log quét chữ cho màn hình chính (DATA / AI / RÁC). Gọi trên luồng nền.
@@ -1554,6 +1647,7 @@ final class SmartSubtitleEngine {
         queue.async {
             self.tracked.removeAll()
             self.stabilizer.reset()
+            self.lastSceneThumb = []
         }
     }
 
@@ -1589,10 +1683,16 @@ final class SmartSubtitleEngine {
         let now = Date()
         var matchedIDs = Set<String>()
 
-        for piece in pieces {
+        // 1.20: phát hiện CẮT CẢNH (cả khung hình đổi hẳn) -> khung dịch của cảnh cũ tắt ngay
+        let wholeThumb = StyleSampler.thumbnail(frame: frame, rect: CGRect(x: 0, y: 0.08, width: 1, height: 0.62))
+        let isSceneCut = !lastSceneThumb.isEmpty && StyleSampler.thumbDiff(wholeThumb, lastSceneThumb) > 11   // đo trên video: cắt cảnh 16-21, máy quay lia <= 5
+        lastSceneThumb = wholeThumb
+
+        for var piece in pieces {
             let key = TranslationMemory.normalize(piece.sourceText)
             guard !key.isEmpty else { continue }
             let keyTokens = key.split(separator: " ").map(String.init)
+            if piece.category != .dialogue && isSubtitleZone(piece) { piece.category = .dialogue }
 
             if piece.category == .dialogue {
                 let lineH = piece.rect.height * SubtitleLayoutEngine.refH / CGFloat(max(1, piece.lineCount))
@@ -1624,6 +1724,7 @@ final class SmartSubtitleEngine {
                 t.hits += 1
                 t.misses = 0
                 t.goneAt = nil
+                t.sceneCut = false
                 let r = t.piece.rect, n = piece.rect
                 let moved = abs(r.minX - n.minX) > 0.012 || abs(r.minY - n.minY) > 0.012
                     || abs(r.width - n.width) > 0.03 || abs(r.height - n.height) > 0.02
@@ -1633,7 +1734,13 @@ final class SmartSubtitleEngine {
                 }
                 var updated = piece
                 if !moved { updated.rect = r }   // giữ nguyên vị trí -> khung không rung
-                if t.piece.speakerLabel != nil && updated.speakerLabel == nil { updated.speakerLabel = t.piece.speakerLabel }
+                if t.piece.speakerLabel != nil && updated.speakerLabel == nil {
+                    updated.speakerLabel = t.piece.speakerLabel
+                    updated.speaker = t.piece.speaker
+                    if moved { updated.rect = updated.rect.union(t.piece.rect) }   // vẫn phủ nhãn "(Sam)"
+                }
+                // 1.20: đã là lời thoại thì GIỮ là lời thoại (chữ vàng), kể cả khi lần quét này OCR tách mất "(Sam)"
+                if t.piece.category == .dialogue && updated.category != .dialogue { updated.category = .dialogue }
                 t.piece = updated
                 if moved {
                     t.style = StyleSampler.sample(frame: frame, rect: piece.rect)
@@ -1683,6 +1790,11 @@ final class SmartSubtitleEngine {
         // Khung không còn thấy chữ gốc trong lần quét này
         for t in tracked where !matchedIDs.contains(t.id) {
             t.misses += 1
+            if isSceneCut && t.piece.category != .dialogue {
+                t.sceneCut = true
+                if t.goneAt == nil { t.goneAt = now }
+                continue
+            }
             if t.goneAt == nil {
                 let now2 = StyleSampler.thumbnail(frame: frame, rect: t.piece.rect)
                 let vanished = StyleSampler.thumbDiff(now2, t.thumb) > 16
@@ -1787,7 +1899,14 @@ final class SmartSubtitleEngine {
                 if recentDialogue.count > 3 { recentDialogue.removeFirst() }
             }
             let mode = engineMode
+            let namesInSentence = protected
             OnDeviceAITranslator.shared.translate(aiSource, key: aiKey, context: context) { [weak self] vi in
+                // 1.20: câu dịch AI phải còn ĐỦ tên riêng của câu gốc ("Sam", "Josh"...).
+                // AI làm rơi tên -> dùng Google (tên được khoá bằng mã giữ chỗ nên không mất).
+                if let vi = vi, mode == .appleThenGoogle, !Self.keepsNames(namesInSentence, in: vi) {
+                    google()
+                    return
+                }
                 if let vi = vi {
                     self?.online.store(key: aiKey, value: vi)
                     deliver(vi)
@@ -1805,6 +1924,14 @@ final class SmartSubtitleEngine {
             }
         } else if engineMode != .appleOnly {
             google()
+        }
+    }
+
+    /// 1.20: bản dịch còn đủ tên riêng của câu gốc (không phân biệt hoa thường / dấu)
+    static func keepsNames(_ names: [String], in vi: String) -> Bool {
+        let hay = vi.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: nil)
+        return names.allSatisfy { n in
+            hay.contains(n.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: nil))
         }
     }
 

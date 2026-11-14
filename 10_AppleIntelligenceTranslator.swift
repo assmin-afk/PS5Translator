@@ -140,6 +140,7 @@ final class OnDeviceAITranslator {
                     - Dịch tự nhiên, đúng ngữ cảnh game. Lời thoại dùng văn nói, xưng hô hợp với nhân vật trẻ (tớ/cậu, tao/mày khi cãi nhau, anh/em khi thân mật).
                     - Menu, nút, nhiệm vụ: dịch ngắn gọn như trong game Việt hoá.
                     - GIỮ NGUYÊN tên riêng (tên người, địa danh, tên vật phẩm riêng), tên nút tay cầm (L1, R2, X, O...), con số.
+                    - KHÔNG được bỏ bớt tên người có trong câu gốc: câu gốc có "Sam" thì câu dịch cũng phải có "Sam".
                     - Chỉ trả về đúng câu tiếng Việt, không giải thích, không thêm dấu ngoặc kép.
                     """)
                     let response = try await session.respond(to: prompt, options: GenerationOptions(temperature: 0.2))

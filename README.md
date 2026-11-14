@@ -1,4 +1,32 @@
 # PS5Translator
+## Bản 1.21 – Ảnh bìa game, thư viện game có sẵn, màn Kết nối PS5 kiểu mới
+
+- **Ảnh bìa (avatar) cho từng game** (`13_GameCovers.swift`): app tự tải ảnh bìa vuông từ trang PlayStation Store
+  của game (mã concept lưu sẵn), lưu thành `cover.jpg` trong thư mục game, lần sau không cần mạng.
+  Game tự thêm: app tìm trên PlayStation Store theo tên. Muốn đổi: menu "…" → "Chọn ảnh bìa từ Ảnh"
+  hoặc "Tải lại ảnh bìa"; ở tab Game chạm vào ảnh bìa để chọn ảnh khác.
+- **Thêm sẵn 21 game** có trong máy PS5 vào Thư viện Game (chỉ thêm 1 lần, game đã xoá không bị thêm lại;
+  game trùng tên với game đã có thì bỏ qua).
+- **Tab Game:** ảnh bìa ở thẻ "Đang chơi" (nền mờ lấy từ ảnh bìa). Bỏ nút Apple AI / Google / Chỉ data:
+  app luôn dùng "Tất cả" (Data Việt hoá → Apple Intelligence → Google).
+- **Màn Kết nối PS5** đổi sang giao diện đen mờ & trắng, bo tròn như phần còn lại của app.
+- Công tắc bật dùng màu xám bạc để nút gạt trắng luôn nhìn thấy.
+- Game chưa có data hiện "Chưa có câu Việt hoá · dịch bằng AI" thay vì "Data lỗi (0 câu)".
+
+## Bản 1.20 – Sửa dịch thông minh theo video "video text"
+- **Giữ tên người nói "(Sam)":** OCR hay tách "(Sam)" thành một mảnh riêng. Bản 1.16 coi mảnh này là "dòng chỉ có tên riêng" nên bỏ đi, làm câu dịch mất tên người nói.
+  - Giờ nhãn "(Sam)", "[Ashley]", "Chris:" được gắn lại vào lời thoại cùng hàng.
+  - Khung dịch phủ cả nhãn và hiện "(Sam) Này, lạ nhỉ. Cửa bị khoá rồi."
+- **Tên riêng trong câu:** nếu Apple Intelligence làm rơi tên có trong câu gốc (ví dụ "Sam"), app dùng bản Google. Bản Google khoá tên bằng mã giữ chỗ nên tên không bị mất.
+- **Bỏ bản dịch về trễ:** "CỐT TRUYỆN CỦA CHÚNG TA" ở giây 4–6 là bản dịch AI của chữ viết tay trên tấm bảng ("THE PAST IS BEYOND OUR CONTROL") ở cảnh trước. Bản dịch về sau khi đã chuyển cảnh nhưng vẫn được giữ trên màn hình. Cách sửa:
+  - Bản dịch về khi chữ gốc đã biến mất thì không hiện. Riêng lời thoại ngắn được nới thêm 1,5 giây.
+  - App nhận biết cắt cảnh (cả khung hình đổi hẳn). Khi đó các khung dịch không phải lời thoại của cảnh cũ tắt ngay.
+  - Chữ ngoài phụ đề, không có trong data, OCR chưa chắc chắn: phải đọc được ở 2 lần quét và đứng yên mới hiện.
+- **Lời thoại luôn chữ vàng:** "(Sam) Creepy." bị tách thành "Creepy." đứng một mình (1 từ, không có người nói), nên trước đây bị coi là menu, thành chữ trắng trong khung hẹp xuống 2 dòng. Giờ:
+  - Chữ nằm đúng dòng phụ đề quen thuộc (cùng đáy dòng, cùng cỡ chữ, gần giữa) luôn là lời thoại.
+  - Khung đã là lời thoại thì giữ là lời thoại, kể cả khi lần quét sau OCR đọc khác.
+- Độ tin cậy OCR của dòng gộp lấy theo mảnh dài hơn, để nhãn "(Sam)" ngắn bị chấm điểm thấp không kéo cả câu thoại bị bỏ.
+
 ## Bản 1.19 – Giao diện mới (iOS 27: đen mờ & trắng, bo tròn) + logo MQ
 
 - **Logo MQ** (chữ MQ ở giữa tay cầm): icon app iPhone (`icon.png`), icon app TV (`TVApp/tv_app_icon.png`),

@@ -1,6 +1,6 @@
 // ============================================================================
 // FILE 9: 9_GameLibraryView.swift
-// PHIÊN BẢN: PS5Translator 1.19 (tab Thư viện Game)
+// PHIÊN BẢN: PS5Translator 1.21 (tab Thư viện Game, ảnh bìa game)
 //
 // THƯ VIỆN GAME (thay màn hình "Quản lý Hồ sơ Game" cũ):
 // - Thẻ game đang dùng: tên, số câu Việt hoá dùng được, tình trạng data, bộ dịch AI.
@@ -285,12 +285,12 @@ struct GameLibraryView: View {
         if !hasFile {
             subtitle = "Chưa có data · dịch bằng AI"
         } else if let n = stat {
-            subtitle = n > 0 ? "\(n.formatted()) câu Việt hoá" : "Data lỗi (0 câu)"
+            subtitle = n > 0 ? "\(n.formatted()) câu Việt hoá" : "Chưa có câu Việt hoá · dịch bằng AI"
         } else {
             subtitle = "Có data · chọn để kiểm tra"
         }
         return HStack(spacing: 12) {
-            GameMonogram(name: profile.folderName, size: 54)
+            GameCoverView(name: profile.folderName, folderURL: profile.folderURL, size: 58)
             VStack(alignment: .leading, spacing: 3) {
                 Text(profile.folderName)
                     .font(.system(size: 16, weight: .bold))
@@ -308,6 +308,14 @@ struct GameLibraryView: View {
                     showImporter = true
                 }) {
                     Label(hasFile ? "Thay data Việt hoá" : "Nạp data Việt hoá", systemImage: "square.and.arrow.down")
+                }
+                CoverPhotoPicker(name: profile.folderName, folderURL: profile.folderURL) {
+                    Label("Chọn ảnh bìa từ Ảnh", systemImage: "photo")
+                }
+                Button(action: {
+                    GameCoverStore.shared.reloadCover(name: profile.folderName, folderURL: profile.folderURL)
+                }) {
+                    Label("Tải lại ảnh bìa từ PlayStation Store", systemImage: "arrow.clockwise")
                 }
                 Button(role: .destructive, action: { confirmDelete = profile }) {
                     Label("Xoá game", systemImage: "trash")

@@ -22,7 +22,7 @@ import SQLite3
 // 1. THÔNG SỐ CẤU HÌNH PHIÊN BẢN PS5TRANSLATOR 1.02 (Đặt ở đầu file)
 // ============================================================================
 struct TranslatorV102Config {
-    static let appVersionName = "PS5Translator 1.19"
+    static let appVersionName = "PS5Translator 1.21"
     static let tvTestSentence = "phụ đề tiếng Việt như thế này"
     static let defaultScanFPS: Double = 6.0
     static let minScanFPS: Double = 1.0
@@ -639,8 +639,8 @@ class PipelineCoordinator: ObservableObject {
         }
     }
     /// 1.12: Bộ dịch AI (Apple Intelligence trên iPhone / Google online)
-    @Published var translationEngineMode: TranslationEngineMode =
-        TranslationEngineMode(rawValue: UserDefaults.standard.string(forKey: "translation_engine_v115") ?? "") ?? .appleThenGoogle {
+    /// 1.21: luôn dùng "Tất cả" (Data Việt hoá → Apple Intelligence → Google), đã bỏ nút chọn bộ dịch
+    @Published var translationEngineMode: TranslationEngineMode = .appleThenGoogle {
         didSet {
             UserDefaults.standard.set(translationEngineMode.rawValue, forKey: "translation_engine_v115")
             smartEngine.engineMode = translationEngineMode
@@ -788,6 +788,19 @@ class PipelineCoordinator: ObservableObject {
             if fm.fileExists(atPath: defaultRPG.path) {
                 try? fm.copyItem(at: defaultRPG, to: destSQLite)
             }
+        }
+
+        // 1.21: thêm sẵn các game có trong máy PS5 (chỉ 1 lần; game đã xoá sẽ không bị thêm lại)
+        let seededKey = "preset_games_seeded_v121"
+        if !UserDefaults.standard.bool(forKey: seededKey) {
+            let existing = (try? fm.contentsOfDirectory(atPath: profilesRootURL.path)) ?? []
+            for preset in GamePresets.all {
+                if existing.contains(where: { GamePresets.matches($0, preset.name) }) { continue }
+                let safeName = preset.name.replacingOccurrences(of: "/", with: "-")
+                let folder = profilesRootURL.appendingPathComponent(safeName, isDirectory: true)
+                try? fm.createDirectory(at: folder, withIntermediateDirectories: true)
+            }
+            UserDefaults.standard.set(true, forKey: seededKey)
         }
     }
 
@@ -998,6 +1011,7 @@ class PipelineCoordinator: ObservableObject {
     }
 
     func deleteGameProfileFolder(folderName: String) {
+        GameCoverStore.shared.forget(name: folderName)
         let folderURL = profilesRootURL.appendingPathComponent(folderName, isDirectory: true)
         try? FileManager.default.removeItem(at: folderURL)
         refreshGameProfileFolders()
