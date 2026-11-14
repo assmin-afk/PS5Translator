@@ -95,7 +95,8 @@ struct PS5AccountConfig: Codable {
 // ============================================================================
 
 struct TranslatedBox: Codable, Identifiable, Equatable {
-    var id: String { "\(text)_\(x)_\(y)" }
+    // 1.11: ID ổn định theo khung chữ đang theo dõi -> SwiftUI không vẽ lại / khung không nhảy
+    var id: String { stableID.isEmpty ? "\(text)_\(x)_\(y)" : stableID }
     let text: String
     let x: Double
     let y: Double
@@ -103,6 +104,13 @@ struct TranslatedBox: Codable, Identifiable, Equatable {
     let h: Double
     var category: String = TextRegionCategory.dialogue.rawValue
     var isAITranslated: Bool = false
+    // 1.11: kiểu chữ khớp chữ gốc
+    var stableID: String = ""
+    /// Cỡ chữ = tỉ lệ so với CHIỀU CAO khung hình (0 = tự tính như bản cũ)
+    var fontSizeNorm: Double = 0
+    var textColorHex: String = ""
+    var backgroundColorHex: String = ""
+    var isBold: Bool = true
 }
 
 struct TVTextItem: Codable {

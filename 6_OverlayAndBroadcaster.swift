@@ -22,7 +22,7 @@ import SQLite3
 // 1. THÔNG SỐ CẤU HÌNH PHIÊN BẢN PS5TRANSLATOR 1.02 (Đặt ở đầu file)
 // ============================================================================
 struct TranslatorV102Config {
-    static let appVersionName = "PS5Translator 1.02"
+    static let appVersionName = "PS5Translator 1.11"
     static let tvTestSentence = "phụ đề tiếng Việt như thế này"
     static let defaultScanFPS: Double = 6.0
     static let minScanFPS: Double = 1.0
@@ -539,13 +539,16 @@ class PipelineCoordinator: ObservableObject {
     @Published var activeProfileFolderName: String = "Mặc định"
     @Published var loadedLineCount: Int = 0
 
-    @Published var enableAppleIntelligenceFallback: Bool = true
+    @Published var enableAppleIntelligenceFallback: Bool = true {
+        didSet { smartEngine.useOnlineAI = enableAppleIntelligenceFallback }
+    }
+    /// 1.11: Kết quả kiểm tra data Việt hoá đang dùng (hiện trong Hồ sơ game)
+    @Published var databaseReport: String = "Chưa có data Việt hoá"
 
     @Published var translatedBoxes: [TranslatedBox] = []
     @Published var lastRecognizedEnglish: String = "Đang quét chữ thời gian thực..."
 
-    private let ocrEngine = V102OCREngine()
-    private let sqliteTranslator = V102SQLiteTranslator()
+    private let smartEngine = SmartSubtitleEngine()
     private var cancellables = Set<AnyCancellable>()
     private var tvTestWorkItem: DispatchWorkItem?
 
@@ -554,6 +557,13 @@ class PipelineCoordinator: ObservableObject {
 
     init() {
         throttler.targetScanFPS = TranslatorV102Config.defaultScanFPS
+        smartEngine.onAsyncUpdate = { [weak self] boxes in
+            DispatchQueue.main.async {
+                guard let self = self, !self.isShowingTVTestSentence else { return }
+                self.translatedBoxes = boxes
+                self.server.broadcast(boxes: boxes)
+            }
+        }
         setupInitialGameProfileFolders()
         refreshGameProfileFolders()
 
@@ -650,13 +660,18 @@ class PipelineCoordinator: ObservableObject {
         if let savedName = UserDefaults.standard.string(forKey: "active_profile_folder_v102"),
            let matched = found.first(where: { $0.folderName == savedName }) {
             self.activeProfileFolderName = matched.folderName
-            sqliteTranslator.loadDatabase(at: matched.fullSQLiteURL)
+            loadTranslationDatabase(matched.fullSQLiteURL)
         } else if let first = found.first {
             self.activeProfileFolderName = first.folderName
-            sqliteTranslator.loadDatabase(at: first.fullSQLiteURL)
+            loadTranslationDatabase(first.fullSQLiteURL)
         }
+    }
 
-        self.loadedLineCount = sqliteTranslator.totalLines
+    /// 1.11: Nạp data Việt hoá bằng bộ đọc mới (tự nhận cấu trúc, báo lỗi data)
+    private func loadTranslationDatabase(_ url: URL) {
+        let report = smartEngine.loadDatabase(url: url)
+        loadedLineCount = report.validPairs
+        databaseReport = report.summary
     }
 
     func createNewGameProfileFolder(folderName: String) {
@@ -696,12 +711,11 @@ class PipelineCoordinator: ObservableObject {
 
         if let sqliteFile = contents.first(where: { $0.hasSuffix(".sqlite") || $0.hasSuffix(".db") }) {
             let sourceSQLiteURL = folderURL.appendingPathComponent(sqliteFile)
-            sqliteTranslator.loadDatabase(at: sourceSQLiteURL)
+            loadTranslationDatabase(sourceSQLiteURL)
         }
 
         activeProfileFolderName = folderName
         UserDefaults.standard.set(folderName, forKey: "active_profile_folder_v102")
-        loadedLineCount = sqliteTranslator.totalLines
         refreshGameProfileFolders()
     }
 
@@ -711,10 +725,10 @@ class PipelineCoordinator: ObservableObject {
         refreshGameProfileFolders()
     }
 
-    // MARK: - Luồng quét đa vùng, đặt đúng vị trí từng khối chữ và đồng bộ thời gian xuất hiện thực tế
+    // MARK: - 1.11: Luồng quét chữ thông minh (lọc rác, giữ khung ổn định, khớp kiểu chữ gốc)
     private func processFrameRealtime(_ frame: CGImage) {
         guard !isShowingTVTestSentence else { return }
-        guard !isOCRProcessing else { return }
+        guard !isOCRProcessing, !smartEngine.isBusy else { return }
 
         let now = Date().timeIntervalSince1970
         let minInterval = 1.0 / max(1.0, scanFPS)
@@ -725,69 +739,18 @@ class PipelineCoordinator: ObservableObject {
         isOCRProcessing = true
 
         let roiRect = videoMgr.getNormalizedROIRect(for: roiMode)
+        smartEngine.useOnlineAI = enableAppleIntelligenceFallback
 
-        ocrEngine.recognizeMultiRegions(in: cropped) { [weak self] (regions: [V102OCRTextRegion]) in
-            guard let self = self else { return }
-            self.isOCRProcessing = false
-            guard !self.isShowingTVTestSentence else { return }
-
-            if regions.isEmpty {
-                DispatchQueue.main.async {
-                    if !self.translatedBoxes.isEmpty {
-                        self.translatedBoxes = []
-                        self.server.broadcast(boxes: [])
-                    }
-                    self.lastRecognizedEnglish = "Màn hình không có chữ (Đã ẩn phụ đề)"
-                }
-                return
-            }
-
-            var mappedBoxes: [TranslatedBox] = []
-            var englishSummaryParts: [String] = []
-
-            for region in regions {
-                let rawEng = region.rawText.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines)
-                guard !rawEng.isEmpty else { continue }
-                englishSummaryParts.append(rawEng)
-
-                let exactX = roiRect.origin.x + region.x * roiRect.size.width
-                let exactY = roiRect.origin.y + region.y * roiRect.size.height
-                let exactW = region.w * roiRect.size.width
-                let exactH = region.h * roiRect.size.height
-
-                if let dbText = self.sqliteTranslator.findBestVietnameseMatch(for: rawEng) {
-                    mappedBoxes.append(
-                        TranslatedBox(
-                            text: dbText,
-                            x: exactX,
-                            y: exactY,
-                            w: exactW,
-                            h: exactH
-                        )
-                    )
-                } else if self.enableAppleIntelligenceFallback {
-                    let aiText = AppleIntelligenceFallbackEngine.shared.translateRegion(
-                        englishText: rawEng,
-                        onAsyncRefined: { [weak self] _ in
-                            self?.lastScanTimestamp = 0
-                        }
-                    )
-                    mappedBoxes.append(
-                        TranslatedBox(
-                            text: aiText,
-                            x: exactX,
-                            y: exactY,
-                            w: exactW,
-                            h: exactH
-                        )
-                    )
-                }
-            }
-
+        smartEngine.process(frame: frame, cropped: cropped, roi: roiRect) { [weak self] boxes, summary in
             DispatchQueue.main.async {
-                self.lastRecognizedEnglish = englishSummaryParts.joined(separator: " | ")
-                self.translatedBoxes = mappedBoxes
-                self.server.broadcast(boxes: mappedBoxes)
+                guard let self = self else { return }
+                self.isOCRProcessing = false
+                guard !self.isShowingTVTestSentence else { return }
+                self.lastRecognizedEnglish = summary
+                if boxes != self.translatedBoxes {
+                    self.translatedBoxes = boxes
+                    self.server.broadcast(boxes: boxes)
+                }
             }
         }
     }

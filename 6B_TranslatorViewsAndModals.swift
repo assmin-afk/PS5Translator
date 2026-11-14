@@ -164,35 +164,9 @@ struct MainTranslatorView: View {
                                     )
                                 }
 
+                                // 1.11: Khung dịch neo đúng vị trí chữ gốc, cùng cỡ chữ / màu chữ / màu nền
                                 ForEach(coord.translatedBoxes) { box in
-                                    let pixelW = max(36.0, box.w * geo.size.width)
-                                    let pixelH = max(16.0, box.h * geo.size.height)
-                                    let matchedFontSize = calculateMatchingFontSize(boxWidth: pixelW, boxHeight: pixelH, text: box.text)
-
-                                    Text(box.text)
-                                        .font(.system(size: matchedFontSize, weight: .bold))
-                                        .foregroundColor(.yellow)
-                                        .multilineTextAlignment(.center)
-                                        .lineLimit(nil)
-                                        .minimumScaleFactor(0.65)
-                                        .padding(.horizontal, 6)
-                                        .padding(.vertical, 4)
-                                        .frame(
-                                            minWidth: pixelW + 14,
-                                            minHeight: pixelH + 10
-                                        )
-                                        .background(
-                                            RoundedRectangle(cornerRadius: 6)
-                                                .fill(Color.black.opacity(TranslatorV102Config.subtitleMaskBlackOpacity))
-                                        )
-                                        .overlay(
-                                            RoundedRectangle(cornerRadius: 6)
-                                                .stroke(Color.white.opacity(0.18), lineWidth: 0.8)
-                                        )
-                                        .position(
-                                            x: (box.x + box.w / 2.0) * geo.size.width,
-                                            y: (box.y + box.h / 2.0) * geo.size.height
-                                        )
+                                    TranslatedSubtitleBoxView(box: box, frameSize: geo.size)
                                 }
                             }
                         }
@@ -347,10 +321,10 @@ struct MainTranslatorView: View {
                 Image(systemName: "sparkles")
                     .foregroundColor(.yellow)
                 VStack(alignment: .leading, spacing: 1) {
-                    Text("Dịch AI (Apple Intelligence)")
+                    Text("Dịch AI online (giữ nguyên tên riêng)")
                         .font(.system(size: 12, weight: .bold))
                         .foregroundColor(.white)
-                    Text("Tự động dịch Hội thoại, Nhiệm vụ, Kỹ năng, Vật phẩm chưa có trong data")
+                    Text("Dịch câu chưa có trong data Việt hoá (Google Dịch, cần Internet, lưu bộ nhớ đệm)")
                         .font(.system(size: 10))
                         .foregroundColor(.white.opacity(0.7))
                 }
@@ -516,6 +490,10 @@ struct GameProfileFolderManagerView: View {
                             .bold()
                             .foregroundColor(.cyan)
                     }
+                    // 1.11: kết quả kiểm tra data Việt hoá
+                    Text(coord.databaseReport)
+                        .font(.caption)
+                        .foregroundColor(coord.loadedLineCount == 0 ? .orange : .green)
 
                     Button(action: {
                         coord.triggerTVTestSentence()
@@ -640,7 +618,7 @@ struct GameProfileFolderManagerView: View {
                         Text("\(coord.server.connectedCount) TV")
                             .bold()
                     }
-                    Toggle("Dịch dự phòng bằng AI (Apple Intelligence)", isOn: $coord.enableAppleIntelligenceFallback)
+                    Toggle("Dịch AI online cho câu chưa có trong data", isOn: $coord.enableAppleIntelligenceFallback)
                 }
             }
             .navigationTitle("Quản lý Hồ sơ Game")
@@ -1273,6 +1251,49 @@ struct SonyOAuthWebView: UIViewRepresentable {
                 self.onExtractedAccount(onlineID, base64ID, numericID)
             }
         }
+    }
+}
+
+// 1.11: Vẽ 1 khung dịch đè khít lên chữ gốc
+struct TranslatedSubtitleBoxView: View {
+    let box: TranslatedBox
+    let frameSize: CGSize
+
+    var body: some View {
+        let W = frameSize.width, H = frameSize.height
+        let fontSize: CGFloat = box.fontSizeNorm > 0
+            ? CGFloat(box.fontSizeNorm) * H
+            : max(9.5, min(18.0, CGFloat(box.h) * H * 0.78))
+        let padX = fontSize * 0.30, padY = fontSize * 0.10
+        let textColor = Color(hexString: box.textColorHex) ?? .yellow
+        let bgColor = Color(hexString: box.backgroundColorHex) ?? .black
+
+        Text(box.text)
+            .font(.system(size: fontSize, weight: box.isBold ? .semibold : .medium))
+            .foregroundColor(textColor)
+            .shadow(color: Color.black.opacity(0.55), radius: 0.6, x: 0.5, y: 0.5)
+            .multilineTextAlignment(.leading)
+            .lineLimit(nil)
+            .minimumScaleFactor(0.7)
+            .fixedSize(horizontal: false, vertical: false)
+            .padding(.horizontal, padX)
+            .padding(.vertical, padY)
+            .frame(width: CGFloat(box.w) * W, height: CGFloat(box.h) * H, alignment: .topLeading)
+            .background(
+                RoundedRectangle(cornerRadius: max(2, fontSize * 0.18))
+                    .fill(bgColor.opacity(0.94))
+            )
+            .position(x: CGFloat(box.x + box.w / 2) * W, y: CGFloat(box.y + box.h / 2) * H)
+            .allowsHitTesting(false)
+    }
+}
+
+extension Color {
+    /// "#RRGGBB" -> Color
+    init?(hexString: String) {
+        let hex = hexString.trimmingCharacters(in: CharacterSet(charactersIn: "# "))
+        guard hex.count == 6, let v = UInt32(hex, radix: 16) else { return nil }
+        self.init(red: Double((v >> 16) & 0xFF) / 255, green: Double((v >> 8) & 0xFF) / 255, blue: Double(v & 0xFF) / 255)
     }
 }
 
