@@ -1,6 +1,6 @@
 // ============================================================================
 // FILE 13: 13_GameCovers.swift
-// PHIÊN BẢN: PS5Translator 1.21
+// PHIÊN BẢN: PS5Translator 1.22
 //
 // ẢNH BÌA GAME (AVATAR) + DANH SÁCH GAME CÓ SẴN
 // - Mỗi game có mã trang PlayStation Store (concept). App tự tải ảnh bìa vuông
@@ -272,27 +272,35 @@ struct GameCoverView: View {
     }
 }
 
-/// Nền mờ lấy từ ảnh bìa (thẻ "Đang chơi")
-struct GameCoverBackdrop: View {
+/// 1.22: Ảnh bìa lớn, hiện rõ (không làm mờ) ở thẻ "Đang chơi"
+struct GameCoverBanner: View {
     let name: String
     let folderURL: URL
     @ObservedObject private var store = GameCoverStore.shared
 
     var body: some View {
-        ZStack {
-            LinearGradient(colors: [Color(white: 0.24), Color(white: 0.08), Color(white: 0.14)],
-                           startPoint: .topLeading, endPoint: .bottomTrailing)
-            if let img = store.images[name] ?? store.cachedCover(name: name, folderURL: folderURL) {
-                Image(uiImage: img)
-                    .resizable()
-                    .scaledToFill()
-                    .blur(radius: 18)
-                    .opacity(0.75)
-            }
-            LinearGradient(colors: [Color.black.opacity(0.15), Color.black.opacity(0.75)],
-                           startPoint: .top, endPoint: .bottom)
-        }
-        .clipped()
+        // Khung gần vuông theo chiều rộng thẻ (ảnh bìa vuông chỉ bị cắt rất ít hai bên trên/dưới);
+        // ảnh phủ kín bên trong rồi cắt gọn, không đẩy lệch bố cục
+        Color.black
+            .aspectRatio(1.2, contentMode: .fit)
+            .frame(maxWidth: .infinity)
+            .overlay(
+                Group {
+                    if let img = store.images[name] ?? store.cachedCover(name: name, folderURL: folderURL) {
+                        Image(uiImage: img)
+                            .resizable()
+                            .scaledToFill()
+                    } else {
+                        ZStack {
+                            LinearGradient(colors: [Color(white: 0.24), Color(white: 0.08)],
+                                           startPoint: .topLeading, endPoint: .bottomTrailing)
+                            GameMonogram(name: name, size: 96)
+                        }
+                    }
+                }
+            )
+            .clipped()
+            .onAppear { store.ensureCover(name: name, folderURL: folderURL) }
     }
 }
 

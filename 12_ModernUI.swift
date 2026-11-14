@@ -1,6 +1,6 @@
 // ============================================================================
 // FILE 12: 12_ModernUI.swift
-// PHIÊN BẢN: PS5Translator 1.21
+// PHIÊN BẢN: PS5Translator 1.22
 //
 // GIAO DIỆN MỚI (lấy cảm hứng iOS 27 – kính mờ, đen mờ & trắng, bo tròn):
 // - Bộ màu / nền / kiểu kính dùng chung (MQTheme, .mqGlass, .mqPill)
@@ -552,49 +552,49 @@ struct GamePlayingView: View {
 
     private var gameCard: some View {
         VStack(alignment: .leading, spacing: 12) {
-            ZStack(alignment: .bottomLeading) {
+            // 1.22: ảnh bìa lớn hiện rõ (chạm để đổi ảnh), tên game nằm bên dưới
+            Group {
                 if let p = activeProfile {
-                    GameCoverBackdrop(name: p.folderName, folderURL: p.folderURL)
+                    CoverPhotoPicker(name: p.folderName, folderURL: p.folderURL) {
+                        GameCoverBanner(name: p.folderName, folderURL: p.folderURL)
+                    }
+                    .buttonStyle(.plain)
                 } else {
-                    LinearGradient(colors: [Color(white: 0.24), Color(white: 0.08), Color(white: 0.14)],
-                                   startPoint: .topLeading, endPoint: .bottomTrailing)
-                }
-                HStack(alignment: .bottom, spacing: 14) {
-                    // 1.21: ảnh bìa game (avatar)
-                    Group {
-                        if let p = activeProfile {
-                            CoverPhotoPicker(name: p.folderName, folderURL: p.folderURL) {
-                                GameCoverView(name: p.folderName, folderURL: p.folderURL, size: 112, cornerRatio: 0.2)
-                                    .shadow(color: Color.black.opacity(0.5), radius: 12, x: 0, y: 6)
-                            }
-                            .buttonStyle(.plain)
-                        } else {
-                            GameMonogram(name: coord.activeProfileFolderName, size: 112)
-                        }
+                    ZStack {
+                        LinearGradient(colors: [Color(white: 0.24), Color(white: 0.08)],
+                                       startPoint: .topLeading, endPoint: .bottomTrailing)
+                        GameMonogram(name: coord.activeProfileFolderName, size: 96)
                     }
-                    VStack(alignment: .leading, spacing: 4) {
-                        Label("Đang kích hoạt", systemImage: "circle.fill")
-                            .font(.system(size: 10, weight: .bold))
-                            .padding(.horizontal, 8)
-                            .padding(.vertical, 3)
-                            .background(Capsule().fill(Color.white.opacity(0.9)))
-                            .foregroundColor(MQTheme.ink)
-                        Text(coord.activeProfileFolderName)
-                            .font(.system(size: 22, weight: .heavy))
-                            .foregroundColor(.white)
-                            .lineLimit(3)
-                            .minimumScaleFactor(0.75)
-                        Text(coord.databaseReport)
-                            .font(.system(size: 12))
-                            .foregroundColor(MQTheme.secondary)
-                            .lineLimit(2)
-                    }
-                    Spacer(minLength: 0)
+                    .aspectRatio(1.2, contentMode: .fit)
                 }
-                .padding(14)
             }
-            .frame(height: 190)
             .clipShape(RoundedRectangle(cornerRadius: 20, style: .continuous))
+            .overlay(
+                RoundedRectangle(cornerRadius: 20, style: .continuous)
+                    .stroke(Color.white.opacity(0.10), lineWidth: 1)
+            )
+
+            VStack(alignment: .leading, spacing: 4) {
+                HStack(spacing: 8) {
+                    Text(coord.activeProfileFolderName)
+                        .font(.system(size: 22, weight: .heavy))
+                        .foregroundColor(.white)
+                        .lineLimit(2)
+                        .minimumScaleFactor(0.8)
+                    Spacer(minLength: 4)
+                    Text("Đang chơi")
+                        .font(.system(size: 11, weight: .bold))
+                        .padding(.horizontal, 9)
+                        .padding(.vertical, 4)
+                        .background(Capsule().fill(MQTheme.pearl))
+                        .foregroundColor(MQTheme.ink)
+                }
+                Text(coord.databaseReport)
+                    .font(.system(size: 12))
+                    .foregroundColor(MQTheme.secondary)
+                    .lineLimit(2)
+            }
+            .padding(.horizontal, 4)
 
             HStack(spacing: 8) {
                 statTile(coord.loadedLineCount.formatted(), "câu trong data")

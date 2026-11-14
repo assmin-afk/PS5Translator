@@ -1,4 +1,8 @@
 # PS5Translator
+## Bản 1.22 – Sửa thẻ "Đang chơi" ở tab Game
+- Bỏ ảnh bìa nhỏ bị lệch xuống dưới khung. Ảnh bìa lớn hiện rõ (không làm mờ), cắt gọn trong khung bo tròn.
+- Tên game, nhãn "Đang chơi" và thông tin data nằm bên dưới ảnh. Chạm vào ảnh để chọn ảnh bìa khác.
+
 ## Bản 1.21 – Ảnh bìa game, thư viện game có sẵn, màn Kết nối PS5 kiểu mới
 
 - **Ảnh bìa (avatar) cho từng game** (`13_GameCovers.swift`): app tự tải ảnh bìa vuông từ trang PlayStation Store
